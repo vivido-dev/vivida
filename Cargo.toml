@@ -1,8 +1,47 @@
 [package]
 name = "vivida"
-version = "0.1.0"
-description = "vivido tab manager"
-license = "Apache-2.0"
+version = "0.1.1"
 edition = "2024"
+license = "Apache-2.0"
+authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
+description = "Workspace and tab manager for Vivido"
+rust-version = "1.94.0"
+repository = "https://github.com/vivido-dev/vivida"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vello = { version = "0.10", default-features = false, features = ["wgpu"] }
+vivido = { version = "0.4", path = "../vivido" }
+winit = { version = "0.30.13", default-features = false, features = [
+  "rwh_06",
+  "serde",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.1"
+objc2-foundation = { version = "0.3.1", default-features = false, features = [
+  "std",
+  "NSGeometry",
+] }
+objc2-app-kit = { version = "0.3.1", default-features = false, features = [
+  "std",
+  "NSButton",
+  "NSControl",
+  "NSGraphics",
+  "NSResponder",
+  "NSView",
+  "NSWindow",
+] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[workspace]
+resolver = "2"
