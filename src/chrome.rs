@@ -137,6 +137,8 @@ pub struct ChromeRenderer {
     text: TextSystem,
     scale_factor: f64,
     transparent_content: bool,
+    pane_background: Rgb,
+    pane_opacity: f32,
 }
 
 pub struct ChromeRenderState<'a> {
@@ -263,11 +265,15 @@ impl ChromeRenderer {
             text,
             scale_factor,
             transparent_content,
+            pane_background: config.colors.primary.background,
+            pane_opacity: config.window_opacity(),
         })
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>, scale_factor: f64, config: &UiConfig) {
         self.renderer.resize(size);
+        self.pane_background = config.colors.primary.background;
+        self.pane_opacity = config.window_opacity();
         if (scale_factor - self.scale_factor).abs() > f64::EPSILON {
             self.scale_factor = scale_factor;
             self.text = text_system(config, scale_factor);
@@ -308,6 +314,21 @@ impl ChromeRenderer {
                 ),
             ],
         );
+
+        let bottom_gutter = bottom_resize_gutter_rect(size, layout);
+        if bottom_gutter.height > 0 {
+            paint_rects(
+                &mut scene,
+                [RenderRect::new(
+                    bottom_gutter.x as f32,
+                    bottom_gutter.y as f32,
+                    bottom_gutter.width as f32,
+                    bottom_gutter.height as f32,
+                    self.pane_background,
+                    self.pane_opacity,
+                )],
+            );
+        }
 
         if layout.tab_bar.height > 0 {
             let (tabs_area, label_x) =
@@ -884,6 +905,18 @@ fn sidebar_footer_metrics(area_height: u32, scale_factor: f64) -> (u32, u32) {
     )
 }
 
+fn bottom_resize_gutter_rect(size: PhysicalSize<u32>, layout: ChromeLayout) -> PhysicalRect {
+    let y = layout.content.bottom().max(0);
+    PhysicalRect {
+        x: layout.content.x,
+        y,
+        width: layout.content.width,
+        height: size
+            .height
+            .saturating_sub(u32::try_from(y).unwrap_or_default()),
+    }
+}
+
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(
         rect.x as f32,
@@ -947,6 +980,15 @@ mod tests {
         let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
 
         assert_eq!(layout.content.bottom(), 590);
+        assert_eq!(
+            bottom_resize_gutter_rect(size, layout),
+            PhysicalRect {
+                x: 220,
+                y: 590,
+                width: 780,
+                height: 10,
+            }
+        );
 
         let short_layout =
             compute_chrome_layout(PhysicalSize::new(1000, 100), 1.0, SidebarMode::Expanded);
