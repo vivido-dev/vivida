@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use vello::Scene;
-use vello::kurbo::{Affine, BezPath, Circle, Stroke};
-use vello::peniko::Color;
+use vello::kurbo::{Affine, BezPath, Circle, Rect, Stroke};
+use vello::peniko::{Color, Fill};
 use vivido::config::UiConfig;
 use vivido::config::font::FontSize;
 use vivido::display::color::Rgb;
@@ -17,6 +17,7 @@ use winit::window::Window;
 
 use crate::layout::PhysicalRect;
 use crate::model::{TabId, Workspace, WorkspaceId};
+use crate::platform::pane_bottom_resize_gutter;
 
 pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 220.0;
 pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
@@ -101,11 +102,13 @@ pub fn compute_chrome_layout(
     let min_content_width = (MIN_PANE_WIDTH_LOGICAL * scale_factor).round() as u32;
     let requested_sidebar = (sidebar_mode.logical_width() * scale_factor).round() as u32;
     let sidebar_width = requested_sidebar.min(size.width.saturating_sub(min_content_width));
+    let bottom_resize_gutter = pane_bottom_resize_gutter(scale_factor).min(size.height);
+    let available_height = size.height.saturating_sub(bottom_resize_gutter);
     let tab_height = ((TAB_BAR_LOGICAL * scale_factor).round() as u32).min(
-        size.height
-            .saturating_sub((MIN_PANE_HEIGHT_LOGICAL * scale_factor).round() as u32),
+        available_height.saturating_sub((MIN_PANE_HEIGHT_LOGICAL * scale_factor).round() as u32),
     );
     let main_width = size.width.saturating_sub(sidebar_width);
+    let content_height = available_height.saturating_sub(tab_height);
 
     ChromeLayout {
         sidebar: PhysicalRect {
@@ -124,7 +127,7 @@ pub fn compute_chrome_layout(
             x: sidebar_width as i32,
             y: tab_height as i32,
             width: main_width,
-            height: size.height.saturating_sub(tab_height),
+            height: content_height,
         },
     }
 }
@@ -332,20 +335,24 @@ impl ChromeRenderer {
                     if tab.id == workspace.active_tab {
                         paint_rects(&mut scene, [rect(tab_rect, ACTIVE)]);
                     }
-                    self.text.paint_text(
-                        &mut scene,
-                        &tab.title,
-                        (
-                            tab_rect.x as f32 + (12.0 * scale) as f32,
-                            (8.0 * scale) as f32,
-                        ),
-                        if tab.id == workspace.active_tab {
-                            TEXT
-                        } else {
-                            MUTED
-                        },
-                        tab.id == workspace.active_tab,
-                    );
+                    if let Some(title_clip) = tab_title_clip(tab_rect, scale) {
+                        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &title_clip);
+                        self.text.paint_text(
+                            &mut scene,
+                            &tab.title,
+                            (
+                                tab_rect.x as f32 + (12.0 * scale) as f32,
+                                (8.0 * scale) as f32,
+                            ),
+                            if tab.id == workspace.active_tab {
+                                TEXT
+                            } else {
+                                MUTED
+                            },
+                            tab.id == workspace.active_tab,
+                        );
+                        scene.pop_layer();
+                    }
                 }
                 let x =
                     tabs_area.x + (workspace.tabs.len() as u32 * tab_width).min(tabs_width) as i32;
@@ -855,6 +862,19 @@ fn text_system(config: &UiConfig, scale_factor: f64) -> TextSystem {
     )
 }
 
+fn tab_title_clip(tab: PhysicalRect, scale_factor: f64) -> Option<Rect> {
+    let padding = (12.0 * scale_factor).round() as u32;
+    let width = tab.width.checked_sub(padding.saturating_mul(2))?;
+    (width > 0).then(|| {
+        Rect::new(
+            f64::from(tab.x) + f64::from(padding),
+            f64::from(tab.y),
+            f64::from(tab.x) + f64::from(padding) + f64::from(width),
+            f64::from(tab.y) + f64::from(tab.height),
+        )
+    })
+}
+
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(
         rect.x as f32,
@@ -911,11 +931,57 @@ mod tests {
         assert_eq!(layout.content.y, 35);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_content_leaves_the_bottom_resize_gutter_uncovered() {
+        let size = PhysicalSize::new(1000, 600);
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+
+        assert_eq!(layout.content.bottom(), 590);
+
+        let short_layout =
+            compute_chrome_layout(PhysicalSize::new(1000, 100), 1.0, SidebarMode::Expanded);
+        assert_eq!(short_layout.content.height, 80);
+        assert_eq!(short_layout.content.bottom(), 90);
+    }
+
     #[test]
     fn sidebar_mode_cycles_through_all_presentations() {
         assert_eq!(SidebarMode::Expanded.next(), SidebarMode::Compact);
         assert_eq!(SidebarMode::Compact.next(), SidebarMode::Hidden);
         assert_eq!(SidebarMode::Hidden.next(), SidebarMode::Expanded);
+    }
+
+    #[test]
+    fn tab_title_clip_stays_inside_tab_padding() {
+        let clip = tab_title_clip(
+            PhysicalRect {
+                x: 73,
+                y: 0,
+                width: 150,
+                height: 35,
+            },
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(clip, Rect::new(85.0, 0.0, 211.0, 35.0));
+    }
+
+    #[test]
+    fn tab_title_clip_omits_tabs_without_room_for_padding() {
+        assert!(
+            tab_title_clip(
+                PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 23,
+                    height: 35,
+                },
+                1.0,
+            )
+            .is_none()
+        );
     }
 
     #[test]

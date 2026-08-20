@@ -27,7 +27,7 @@ use model::{
     workspace_label,
 };
 use platform::{
-    NativePaneHost, PaneHost, configure_chrome_window, configure_event_loop,
+    NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
     finalize_chrome_window, position_settings_menu, settings_menu_window_attributes,
 };
 use vivido::cli::{IpcSignalName, TerminalOptions};
@@ -1622,7 +1622,7 @@ fn resize_direction_at(
     scale_factor: f64,
     position: PhysicalPosition<f64>,
 ) -> Option<ResizeDirection> {
-    let edge = (6.0 * scale_factor).max(1.0);
+    let edge = (RESIZE_EDGE_LOGICAL * scale_factor).max(1.0);
     let left = position.x < edge;
     let right = position.x >= f64::from(size.width) - edge;
     let top = position.y < edge;
@@ -1955,6 +1955,20 @@ mod tests {
         assert_eq!(
             resize_direction_at(size, 1.0, PhysicalPosition::new(320.0, 240.0)),
             None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resize_hit_regions_overlap_the_windows_padded_frame() {
+        let size = winit::dpi::PhysicalSize::new(640, 480);
+        assert_eq!(
+            resize_direction_at(size, 1.0, PhysicalPosition::new(8.0, 471.0)),
+            Some(ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            resize_direction_at(size, 1.0, PhysicalPosition::new(631.0, 471.0)),
+            Some(ResizeDirection::SouthEast)
         );
     }
 

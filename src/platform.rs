@@ -10,6 +10,19 @@ use winit::window::WindowId;
 
 use crate::layout::PhysicalRect;
 
+#[cfg(target_os = "windows")]
+pub const RESIZE_EDGE_LOGICAL: f64 = 10.0;
+#[cfg(not(target_os = "windows"))]
+pub const RESIZE_EDGE_LOGICAL: f64 = 6.0;
+
+pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
+    if cfg!(target_os = "windows") {
+        (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
+    } else {
+        0
+    }
+}
+
 pub trait PaneHost {
     fn create_pane(
         &self,
