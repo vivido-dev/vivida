@@ -641,7 +641,7 @@ impl ChromeRenderer {
         let scale = self.scale_factor;
         let header_height = (44.0 * scale).round() as u32;
         let row_height = (38.0 * scale).round() as u32;
-        let footer_height = (44.0 * scale).round() as u32;
+        let (list_bottom, footer_height) = sidebar_footer_metrics(area.height, scale);
         let padding = (10.0 * scale).round() as u32;
         let status_slot = (12.0 * scale).round() as u32;
 
@@ -658,7 +658,6 @@ impl ChromeRenderer {
             );
         }
 
-        let list_bottom = area.height.saturating_sub(footer_height);
         for (index, workspace) in workspaces.iter().enumerate() {
             let y = header_height.saturating_add(index as u32 * row_height);
             if y.saturating_add(row_height) > list_bottom {
@@ -875,6 +874,16 @@ fn tab_title_clip(tab: PhysicalRect, scale_factor: f64) -> Option<Rect> {
     })
 }
 
+fn sidebar_footer_metrics(area_height: u32, scale_factor: f64) -> (u32, u32) {
+    let available_height =
+        area_height.saturating_sub(pane_bottom_resize_gutter(scale_factor).min(area_height));
+    let footer_height = ((44.0 * scale_factor).round() as u32).min(available_height);
+    (
+        available_height.saturating_sub(footer_height),
+        footer_height,
+    )
+}
+
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(
         rect.x as f32,
@@ -943,6 +952,23 @@ mod tests {
             compute_chrome_layout(PhysicalSize::new(1000, 100), 1.0, SidebarMode::Expanded);
         assert_eq!(short_layout.content.height, 80);
         assert_eq!(short_layout.content.bottom(), 90);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_workspace_footer_does_not_cover_the_bottom_resize_gutter() {
+        let (y, height) = sidebar_footer_metrics(600, 1.0);
+        let new_workspace = PhysicalRect {
+            x: 0,
+            y: i32::try_from(y).unwrap(),
+            width: 220,
+            height,
+        };
+
+        assert_eq!(new_workspace.bottom(), 590);
+        assert!(new_workspace.contains(0.0, 589.0));
+        assert!(!new_workspace.contains(0.0, 590.0));
+        assert!(!new_workspace.contains(0.0, 599.0));
     }
 
     #[test]
