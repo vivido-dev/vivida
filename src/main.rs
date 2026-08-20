@@ -70,6 +70,7 @@ struct MotionProbe {
 
 struct Shell {
     config: UiConfig,
+    _terminfo: vivido::tty::TerminfoGuard,
     terminal_options: TerminalOptions,
     processor: Processor,
     chrome_window: Option<Arc<Window>>,
@@ -118,7 +119,7 @@ impl Shell {
         options.daemon = true;
         let config = load_shell_config(&mut options);
 
-        vivido::tty::setup_env();
+        let terminfo = vivido::tty::setup_env();
         let processor = Processor::new(config.clone(), options, event_loop);
         let current_dir = std::env::current_dir()?;
         let launch_cwd = terminal_options
@@ -134,6 +135,7 @@ impl Shell {
             .unwrap_or(current_dir);
         Ok(Self {
             config,
+            _terminfo: terminfo,
             terminal_options,
             processor,
             chrome_window: None,
