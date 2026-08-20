@@ -159,9 +159,15 @@ impl PaneHost for NativePaneHost {
         options.no_activate = true;
         options.parent_window = Some(parent);
         options.terminal_options.working_directory = Some(cwd.to_owned());
-        Ok(WindowId::from(
-            processor.create_window(LoopHandle::Winit(event_loop), options)?,
-        ))
+        let pane_id =
+            WindowId::from(processor.create_window(LoopHandle::Winit(event_loop), options)?);
+        // The shell owns pane geometry. A child NSWindow floats above the chrome and carries
+        // its own resize border, so leaving it user-resizable lets an edge drag live-resize
+        // the pane out from under the chrome's layout instead of resizing the chrome.
+        if let Some(pane) = processor.window_mut(pane_id) {
+            pane.display.window.set_resizable(false);
+        }
+        Ok(pane_id)
     }
 
     fn move_pane(&self, processor: &mut Processor, pane_id: WindowId, rect: PhysicalRect) {

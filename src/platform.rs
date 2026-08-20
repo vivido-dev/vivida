@@ -16,7 +16,21 @@ pub const RESIZE_EDGE_LOGICAL: f64 = 10.0;
 pub const RESIZE_EDGE_LOGICAL: f64 = 6.0;
 
 pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
-    if cfg!(target_os = "windows") {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
+    } else {
+        0
+    }
+}
+
+/// Width of the side strips panes leave uncovered so the chrome's resize border stays reachable.
+///
+/// On macOS a pane is a child NSWindow floating above the chrome, so it would otherwise cover
+/// the chrome's native resize border along its trailing edge (and its leading edge when the
+/// sidebar is hidden). Windows performs side resizing through client-area hit testing, which
+/// the shell already owns, so it needs no side gutter.
+pub fn pane_side_resize_gutter(scale_factor: f64) -> u32 {
+    if cfg!(target_os = "macos") {
         (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
     } else {
         0
