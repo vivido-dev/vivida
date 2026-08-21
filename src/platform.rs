@@ -1,13 +1,20 @@
 //! Platform boundary for native pane hosting and event-loop integration.
 
+#[cfg(target_os = "macos")]
 use std::error::Error;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
 use vivido::Processor;
+#[cfg(target_os = "macos")]
 use vivido::cli::TerminalOptions;
+#[cfg(target_os = "macos")]
 use winit::event_loop::ActiveEventLoop;
+#[cfg(target_os = "macos")]
 use winit::window::WindowId;
 
+#[cfg(target_os = "macos")]
 use crate::layout::PhysicalRect;
 
 #[cfg(target_os = "windows")]
@@ -37,6 +44,7 @@ pub fn pane_side_resize_gutter(scale_factor: f64) -> u32 {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub trait PaneHost {
     fn create_pane(
         &self,
@@ -50,6 +58,9 @@ pub trait PaneHost {
     fn focus(&self, processor: &mut Processor, pane: WindowId);
     fn is_attached(&self, processor: &Processor, pane: WindowId) -> bool;
 }
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub use vivido::shell::{NativePaneHost, PaneHost};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -67,7 +78,7 @@ mod windows;
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    NativePaneHost, configure_event_loop, finalize_chrome_window, position_settings_menu,
+    configure_event_loop, finalize_chrome_window, position_settings_menu,
     settings_menu_window_attributes,
 };
 #[cfg(target_os = "linux")]
@@ -76,6 +87,6 @@ mod linux;
 pub use linux::configure_chrome_window;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    NativePaneHost, configure_event_loop, finalize_chrome_window, position_settings_menu,
+    configure_event_loop, finalize_chrome_window, position_settings_menu,
     settings_menu_window_attributes,
 };
