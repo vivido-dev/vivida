@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use vello::Scene;
-use vello::kurbo::{Affine, BezPath, Circle, Stroke};
-use vello::peniko::Color;
+use vello::kurbo::{Affine, BezPath, Circle, Rect, Stroke};
+use vello::peniko::{Color, Fill};
 use vivido::config::UiConfig;
 use vivido::config::font::FontSize;
 use vivido::display::color::Rgb;
@@ -17,6 +17,7 @@ use winit::window::Window;
 
 use crate::layout::PhysicalRect;
 use crate::model::{TabId, Workspace, WorkspaceId};
+use crate::platform::{pane_bottom_resize_gutter, pane_side_resize_gutter};
 
 pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 220.0;
 pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
@@ -101,11 +102,21 @@ pub fn compute_chrome_layout(
     let min_content_width = (MIN_PANE_WIDTH_LOGICAL * scale_factor).round() as u32;
     let requested_sidebar = (sidebar_mode.logical_width() * scale_factor).round() as u32;
     let sidebar_width = requested_sidebar.min(size.width.saturating_sub(min_content_width));
+    let bottom_resize_gutter = pane_bottom_resize_gutter(scale_factor).min(size.height);
+    let available_height = size.height.saturating_sub(bottom_resize_gutter);
     let tab_height = ((TAB_BAR_LOGICAL * scale_factor).round() as u32).min(
-        size.height
-            .saturating_sub((MIN_PANE_HEIGHT_LOGICAL * scale_factor).round() as u32),
+        available_height.saturating_sub((MIN_PANE_HEIGHT_LOGICAL * scale_factor).round() as u32),
     );
-    let main_width = size.width.saturating_sub(sidebar_width);
+    // Panes must never cover the chrome's resize border: they would swallow the drags that
+    // resize the shell. Keep a trailing strip uncovered, and a leading one where the sidebar
+    // leaves the leading edge exposed.
+    let side_resize_gutter = pane_side_resize_gutter(scale_factor).min(size.width);
+    let content_x = sidebar_width.max(side_resize_gutter);
+    let main_width = size
+        .width
+        .saturating_sub(content_x)
+        .saturating_sub(side_resize_gutter);
+    let content_height = available_height.saturating_sub(tab_height);
 
     ChromeLayout {
         sidebar: PhysicalRect {
@@ -121,10 +132,10 @@ pub fn compute_chrome_layout(
             height: tab_height,
         },
         content: PhysicalRect {
-            x: sidebar_width as i32,
+            x: content_x as i32,
             y: tab_height as i32,
             width: main_width,
-            height: size.height.saturating_sub(tab_height),
+            height: content_height,
         },
     }
 }
@@ -134,6 +145,8 @@ pub struct ChromeRenderer {
     text: TextSystem,
     scale_factor: f64,
     transparent_content: bool,
+    pane_background: Rgb,
+    pane_opacity: f32,
 }
 
 pub struct ChromeRenderState<'a> {
@@ -260,11 +273,15 @@ impl ChromeRenderer {
             text,
             scale_factor,
             transparent_content,
+            pane_background: config.colors.primary.background,
+            pane_opacity: config.window_opacity(),
         })
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>, scale_factor: f64, config: &UiConfig) {
         self.renderer.resize(size);
+        self.pane_background = config.colors.primary.background;
+        self.pane_opacity = config.window_opacity();
         if (scale_factor - self.scale_factor).abs() > f64::EPSILON {
             self.scale_factor = scale_factor;
             self.text = text_system(config, scale_factor);
@@ -306,6 +323,25 @@ impl ChromeRenderer {
             ],
         );
 
+        let gutters = resize_gutter_rects(size, layout);
+        if !gutters.is_empty() {
+            let pane_background = self.pane_background;
+            let pane_opacity = self.pane_opacity;
+            paint_rects(
+                &mut scene,
+                gutters.into_iter().map(|gutter| {
+                    RenderRect::new(
+                        gutter.x as f32,
+                        gutter.y as f32,
+                        gutter.width as f32,
+                        gutter.height as f32,
+                        pane_background,
+                        pane_opacity,
+                    )
+                }),
+            );
+        }
+
         if layout.tab_bar.height > 0 {
             let (tabs_area, label_x) =
                 self.paint_top_controls(&mut scene, layout, state.fullscreen, &mut hit_map);
@@ -332,20 +368,24 @@ impl ChromeRenderer {
                     if tab.id == workspace.active_tab {
                         paint_rects(&mut scene, [rect(tab_rect, ACTIVE)]);
                     }
-                    self.text.paint_text(
-                        &mut scene,
-                        &tab.title,
-                        (
-                            tab_rect.x as f32 + (12.0 * scale) as f32,
-                            (8.0 * scale) as f32,
-                        ),
-                        if tab.id == workspace.active_tab {
-                            TEXT
-                        } else {
-                            MUTED
-                        },
-                        tab.id == workspace.active_tab,
-                    );
+                    if let Some(title_clip) = tab_title_clip(tab_rect, scale) {
+                        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &title_clip);
+                        self.text.paint_text(
+                            &mut scene,
+                            &tab.title,
+                            (
+                                tab_rect.x as f32 + (12.0 * scale) as f32,
+                                (8.0 * scale) as f32,
+                            ),
+                            if tab.id == workspace.active_tab {
+                                TEXT
+                            } else {
+                                MUTED
+                            },
+                            tab.id == workspace.active_tab,
+                        );
+                        scene.pop_layer();
+                    }
                 }
                 let x =
                     tabs_area.x + (workspace.tabs.len() as u32 * tab_width).min(tabs_width) as i32;
@@ -634,7 +674,7 @@ impl ChromeRenderer {
         let scale = self.scale_factor;
         let header_height = (44.0 * scale).round() as u32;
         let row_height = (38.0 * scale).round() as u32;
-        let footer_height = (44.0 * scale).round() as u32;
+        let (list_bottom, footer_height) = sidebar_footer_metrics(area.height, scale);
         let padding = (10.0 * scale).round() as u32;
         let status_slot = (12.0 * scale).round() as u32;
 
@@ -651,7 +691,6 @@ impl ChromeRenderer {
             );
         }
 
-        let list_bottom = area.height.saturating_sub(footer_height);
         for (index, workspace) in workspaces.iter().enumerate() {
             let y = header_height.saturating_add(index as u32 * row_height);
             if y.saturating_add(row_height) > list_bottom {
@@ -855,6 +894,72 @@ fn text_system(config: &UiConfig, scale_factor: f64) -> TextSystem {
     )
 }
 
+fn tab_title_clip(tab: PhysicalRect, scale_factor: f64) -> Option<Rect> {
+    let padding = (12.0 * scale_factor).round() as u32;
+    let width = tab.width.checked_sub(padding.saturating_mul(2))?;
+    (width > 0).then(|| {
+        Rect::new(
+            f64::from(tab.x) + f64::from(padding),
+            f64::from(tab.y),
+            f64::from(tab.x) + f64::from(padding) + f64::from(width),
+            f64::from(tab.y) + f64::from(tab.height),
+        )
+    })
+}
+
+fn sidebar_footer_metrics(area_height: u32, scale_factor: f64) -> (u32, u32) {
+    let available_height =
+        area_height.saturating_sub(pane_bottom_resize_gutter(scale_factor).min(area_height));
+    let footer_height = ((44.0 * scale_factor).round() as u32).min(available_height);
+    (
+        available_height.saturating_sub(footer_height),
+        footer_height,
+    )
+}
+
+/// Strips of the chrome that panes leave uncovered so its resize border stays reachable,
+/// painted with the pane background for a seamless edge. Order is fixed: bottom, trailing,
+/// leading (the last only when the sidebar is hidden).
+fn resize_gutter_rects(size: PhysicalSize<u32>, layout: ChromeLayout) -> Vec<PhysicalRect> {
+    let content = layout.content;
+    let mut gutters = Vec::new();
+    let bottom = content.bottom().max(0);
+    if u32::try_from(bottom).unwrap_or_default() < size.height {
+        gutters.push(PhysicalRect {
+            x: content.x,
+            y: bottom,
+            width: size
+                .width
+                .saturating_sub(u32::try_from(content.x.max(0)).unwrap_or_default()),
+            height: size
+                .height
+                .saturating_sub(u32::try_from(bottom).unwrap_or_default()),
+        });
+    }
+    let right = content.right().max(0);
+    if u32::try_from(right).unwrap_or_default() < size.width {
+        gutters.push(PhysicalRect {
+            x: right,
+            y: content.y,
+            width: size
+                .width
+                .saturating_sub(u32::try_from(right).unwrap_or_default()),
+            height: content.height,
+        });
+    }
+    if layout.sidebar.width == 0 && content.x > 0 {
+        gutters.push(PhysicalRect {
+            x: 0,
+            y: content.y,
+            width: u32::try_from(content.x).unwrap_or_default(),
+            height: size
+                .height
+                .saturating_sub(u32::try_from(content.y.max(0)).unwrap_or_default()),
+        });
+    }
+    gutters
+}
+
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(
         rect.x as f32,
@@ -897,7 +1002,10 @@ mod tests {
     fn expanded_sidebar_never_starves_the_minimum_pane_width() {
         let layout = compute_chrome_layout(PhysicalSize::new(300, 200), 1.0, SidebarMode::Expanded);
         assert_eq!(layout.sidebar.width, 140);
-        assert_eq!(layout.content.width, 160);
+        assert_eq!(
+            layout.content.width,
+            160u32.saturating_sub(pane_side_resize_gutter(1.0))
+        );
         assert!(layout.content.height >= 80);
         assert_eq!(
             layout.tab_bar,
@@ -911,11 +1019,144 @@ mod tests {
         assert_eq!(layout.content.y, 35);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_content_leaves_the_bottom_resize_gutter_uncovered() {
+        let size = PhysicalSize::new(1000, 600);
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+
+        assert_eq!(layout.content.bottom(), 590);
+        assert_eq!(
+            resize_gutter_rects(size, layout),
+            vec![PhysicalRect {
+                x: 220,
+                y: 590,
+                width: 780,
+                height: 10,
+            }]
+        );
+
+        let short_layout =
+            compute_chrome_layout(PhysicalSize::new(1000, 100), 1.0, SidebarMode::Expanded);
+        assert_eq!(short_layout.content.height, 80);
+        assert_eq!(short_layout.content.bottom(), 90);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_content_leaves_the_native_resize_border_reachable() {
+        let size = PhysicalSize::new(1000, 600);
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+
+        assert_eq!(layout.content.right(), 994);
+        assert_eq!(layout.content.bottom(), 594);
+        assert_eq!(
+            resize_gutter_rects(size, layout),
+            vec![
+                PhysicalRect {
+                    x: 220,
+                    y: 594,
+                    width: 780,
+                    height: 6,
+                },
+                PhysicalRect {
+                    x: 994,
+                    y: 35,
+                    width: 6,
+                    height: 559,
+                },
+            ]
+        );
+
+        // A hidden sidebar exposes the leading edge, so the content moves off it too.
+        let hidden = compute_chrome_layout(size, 1.0, SidebarMode::Hidden);
+        assert_eq!(hidden.content.x, 6);
+        assert_eq!(
+            resize_gutter_rects(size, hidden),
+            vec![
+                PhysicalRect {
+                    x: 6,
+                    y: 594,
+                    width: 994,
+                    height: 6,
+                },
+                PhysicalRect {
+                    x: 994,
+                    y: 35,
+                    width: 6,
+                    height: 559,
+                },
+                PhysicalRect {
+                    x: 0,
+                    y: 35,
+                    width: 6,
+                    height: 565,
+                },
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_workspace_footer_does_not_cover_the_bottom_resize_gutter() {
+        let (y, height) = sidebar_footer_metrics(600, 1.0);
+        assert_eq!(y + height, 594);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_workspace_footer_does_not_cover_the_bottom_resize_gutter() {
+        let (y, height) = sidebar_footer_metrics(600, 1.0);
+        let new_workspace = PhysicalRect {
+            x: 0,
+            y: i32::try_from(y).unwrap(),
+            width: 220,
+            height,
+        };
+
+        assert_eq!(new_workspace.bottom(), 590);
+        assert!(new_workspace.contains(0.0, 589.0));
+        assert!(!new_workspace.contains(0.0, 590.0));
+        assert!(!new_workspace.contains(0.0, 599.0));
+    }
+
     #[test]
     fn sidebar_mode_cycles_through_all_presentations() {
         assert_eq!(SidebarMode::Expanded.next(), SidebarMode::Compact);
         assert_eq!(SidebarMode::Compact.next(), SidebarMode::Hidden);
         assert_eq!(SidebarMode::Hidden.next(), SidebarMode::Expanded);
+    }
+
+    #[test]
+    fn tab_title_clip_stays_inside_tab_padding() {
+        let clip = tab_title_clip(
+            PhysicalRect {
+                x: 73,
+                y: 0,
+                width: 150,
+                height: 35,
+            },
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(clip, Rect::new(85.0, 0.0, 211.0, 35.0));
+    }
+
+    #[test]
+    fn tab_title_clip_omits_tabs_without_room_for_padding() {
+        assert!(
+            tab_title_clip(
+                PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 23,
+                    height: 35,
+                },
+                1.0,
+            )
+            .is_none()
+        );
     }
 
     #[test]

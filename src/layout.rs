@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+pub use vivido::shell::PhysicalRect;
 
 use crate::model::PaneId;
 
@@ -20,33 +21,6 @@ pub enum Node {
         children: Vec<Node>,
         sizes: Vec<f32>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PhysicalRect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl PhysicalRect {
-    pub fn contains(self, x: f64, y: f64) -> bool {
-        x >= f64::from(self.x)
-            && y >= f64::from(self.y)
-            && x < f64::from(self.x) + f64::from(self.width)
-            && y < f64::from(self.y) + f64::from(self.height)
-    }
-
-    pub fn right(self) -> i32 {
-        self.x
-            .saturating_add(i32::try_from(self.width).unwrap_or(i32::MAX))
-    }
-
-    pub fn bottom(self) -> i32 {
-        self.y
-            .saturating_add(i32::try_from(self.height).unwrap_or(i32::MAX))
-    }
 }
 
 impl Node {
