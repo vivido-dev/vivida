@@ -15,8 +15,12 @@ use winit::window::{Window, WindowAttributes};
 pub fn configure_event_loop(_builder: &mut EventLoopBuilder<Event>) {}
 
 pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes {
+    // Chrome is presented through DirectComposition. An HWND redirection bitmap would retain an
+    // opaque copy of the initial client area underneath that visual, making transparency appear
+    // only in regions exposed by a later resize.
     attributes
         .with_decorations(false)
+        .with_no_redirection_bitmap(true)
         .with_clip_children(true)
         .with_undecorated_shadow(true)
 }
