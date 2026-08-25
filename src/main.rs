@@ -30,7 +30,9 @@ use platform::{
     NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
     finalize_chrome_window, position_settings_menu, settings_menu_window_attributes,
 };
-use vivido::cli::{IpcSignalName, MessageOptions, SocketMessage, TerminalOptions, WindowOptions};
+use vivido::cli::{
+    IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
+};
 use vivido::config::UiConfig;
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
@@ -70,7 +72,10 @@ struct VividaOptions {
 #[derive(Debug, Subcommand)]
 enum VividaCommand {
     /// Control a running Vivida instance.
-    Msg(VividaMessageOptions),
+    Msg(Box<VividaMessageOptions>),
+
+    /// List discoverable Vivido and Vivida instances.
+    List(ListOptions),
 }
 
 #[derive(Args, Debug)]
@@ -96,6 +101,9 @@ enum VividaMessage {
 
     /// Return the complete Vivida workspace, tab, split, and pane layout.
     Layout,
+
+    /// Select and reveal a pane without requesting operating-system focus.
+    ActivatePane(WindowTarget),
 
     /// Create a workspace and its initial terminal pane.
     CreateWorkspace(WindowOptions),
@@ -237,6 +245,7 @@ impl Shell {
         processor.claim_ipc_methods(&[
             "create_window",
             "vivida_layout",
+            "vivida_activate_pane",
             "vivida_create_workspace",
             "vivida_create_tab",
             "vivida_split_pane",
@@ -946,6 +955,9 @@ impl Shell {
                                     "title": pane.title(),
                                     "working_directory": pane.current_directory(),
                                     "focused": pane.is_focused(),
+                                    "os_focused": pane.is_focused(),
+                                    "selected_in_host": hierarchy_visible
+                                        && tab.focused_pane == *pane_id,
                                     "visible": hierarchy_visible && chrome_visible
                                         && pane.display.window.is_visible() != Some(false),
                                     "rect": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height},
@@ -1099,7 +1111,7 @@ impl Shell {
         self.focus_active_pane();
     }
 
-    fn activate_pane(&mut self, window_id: WindowId) -> bool {
+    fn select_pane(&mut self, window_id: WindowId) -> bool {
         let Some(key) = self.pane_index.get(&window_id).copied() else {
             return false;
         };
@@ -1120,8 +1132,15 @@ impl Shell {
         workspace.active_tab = key.tab_id;
         tab.focused_pane = key.pane_id;
         self.sync_visibility_and_geometry();
-        self.focus_active_pane();
         self.request_chrome_redraw();
+        true
+    }
+
+    fn activate_pane(&mut self, window_id: WindowId) -> bool {
+        if !self.select_pane(window_id) {
+            return false;
+        }
+        self.focus_active_pane();
         true
     }
 
@@ -1452,6 +1471,33 @@ impl Shell {
                     })
                     .and_then(|options| self.host_create_tab(event_loop, None, options)),
                 "vivida_layout" => Ok(self.layout_json()),
+                "vivida_activate_pane" => {
+                    serde_json::from_value::<WindowTarget>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|target| {
+                            let window_id =
+                                self.platform_window_id(target.window_id).ok_or_else(|| {
+                                    vivido::host::IpcError::new(
+                                        "window_not_found",
+                                        "target pane not found",
+                                    )
+                                })?;
+                            if !self.select_pane(window_id) {
+                                return Err(vivido::host::IpcError::new(
+                                    "window_not_found",
+                                    "target pane not found",
+                                ));
+                            }
+                            Ok(serde_json::json!({
+                                "window_id": target.window_id,
+                                "selected_in_host": true,
+                                "visible": true,
+                                "os_focus_requested": false,
+                            }))
+                        })
+                }
                 "vivida_create_workspace" => {
                     serde_json::from_value::<WindowOptions>(request.params.clone())
                         .map_err(|error| {
@@ -2568,6 +2614,9 @@ fn send_vivida_message(options: VividaMessageOptions) -> Result<(), Box<dyn Erro
 
     let (method, params) = match message {
         VividaMessage::Layout => ("vivida_layout", serde_json::json!({})),
+        VividaMessage::ActivatePane(target) => {
+            ("vivida_activate_pane", serde_json::to_value(target)?)
+        }
         VividaMessage::CreateWorkspace(options) => {
             ("vivida_create_workspace", serde_json::to_value(options)?)
         }
@@ -2586,10 +2635,38 @@ fn send_vivida_message(options: VividaMessageOptions) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+fn list_instances(options: ListOptions) -> Result<(), Box<dyn Error>> {
+    let instances = vivido::host::list_registries()?
+        .into_iter()
+        .filter(|instance| options.all || instance.headless)
+        .collect::<Vec<_>>();
+    if options.json {
+        serde_json::to_writer(
+            std::io::stdout().lock(),
+            &serde_json::json!({"schema_version": 1, "instances": instances}),
+        )?;
+        println!();
+    } else {
+        for instance in instances {
+            println!(
+                "{}\tpid {}\t{}x{}\t{}",
+                instance.name,
+                instance.pid,
+                instance.columns,
+                instance.lines,
+                instance.socket.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let options = VividaOptions::parse();
-    if let Some(VividaCommand::Msg(options)) = options.command {
-        return send_vivida_message(options);
+    match options.command {
+        Some(VividaCommand::Msg(options)) => return send_vivida_message(*options),
+        Some(VividaCommand::List(options)) => return list_instances(options),
+        None => {}
     }
     let mut builder = EventLoop::<Event>::with_user_event();
     configure_event_loop(&mut builder);
@@ -2829,19 +2906,35 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(
-            standard.command,
-            Some(VividaCommand::Msg(VividaMessageOptions {
-                message: VividaMessage::Vivido(SocketMessage::Typing(_)),
-                ..
-            }))
+            standard.command.as_ref(),
+            Some(VividaCommand::Msg(options))
+                if matches!(options.message, VividaMessage::Vivido(SocketMessage::Typing(_)))
         ));
 
         let layout = VividaOptions::try_parse_from(["vivida", "msg", "layout"]).unwrap();
         assert!(matches!(
-            layout.command,
-            Some(VividaCommand::Msg(VividaMessageOptions {
-                message: VividaMessage::Layout,
-                ..
+            layout.command.as_ref(),
+            Some(VividaCommand::Msg(options)) if matches!(options.message, VividaMessage::Layout)
+        ));
+
+        let activate =
+            VividaOptions::try_parse_from(["vivida", "msg", "activate-pane", "--window-id", "42"])
+                .unwrap();
+        assert!(matches!(
+            activate.command.as_ref(),
+            Some(VividaCommand::Msg(options))
+                if matches!(
+                    options.message,
+                    VividaMessage::ActivatePane(WindowTarget { window_id: 42 })
+                )
+        ));
+
+        let list = VividaOptions::try_parse_from(["vivida", "list", "--all", "--json"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(VividaCommand::List(ListOptions {
+                all: true,
+                json: true
             }))
         ));
     }

@@ -6,60 +6,51 @@ use `vivida msg` without a separately installed `vivido` program.
 
 ## Agent loop
 
-Save the controller pane before selecting another pane. In PowerShell:
+Discover capabilities once per live instance and reuse its public window IDs until a restart or
+stale-ID error. In PowerShell:
 
 ```powershell
-$controller = $env:VIVIDO_WINDOW_ID
 vivida msg capabilities
 vivida msg layout
-vivida msg list-windows
 ```
 
 On Linux or macOS:
 
 ```sh
-controller=$VIVIDO_WINDOW_ID
 vivida msg capabilities
 vivida msg layout
-vivida msg list-windows
 ```
 
 Read the JSON layout and choose the target's globally unique `window_id`. Workspace, tab, and pane
 IDs describe the hierarchy; local pane IDs are meaningful only together with their workspace and
 tab IDs. Pass `--window-id` on every target operation because an agent pane continues to inherit
-its own ID even while it is hidden.
+its own ID even while it is hidden. If endpoint inheritance is unavailable, use `vivida list
+--all --json` rather than reading registry files directly.
 
 ```sh
 vivida msg inspect --window-id 42
-vivida msg focus --window-id 42
+vivida msg activate-pane --window-id 42
 vivida msg typing "status" --window-id 42 --report
 vivida msg key Enter --window-id 42 --report
 vivida msg wait screen-stable --window-id 42 --quiet 250ms
 ```
 
-Application-routed typing, paste, keys, and mouse input can target a background pane. Focus the
-target first for UI-routed mouse input or a fresh visual frame. Capture the current frame sequence
-with `inspect`, wait for a newer frame after focusing or acting, then take the screenshot:
+Explicitly targeted application and UI input can operate on a background pane. `activate-pane`
+selects and reveals a hosted pane without requesting foreground focus. Capture the frame sequence
+and geometry with the screenshot, wait for a newer frame after acting, then verify once:
 
 ```sh
+vivida msg screenshot --json --window-id 42
+vivida msg mouse path --point 100,100 110,105 120,115 --route application --window-id 42
 vivida msg wait frame --window-id 42 --after-frame 7
-vivida msg screenshot --window-id 42
+vivida msg screenshot --json --window-id 42
 ```
 
-`screenshot` prints an absolute path to a private PNG of the target pane. Claude Code, Codex CLI,
-OpenCode, or another vision-capable agent should open that file with its image-reading tool before
-choosing pixel or cell coordinates for `vivida msg mouse`. Vivida does not perform OCR or image
-recognition itself.
-
-Restore the controller when needed:
-
-```powershell
-vivida msg focus --window-id $controller
-```
-
-```sh
-vivida msg focus --window-id "$controller"
-```
+`screenshot --json` returns the private PNG path, captured frame sequence, physical dimensions,
+scale factor, and cell metrics. Open that file before choosing coordinates. `mouse path` sends one
+bounded two-to-1,000 point press/move/release gesture and preserves exact physical pixels under
+SGR pixel mouse mode. `focus` remains the explicit request for real OS activation; Windows
+foreground-lock or compositor policy can deny it, and targeted background input does not need it.
 
 ## Layout management
 
@@ -68,6 +59,7 @@ its complete workspace and split model:
 
 ```sh
 vivida msg create-workspace --working-directory /path/to/project
+vivida msg activate-pane --window-id 42
 vivida msg create-tab --workspace-id 2
 vivida msg split-pane --window-id 42 --axis horizontal
 vivida msg close-pane --window-id 42
