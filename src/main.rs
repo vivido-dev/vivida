@@ -20,8 +20,8 @@ use chrome::{
     ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, SettingsMenuRenderer,
     SidebarMode, compute_chrome_layout, settings_menu_logical_size,
 };
-use clap::Parser;
-use layout::{Axis, PhysicalRect, compute_rects};
+use clap::{Args, Parser, Subcommand};
+use layout::{Axis, PhysicalRect, compute_rects, resize_pane};
 use model::{
     PaneId, PaneKey, TabId, Workspace, WorkspaceId, focus_owned_pane, remove_owned_pane,
     workspace_label,
@@ -30,10 +30,12 @@ use platform::{
     NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
     finalize_chrome_window, position_settings_menu, settings_menu_window_attributes,
 };
-use vivido::cli::{IpcSignalName, TerminalOptions};
+use vivido::cli::{IpcSignalName, MessageOptions, SocketMessage, TerminalOptions, WindowOptions};
 use vivido::config::UiConfig;
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
+use vivido::host::{IoListener, RegistryGuard, SessionPaths};
+use vivido::shell::ShellAction;
 use vivido::{Event, Processor};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
@@ -42,7 +44,7 @@ use winit::event::TouchPhase;
 use winit::event::{ElementState, Event as WinitEvent, MouseButton, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 const CHROME_TITLE: &str = "vivida";
 const INITIAL_WIDTH: f64 = 1100.0;
@@ -57,9 +59,106 @@ const PROBE_FRAMES: u16 = 120;
     about = "Native workspace shell embedding Vivido terminals"
 )]
 struct VividaOptions {
+    #[command(subcommand)]
+    command: Option<VividaCommand>,
+
     /// Terminal process and arguments used for every pane.
     #[command(flatten)]
     terminal_options: TerminalOptions,
+}
+
+#[derive(Debug, Subcommand)]
+enum VividaCommand {
+    /// Control a running Vivida instance.
+    Msg(VividaMessageOptions),
+}
+
+#[derive(Args, Debug)]
+struct VividaMessageOptions {
+    /// IPC endpoint override (a filesystem path on Unix, a named pipe on Windows).
+    #[arg(short, long)]
+    socket: Option<PathBuf>,
+
+    /// Exact registered Vivida instance name.
+    #[arg(short = 't', long, conflicts_with = "socket")]
+    target: Option<String>,
+
+    #[command(subcommand)]
+    message: VividaMessage,
+}
+
+#[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum VividaMessage {
+    /// Use any standard Vivido terminal automation command.
+    #[command(flatten)]
+    Vivido(SocketMessage),
+
+    /// Return the complete Vivida workspace, tab, split, and pane layout.
+    Layout,
+
+    /// Create a workspace and its initial terminal pane.
+    CreateWorkspace(WindowOptions),
+
+    /// Create a tab in a workspace, defaulting to the active workspace.
+    CreateTab(CreateTabOptions),
+
+    /// Split a terminal pane.
+    SplitPane(SplitPaneOptions),
+
+    /// Close one terminal pane.
+    ClosePane(WindowTarget),
+
+    /// Close a tab and all of its terminal panes.
+    CloseTab(TabTarget),
+
+    /// Close a workspace and all of its terminal panes.
+    CloseWorkspace(WorkspaceTarget),
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct CreateTabOptions {
+    #[arg(long)]
+    workspace_id: Option<u64>,
+    #[command(flatten)]
+    options: WindowOptions,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct SplitPaneOptions {
+    #[arg(long, env = "VIVIDO_WINDOW_ID")]
+    window_id: u64,
+    #[arg(long, value_enum)]
+    axis: SplitAxis,
+    #[command(flatten)]
+    options: WindowOptions,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct WindowTarget {
+    #[arg(long, env = "VIVIDO_WINDOW_ID")]
+    window_id: u64,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct TabTarget {
+    #[arg(long)]
+    workspace_id: u64,
+    #[arg(long)]
+    tab_id: u64,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct WorkspaceTarget {
+    #[arg(long)]
+    workspace_id: u64,
 }
 
 struct MotionProbe {
@@ -73,6 +172,7 @@ struct Shell {
     _terminfo: vivido::tty::TerminfoGuard,
     terminal_options: TerminalOptions,
     processor: Processor,
+    _automation_registry: RegistryGuard,
     chrome_window: Option<Arc<Window>>,
     chrome_renderer: Option<ChromeRenderer>,
     chrome_id: Option<WindowId>,
@@ -117,10 +217,33 @@ impl Shell {
         // The shell owns creation and lifetime for every terminal pane.
         let mut options = vivido::cli::Options::default();
         options.daemon = true;
-        let config = load_shell_config(&mut options);
+        let mut config = load_shell_config(&mut options);
+        config.ipc_socket = Some(true);
+
+        let automation_name = format!("vivida-{}", std::process::id());
+        let automation_paths = SessionPaths::for_session(&automation_name)?;
+        automation_paths.prepare_endpoint(&automation_name)?;
+        options.automation_name = Some(automation_name.clone());
+        options.socket = Some(automation_paths.socket.clone());
 
         let terminfo = vivido::tty::setup_env();
-        let processor = Processor::new(config.clone(), options, event_loop);
+        let _listener = IoListener::spawn(
+            &config,
+            &options,
+            vivido::EventSink::Winit(event_loop.create_proxy()),
+        )?;
+        let automation_registry = automation_paths.register(&automation_name, (1, 1), false)?;
+        let mut processor = Processor::new(config.clone(), options, event_loop);
+        processor.claim_ipc_methods(&[
+            "create_window",
+            "vivida_layout",
+            "vivida_create_workspace",
+            "vivida_create_tab",
+            "vivida_split_pane",
+            "vivida_close_pane",
+            "vivida_close_tab",
+            "vivida_close_workspace",
+        ]);
         let current_dir = std::env::current_dir()?;
         let launch_cwd = terminal_options
             .working_directory
@@ -138,6 +261,7 @@ impl Shell {
             _terminfo: terminfo,
             terminal_options,
             processor,
+            _automation_registry: automation_registry,
             chrome_window: None,
             chrome_renderer: None,
             chrome_id: None,
@@ -319,6 +443,31 @@ impl Shell {
             cwd,
             &self.terminal_options,
         )
+    }
+
+    fn create_pane_window_with_options(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let chrome = Arc::clone(
+            self.chrome_window
+                .as_ref()
+                .ok_or("chrome window is not initialized")?,
+        );
+        NativePaneHost::new(chrome).create_pane_with_options(
+            &mut self.processor,
+            event_loop,
+            options,
+        )
+    }
+
+    fn platform_window_id(&self, ipc_window_id: u64) -> Option<WindowId> {
+        self.pane_index.keys().copied().find(|window_id| {
+            self.processor
+                .window(*window_id)
+                .is_some_and(|pane| pane.ipc_window_id() == ipc_window_id)
+        })
     }
 
     fn create_workspace(
@@ -536,6 +685,301 @@ impl Shell {
         self.request_chrome_redraw();
     }
 
+    fn creation_result(
+        &self,
+        window_id: WindowId,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let key = self.pane_index.get(&window_id).ok_or_else(|| {
+            vivido::host::IpcError::new("window_not_found", "new pane disappeared")
+        })?;
+        let ipc_window_id = self
+            .processor
+            .window(window_id)
+            .map(|pane| pane.ipc_window_id())
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "new pane disappeared")
+            })?;
+        Ok(serde_json::json!({
+            "workspace_id": key.workspace_id.0,
+            "tab_id": key.tab_id.0,
+            "pane_id": key.pane_id.0,
+            "window_id": ipc_window_id,
+        }))
+    }
+
+    fn host_create_workspace(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        mut options: WindowOptions,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let cwd = options
+            .terminal_options
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| self.active_pane_cwd());
+        options.terminal_options.working_directory = Some(cwd.clone());
+        let window_id = self
+            .create_pane_window_with_options(event_loop, options)
+            .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
+        let workspace_id = WorkspaceId(self.next_workspace_id);
+        self.next_workspace_id = self.next_workspace_id.saturating_add(1);
+        self.workspaces.push(Workspace::new(
+            workspace_id,
+            workspace_label(&cwd),
+            cwd,
+            window_id,
+        ));
+        self.active_workspace = Some(workspace_id);
+        self.closing_workspaces.remove(&workspace_id);
+        self.pane_index.insert(
+            window_id,
+            PaneKey {
+                workspace_id,
+                tab_id: TabId(1),
+                pane_id: PaneId(1),
+            },
+        );
+        self.sync_visibility_and_geometry();
+        self.focus_active_pane();
+        self.request_chrome_redraw();
+        self.creation_result(window_id)
+    }
+
+    fn host_create_tab(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        workspace_id: Option<u64>,
+        mut options: WindowOptions,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let workspace_id = workspace_id
+            .map(WorkspaceId)
+            .or(self.active_workspace)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("invalid_state", "Vivida has no workspace")
+            })?;
+        let default_cwd = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.identity_cwd.clone())
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        if options.terminal_options.working_directory.is_none() {
+            options.terminal_options.working_directory = Some(default_cwd);
+        }
+        let window_id = self
+            .create_pane_window_with_options(event_loop, options)
+            .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace disappeared")
+            })?;
+        let tab_id = workspace.add_tab(window_id);
+        self.active_workspace = Some(workspace_id);
+        self.pane_index.insert(
+            window_id,
+            PaneKey {
+                workspace_id,
+                tab_id,
+                pane_id: PaneId(1),
+            },
+        );
+        self.sync_visibility_and_geometry();
+        self.focus_active_pane();
+        self.request_chrome_redraw();
+        self.creation_result(window_id)
+    }
+
+    fn host_split_pane(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        params: SplitPaneOptions,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let target = self.platform_window_id(params.window_id).ok_or_else(|| {
+            vivido::host::IpcError::new("window_not_found", "target pane not found")
+        })?;
+        let key = *self.pane_index.get(&target).ok_or_else(|| {
+            vivido::host::IpcError::new("window_not_found", "target pane not found")
+        })?;
+        let cwd = self
+            .processor
+            .window(target)
+            .and_then(|pane| pane.current_directory())
+            .unwrap_or_else(|| self.launch_cwd.clone());
+        let mut options = params.options;
+        if options.terminal_options.working_directory.is_none() {
+            options.terminal_options.working_directory = Some(cwd);
+        }
+        let window_id = self
+            .create_pane_window_with_options(event_loop, options)
+            .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == key.workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace disappeared")
+            })?;
+        workspace.active_tab = key.tab_id;
+        let tab = workspace
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == key.tab_id)
+            .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab disappeared"))?;
+        tab.focused_pane = key.pane_id;
+        let axis = match params.axis {
+            SplitAxis::Horizontal => Axis::Horizontal,
+            SplitAxis::Vertical => Axis::Vertical,
+        };
+        let pane_id = tab.split(axis, window_id).ok_or_else(|| {
+            vivido::host::IpcError::new("invalid_state", "target pane cannot be split")
+        })?;
+        self.active_workspace = Some(key.workspace_id);
+        self.pane_index.insert(
+            window_id,
+            PaneKey {
+                workspace_id: key.workspace_id,
+                tab_id: key.tab_id,
+                pane_id,
+            },
+        );
+        self.sync_visibility_and_geometry();
+        self.focus_active_pane();
+        self.request_chrome_redraw();
+        self.creation_result(window_id)
+    }
+
+    fn request_close_panes(&mut self, panes: &[WindowId]) -> Result<(), vivido::host::IpcError> {
+        for window_id in panes {
+            let pane = self.processor.window_mut(*window_id).ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "target pane not found")
+            })?;
+            pane.set_automation_visible(false);
+            pane.signal_process_group(pane_close_signal())
+                .map_err(|error| {
+                    vivido::host::IpcError::new(
+                        "invalid_state",
+                        format!("failed to close pane: {error:?}"),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn host_close_pane(
+        &mut self,
+        ipc_window_id: u64,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let window_id = self.platform_window_id(ipc_window_id).ok_or_else(|| {
+            vivido::host::IpcError::new("window_not_found", "target pane not found")
+        })?;
+        self.request_close_panes(&[window_id])?;
+        Ok(serde_json::json!({"accepted": true, "window_id": ipc_window_id}))
+    }
+
+    fn host_close_tab(
+        &mut self,
+        target: TabTarget,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let workspace_id = WorkspaceId(target.workspace_id);
+        let tab_id = TabId(target.tab_id);
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        let panes = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.panes.values().copied().collect::<Vec<_>>())
+            .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab not found"))?;
+        if workspace.active_tab == tab_id
+            && let Some(next) = workspace.tabs.iter().find(|tab| tab.id != tab_id)
+        {
+            workspace.active_tab = next.id;
+        }
+        self.request_close_panes(&panes)?;
+        self.sync_visibility_and_geometry();
+        self.focus_active_pane();
+        Ok(
+            serde_json::json!({"accepted": true, "workspace_id": target.workspace_id, "tab_id": target.tab_id}),
+        )
+    }
+
+    fn layout_json(&self) -> serde_json::Value {
+        let scale = self
+            .chrome_window
+            .as_ref()
+            .map_or(1.0, |chrome| chrome.scale_factor());
+        let chrome_visible = self
+            .chrome_window
+            .as_ref()
+            .is_some_and(|chrome| chrome.is_visible() != Some(false));
+        let workspaces = self
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                let tabs = workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        let rects = compute_rects(&tab.root, self.chrome_layout.content, scale);
+                        let panes = tab
+                            .panes
+                            .iter()
+                            .filter_map(|(pane_id, window_id)| {
+                                let pane = self.processor.window(*window_id)?;
+                                let rect = rects.get(pane_id).copied().unwrap_or_default();
+                                let hierarchy_visible = self.active_workspace == Some(workspace.id)
+                                    && workspace.active_tab == tab.id
+                                    && !self.closing_workspaces.contains(&workspace.id);
+                                Some(serde_json::json!({
+                                    "pane_id": pane_id.0,
+                                    "window_id": pane.ipc_window_id(),
+                                    "title": pane.title(),
+                                    "working_directory": pane.current_directory(),
+                                    "focused": pane.is_focused(),
+                                    "visible": hierarchy_visible && chrome_visible
+                                        && pane.display.window.is_visible() != Some(false),
+                                    "rect": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height},
+                                }))
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({
+                            "tab_id": tab.id.0,
+                            "title": tab.title,
+                            "active": workspace.active_tab == tab.id,
+                            "focused_pane_id": tab.focused_pane.0,
+                            "layout": layout_node_json(&tab.root, tab, &self.processor),
+                            "panes": panes,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "workspace_id": workspace.id.0,
+                    "label": workspace.label,
+                    "working_directory": workspace.identity_cwd,
+                    "active": self.active_workspace == Some(workspace.id),
+                    "active_tab_id": workspace.active_tab.0,
+                    "closing": self.closing_workspaces.contains(&workspace.id),
+                    "tabs": tabs,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema_version": 1,
+            "active_workspace_id": self.active_workspace.map(|id| id.0),
+            "workspaces": workspaces,
+        })
+    }
+
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
         if self.sidebar_mode == mode {
             return;
@@ -607,6 +1051,25 @@ impl Shell {
         }
     }
 
+    fn resize_active_pane_layout(
+        &mut self,
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+    ) -> Option<PhysicalRect> {
+        let key = self.pane_index.get(&window_id).copied()?;
+        let scale = self.chrome_window.as_ref()?.scale_factor();
+        let content = self.chrome_layout.content;
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == key.workspace_id)?;
+        let tab = workspace.tabs.iter_mut().find(|tab| tab.id == key.tab_id)?;
+        resize_pane(&mut tab.root, key.pane_id, width, height, content, scale)?;
+        self.sync_pane_geometry();
+        self.pane_rects.get(&window_id).copied()
+    }
+
     fn focus_active_pane(&mut self) {
         let window_id = self
             .active_workspace()
@@ -634,6 +1097,43 @@ impl Shell {
             return;
         }
         self.focus_active_pane();
+    }
+
+    fn activate_pane(&mut self, window_id: WindowId) -> bool {
+        let Some(key) = self.pane_index.get(&window_id).copied() else {
+            return false;
+        };
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == key.workspace_id)
+        else {
+            return false;
+        };
+        let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == key.tab_id) else {
+            return false;
+        };
+        if tab.window_id(key.pane_id) != Some(window_id) {
+            return false;
+        }
+        self.active_workspace = Some(key.workspace_id);
+        workspace.active_tab = key.tab_id;
+        tab.focused_pane = key.pane_id;
+        self.sync_visibility_and_geometry();
+        self.focus_active_pane();
+        self.request_chrome_redraw();
+        true
+    }
+
+    fn alternative_tab_pane(&self, source: WindowId) -> Option<WindowId> {
+        let source_key = self.pane_index.get(&source)?;
+        self.workspaces.iter().find_map(|workspace| {
+            workspace.tabs.iter().find_map(|tab| {
+                (workspace.id != source_key.workspace_id || tab.id != source_key.tab_id)
+                    .then(|| tab.focused_window_id())
+                    .flatten()
+            })
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -940,6 +1440,192 @@ impl Shell {
             Ok(true) => (),
             Ok(false) => window.request_redraw(),
             Err(error) => eprintln!("failed to render settings menu: {error}"),
+        }
+    }
+
+    fn drain_host_requests(&mut self, event_loop: &ActiveEventLoop) {
+        for request in self.processor.take_host_requests() {
+            let result = match request.method.as_str() {
+                "create_window" => serde_json::from_value::<WindowOptions>(request.params.clone())
+                    .map_err(|error| {
+                        vivido::host::IpcError::new("invalid_params", error.to_string())
+                    })
+                    .and_then(|options| self.host_create_tab(event_loop, None, options)),
+                "vivida_layout" => Ok(self.layout_json()),
+                "vivida_create_workspace" => {
+                    serde_json::from_value::<WindowOptions>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|options| self.host_create_workspace(event_loop, options))
+                }
+                "vivida_create_tab" => {
+                    serde_json::from_value::<CreateTabOptions>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|params| {
+                            self.host_create_tab(event_loop, params.workspace_id, params.options)
+                        })
+                }
+                "vivida_split_pane" => {
+                    serde_json::from_value::<SplitPaneOptions>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|params| self.host_split_pane(event_loop, params))
+                }
+                "vivida_close_pane" => {
+                    serde_json::from_value::<WindowTarget>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|target| self.host_close_pane(target.window_id))
+                }
+                "vivida_close_tab" => serde_json::from_value::<TabTarget>(request.params.clone())
+                    .map_err(|error| {
+                        vivido::host::IpcError::new("invalid_params", error.to_string())
+                    })
+                    .and_then(|target| self.host_close_tab(target)),
+                "vivida_close_workspace" => serde_json::from_value::<WorkspaceTarget>(
+                    request.params.clone(),
+                )
+                .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))
+                .and_then(|target| {
+                    let workspace_id = WorkspaceId(target.workspace_id);
+                    if !self
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == workspace_id)
+                    {
+                        return Err(vivido::host::IpcError::new(
+                            "window_not_found",
+                            "workspace not found",
+                        ));
+                    }
+                    self.close_workspace(workspace_id);
+                    Ok(serde_json::json!({"accepted": true, "workspace_id": target.workspace_id}))
+                }),
+                unknown => Err(vivido::host::IpcError::new(
+                    "unsupported",
+                    format!("Vivida does not answer {unknown}"),
+                )),
+            };
+            match result {
+                Ok(result) => request.connection.reply(request.id, result),
+                Err(error) => request.connection.error(request.id, error),
+            }
+        }
+    }
+
+    fn drain_shell_actions(&mut self, event_loop: &ActiveEventLoop) {
+        for request in self.processor.take_shell_actions() {
+            match request.action {
+                ShellAction::CreateTab(options) => {
+                    if let Some(key) = self.pane_index.get(&request.source).copied() {
+                        let _ = self.host_create_tab(event_loop, Some(key.workspace_id.0), options);
+                    }
+                }
+                action @ (ShellAction::SelectNextTab | ShellAction::SelectPreviousTab) => {
+                    if self.activate_pane(request.source) {
+                        let direction = if matches!(action, ShellAction::SelectNextTab) {
+                            1
+                        } else {
+                            -1
+                        };
+                        self.cycle_tab(direction);
+                    }
+                }
+                ShellAction::SelectTab(index) => {
+                    if self.activate_pane(request.source)
+                        && let Some(tab_id) = self
+                            .active_workspace()
+                            .and_then(|workspace| workspace.tabs.get(index))
+                            .map(|tab| tab.id)
+                    {
+                        self.switch_tab(tab_id);
+                    }
+                }
+                ShellAction::SelectLastTab => {
+                    if self.activate_pane(request.source)
+                        && let Some(tab_id) = self
+                            .active_workspace()
+                            .and_then(|workspace| workspace.tabs.last())
+                            .map(|tab| tab.id)
+                    {
+                        self.switch_tab(tab_id);
+                    }
+                }
+                ShellAction::Minimize => {
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_minimized(true);
+                    }
+                }
+                ShellAction::ToggleMaximized => {
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_maximized(!chrome.is_maximized());
+                    }
+                }
+                ShellAction::ToggleFullscreen => {
+                    if let Some(chrome) = &self.chrome_window {
+                        let fullscreen = chrome
+                            .fullscreen()
+                            .is_none()
+                            .then_some(Fullscreen::Borderless(None));
+                        chrome.set_fullscreen(fullscreen);
+                    }
+                }
+                ShellAction::Hide => {
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_visible(false);
+                    }
+                }
+                ShellAction::Activate => {
+                    self.activate_pane(request.source);
+                }
+                ShellAction::Resize { width, height } => {
+                    self.activate_pane(request.source);
+                    if let Some(rect) =
+                        self.resize_active_pane_layout(request.source, width, height)
+                        && let Some(chrome) = &self.chrome_window
+                    {
+                        let current = chrome.inner_size();
+                        let requested = winit::dpi::PhysicalSize::new(
+                            current
+                                .width
+                                .saturating_add(width)
+                                .saturating_sub(rect.width),
+                            current
+                                .height
+                                .saturating_add(height)
+                                .saturating_sub(rect.height),
+                        );
+                        let _ = chrome.request_inner_size(requested);
+                    }
+                }
+                ShellAction::SetPosition { x, y } => {
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                    }
+                }
+                ShellAction::SetVisible(visible) => {
+                    if visible {
+                        self.activate_pane(request.source);
+                    } else if let Some(alternative) = self.alternative_tab_pane(request.source) {
+                        self.activate_pane(alternative);
+                    }
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_visible(
+                            visible || self.alternative_tab_pane(request.source).is_some(),
+                        );
+                    }
+                }
+                ShellAction::SetLevel(level) => {
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_window_level(level);
+                    }
+                }
+            }
         }
     }
 
@@ -1746,6 +2432,8 @@ impl ApplicationHandler<Event> for Shell {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.processor
             .handle_winit_event(event_loop, WinitEvent::AboutToWait);
+        self.drain_shell_actions(event_loop);
+        self.drain_host_requests(event_loop);
         if self.processor.has_pending_embedded_redraw() {
             self.request_chrome_redraw();
         }
@@ -1787,6 +2475,45 @@ fn load_shell_config(options: &mut vivido::cli::Options) -> UiConfig {
     config
 }
 
+fn layout_node_json(
+    node: &layout::Node,
+    tab: &model::Tab,
+    processor: &Processor,
+) -> serde_json::Value {
+    match node {
+        layout::Node::Leaf(pane_id) => {
+            let window_id = tab
+                .window_id(*pane_id)
+                .and_then(|window_id| processor.window(window_id))
+                .map(|pane| pane.ipc_window_id());
+            serde_json::json!({
+                "kind": "pane",
+                "pane_id": pane_id.0,
+                "window_id": window_id,
+            })
+        }
+        layout::Node::Split {
+            axis,
+            children,
+            sizes,
+        } => {
+            let axis = match axis {
+                Axis::Horizontal => "horizontal",
+                Axis::Vertical => "vertical",
+            };
+            serde_json::json!({
+                "kind": "split",
+                "axis": axis,
+                "sizes": sizes,
+                "children": children
+                    .iter()
+                    .map(|child| layout_node_json(child, tab, processor))
+                    .collect::<Vec<_>>(),
+            })
+        }
+    }
+}
+
 fn workspace_shortcut_index(key_code: KeyCode) -> Option<usize> {
     match key_code {
         KeyCode::Digit1 => Some(0),
@@ -1824,8 +2551,46 @@ fn pane_close_signal() -> IpcSignalName {
     }
 }
 
+fn send_vivida_message(options: VividaMessageOptions) -> Result<(), Box<dyn Error>> {
+    let VividaMessageOptions {
+        socket,
+        target,
+        message,
+    } = options;
+    if let VividaMessage::Vivido(message) = message {
+        return vivido::host::send_message(MessageOptions {
+            socket,
+            target,
+            message,
+        })
+        .map_err(Into::into);
+    }
+
+    let (method, params) = match message {
+        VividaMessage::Layout => ("vivida_layout", serde_json::json!({})),
+        VividaMessage::CreateWorkspace(options) => {
+            ("vivida_create_workspace", serde_json::to_value(options)?)
+        }
+        VividaMessage::CreateTab(options) => ("vivida_create_tab", serde_json::to_value(options)?),
+        VividaMessage::SplitPane(options) => ("vivida_split_pane", serde_json::to_value(options)?),
+        VividaMessage::ClosePane(target) => ("vivida_close_pane", serde_json::to_value(target)?),
+        VividaMessage::CloseTab(target) => ("vivida_close_tab", serde_json::to_value(target)?),
+        VividaMessage::CloseWorkspace(target) => {
+            ("vivida_close_workspace", serde_json::to_value(target)?)
+        }
+        VividaMessage::Vivido(_) => unreachable!("standard messages returned above"),
+    };
+    let (_, result) = vivido::host::request_method(socket, target.as_deref(), method, params)?;
+    serde_json::to_writer(std::io::stdout().lock(), &result)?;
+    println!();
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let options = VividaOptions::parse();
+    if let Some(VividaCommand::Msg(options)) = options.command {
+        return send_vivida_message(options);
+    }
     let mut builder = EventLoop::<Event>::with_user_event();
     configure_event_loop(&mut builder);
     let event_loop = builder.build()?;
@@ -2049,6 +2814,47 @@ mod tests {
         assert_eq!(
             translated_pane_position(rect, PhysicalPosition::new(700.0, 500.0)),
             PhysicalPosition::new(480.0, 465.0)
+        );
+    }
+
+    #[test]
+    fn msg_exposes_standard_vivido_and_vivida_layout_commands() {
+        let standard = VividaOptions::try_parse_from([
+            "vivida",
+            "msg",
+            "typing",
+            "hello",
+            "--window-id",
+            "42",
+        ])
+        .unwrap();
+        assert!(matches!(
+            standard.command,
+            Some(VividaCommand::Msg(VividaMessageOptions {
+                message: VividaMessage::Vivido(SocketMessage::Typing(_)),
+                ..
+            }))
+        ));
+
+        let layout = VividaOptions::try_parse_from(["vivida", "msg", "layout"]).unwrap();
+        assert!(matches!(
+            layout.command,
+            Some(VividaCommand::Msg(VividaMessageOptions {
+                message: VividaMessage::Layout,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn split_axis_uses_stable_snake_case_wire_values() {
+        assert_eq!(
+            serde_json::to_value(SplitAxis::Horizontal).unwrap(),
+            "horizontal"
+        );
+        assert_eq!(
+            serde_json::to_value(SplitAxis::Vertical).unwrap(),
+            "vertical"
         );
     }
 }
