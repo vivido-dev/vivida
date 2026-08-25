@@ -7,7 +7,9 @@ use `vivida msg` without a separately installed `vivido` program.
 ## Agent loop
 
 Discover capabilities once per live instance and reuse its public window IDs until a restart or
-stale-ID error. In PowerShell:
+stale-ID error. `layout` reads the caller's inherited `VIVIDO_WINDOW_ID`, so its top-level `caller`
+object identifies the agent's workspace, one-based workspace and tab positions, stable IDs, pane
+ID, rectangle, host selection, and visibility. In PowerShell:
 
 ```powershell
 vivida msg capabilities
@@ -26,6 +28,26 @@ IDs describe the hierarchy; local pane IDs are meaningful only together with the
 tab IDs. Pass `--window-id` on every target operation because an agent pane continues to inherit
 its own ID even while it is hidden. If endpoint inheritance is unavailable, use `vivida list
 --all --json` rather than reading registry files directly.
+
+Do not infer Vivida split relationships from `list-windows`: that standard Vivido response is flat
+and does not contain workspace, tab, or split ownership. Every pane in `layout` includes its
+one-based `split_path` from the tab root and topology-aware `left`, `right`, `up`, and `down`
+neighbors. Resolve a directional route against the host model instead:
+
+```sh
+vivida msg resolve-pane --path left
+vivida msg resolve-pane --path down
+vivida msg resolve-pane --tab 2 --path down
+vivida msg resolve-pane --workspace 2 --tab 1 --path right,down
+```
+
+Workspace and tab numbers are one-based displayed positions. With no workspace or tab selector,
+the caller's own workspace and tab are used, including when that pane is currently hidden. A route
+starts at the caller when it belongs to the selected tab, otherwise at that tab's focused pane;
+`--from-pane-id` selects another explicit starting point. Each `left`, `right`, `up`, or `down`
+step chooses the nearest pane in that direction using overlap, distance, and stable pane ID as
+tie-breakers. A direction is one navigation step, so nested targets may require repeated or mixed
+steps. The response records every step and the final `target.window_id`.
 
 ```sh
 vivida msg inspect --window-id 42

@@ -41,6 +41,28 @@ impl Node {
         }
     }
 
+    /// One-based child indexes from the root split to a pane.
+    pub fn pane_path(&self, pane_id: PaneId) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        self.write_pane_path(pane_id, &mut path).then_some(path)
+    }
+
+    fn write_pane_path(&self, pane_id: PaneId, path: &mut Vec<usize>) -> bool {
+        match self {
+            Self::Leaf(candidate) => *candidate == pane_id,
+            Self::Split { children, .. } => {
+                for (index, child) in children.iter().enumerate() {
+                    path.push(index + 1);
+                    if child.write_pane_path(pane_id, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+        }
+    }
+
     pub fn split(&mut self, pane_id: PaneId, new_pane_id: PaneId, axis: Axis) -> bool {
         match self {
             Self::Leaf(candidate) if *candidate == pane_id => {
@@ -356,6 +378,18 @@ mod tests {
         root.split(PaneId(1), PaneId(2), Axis::Horizontal);
         assert!(root.remove(PaneId(2)));
         assert_eq!(root, Node::Leaf(PaneId(1)));
+    }
+
+    #[test]
+    fn pane_paths_address_nested_split_children() {
+        let mut root = Node::Leaf(PaneId(1));
+        root.split(PaneId(1), PaneId(2), Axis::Horizontal);
+        root.split(PaneId(2), PaneId(3), Axis::Vertical);
+
+        assert_eq!(root.pane_path(PaneId(1)), Some(vec![1]));
+        assert_eq!(root.pane_path(PaneId(2)), Some(vec![2, 1]));
+        assert_eq!(root.pane_path(PaneId(3)), Some(vec![2, 2]));
+        assert_eq!(root.pane_path(PaneId(99)), None);
     }
 
     #[test]
