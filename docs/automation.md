@@ -23,6 +23,13 @@ vivida msg capabilities
 vivida msg layout
 ```
 
+For a complete multi-step interaction, prefer one `vivida msg run-plan --file plan.json` process.
+Vivida inherits the standard plan runner and `capture` composite from Vivido, while advertising its
+layout methods on the same connection. A plan can call `vivida_resolve_pane`, bind
+`/target/window_id`, call `vivida_activate_pane`, then use ordinary screenshot, mouse, wait, and
+verification steps without rediscovery or another client process. Use `--dry-run` for static
+validation or `--preflight` to execute observation steps while skipping mutations.
+
 Read the JSON layout and choose the target's globally unique `window_id`. Workspace, tab, and pane
 IDs describe the hierarchy; local pane IDs are meaningful only together with their workspace and
 tab IDs. Pass `--window-id` on every target operation because an agent pane continues to inherit
@@ -68,11 +75,20 @@ vivida msg wait frame --window-id 42 --after-frame 7
 vivida msg screenshot --json --window-id 42
 ```
 
+The equivalent activation-and-capture composite is:
+
+```sh
+vivida msg capture --activate --stable --window-id 42
+```
+
 `screenshot --json` returns the private PNG path, captured frame sequence, physical dimensions,
 scale factor, and cell metrics. Open that file before choosing coordinates. `mouse path` sends one
 bounded two-to-1,000 point press/move/release gesture and preserves exact physical pixels under
 SGR pixel mouse mode. `focus` remains the explicit request for real OS activation; Windows
 foreground-lock or compositor policy can deny it, and targeted background input does not need it.
+Mouse positions also accept `--relative-x` and `--relative-y` fractions. Dense drawing or drag
+gestures can use `mouse path --duration 250ms --wait-frame`; Vivido schedules the reports, keeps
+the request correlated through PTY completion, and guarantees a final button release.
 
 ## Layout management
 

@@ -36,7 +36,7 @@ use vivido::cli::{
 use vivido::config::UiConfig;
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
-use vivido::host::{IoListener, RegistryGuard, SessionPaths};
+use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
 use vivido::shell::ShellAction;
 use vivido::{Event, Processor};
 use winit::application::ApplicationHandler;
@@ -298,17 +298,17 @@ impl Shell {
         )?;
         let automation_registry = automation_paths.register(&automation_name, (1, 1), false)?;
         let mut processor = Processor::new(config.clone(), options, event_loop);
-        processor.claim_ipc_methods(&[
-            "create_window",
-            "vivida_layout",
-            "vivida_resolve_pane",
-            "vivida_activate_pane",
-            "vivida_create_workspace",
-            "vivida_create_tab",
-            "vivida_split_pane",
-            "vivida_close_pane",
-            "vivida_close_tab",
-            "vivida_close_workspace",
+        processor.claim_ipc_method_capabilities(&[
+            MethodCapability::host("create_window", MethodClass::Window, true),
+            MethodCapability::host("vivida_layout", MethodClass::Observe, false),
+            MethodCapability::host("vivida_resolve_pane", MethodClass::Observe, false),
+            MethodCapability::host("vivida_activate_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_create_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_create_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_split_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_workspace", MethodClass::Window, true),
         ]);
         let current_dir = std::env::current_dir()?;
         let launch_cwd = terminal_options
@@ -3278,6 +3278,15 @@ mod tests {
             standard.command.as_ref(),
             Some(VividaCommand::Msg(options))
                 if matches!(options.message, VividaMessage::Vivido(SocketMessage::Typing(_)))
+        ));
+
+        let plan =
+            VividaOptions::try_parse_from(["vivida", "msg", "run-plan", "--file", "plan.json"])
+                .unwrap();
+        assert!(matches!(
+            plan.command.as_ref(),
+            Some(VividaCommand::Msg(options))
+                if matches!(options.message, VividaMessage::Vivido(SocketMessage::RunPlan(_)))
         ));
 
         let layout = VividaOptions::try_parse_from(["vivida", "msg", "layout"]).unwrap();

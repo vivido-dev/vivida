@@ -14,6 +14,8 @@ vivida msg list-windows
 vivida msg activate-pane --window-id 42
 vivida msg screenshot --json --window-id 42
 vivida msg mouse path --point 100,100 120,120 --window-id 42
+vivida msg capture --activate --stable --window-id 42
+vivida msg run-plan --file plan.json
 ```
 
 `layout` uses the pane's inherited `VIVIDO_WINDOW_ID` to mark the caller and report its workspace,
