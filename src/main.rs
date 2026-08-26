@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use chrome::{
     ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, ContextMenuRenderState,
-    RenameEditorRenderState, SettingsMenuRenderer, SidebarMode, compute_chrome_layout,
-    settings_menu_logical_size,
+    RenameEditorRenderState, RenameEditorRenderer, SettingsMenuRenderer, SidebarMode,
+    compute_chrome_layout, rename_editor_logical_size, settings_menu_logical_size,
 };
 use clap::{Args, Parser, Subcommand};
 use layout::{Axis, PhysicalRect, compute_rects, resize_pane};
@@ -29,8 +29,8 @@ use model::{
 };
 use platform::{
     NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
-    finalize_chrome_window, focus_chrome_input, position_settings_menu,
-    settings_menu_window_attributes,
+    finalize_chrome_window, focus_chrome_input, position_rename_editor, position_settings_menu,
+    rename_editor_window_attributes, settings_menu_window_attributes,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
@@ -429,6 +429,9 @@ struct Shell {
     settings_menu_renderer: Option<SettingsMenuRenderer>,
     settings_menu_id: Option<WindowId>,
     settings_menu_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
+    rename_editor_window: Option<Arc<Window>>,
+    rename_editor_renderer: Option<RenameEditorRenderer>,
+    rename_editor_id: Option<WindowId>,
     chrome_layout: ChromeLayout,
     chrome_hits: ChromeHitMap,
     cursor_position: Option<PhysicalPosition<f64>>,
@@ -525,6 +528,9 @@ impl Shell {
             settings_menu_renderer: None,
             settings_menu_id: None,
             settings_menu_embedded_size: None,
+            rename_editor_window: None,
+            rename_editor_renderer: None,
+            rename_editor_id: None,
             chrome_layout: ChromeLayout::default(),
             chrome_hits: ChromeHitMap::default(),
             cursor_position: None,
@@ -596,6 +602,7 @@ impl Shell {
         }
 
         self.initialize_settings_menu(event_loop)?;
+        self.initialize_rename_editor(event_loop)?;
 
         if let Some(chrome) = &self.chrome_window {
             chrome.set_visible(true);
@@ -1789,7 +1796,6 @@ impl Shell {
     fn sync_pane_visibility(&mut self) {
         let active = self.active_workspace;
         let closing = &self.closing_workspaces;
-        let native_editor_open = self.name_editor.is_some() && !cfg!(target_os = "linux");
         let visibility = self
             .workspaces
             .iter()
@@ -1798,8 +1804,7 @@ impl Shell {
                     tab.panes.values().copied().map(move |window_id| {
                         let visible = Some(workspace.id) == active
                             && tab.id == workspace.active_tab
-                            && !closing.contains(&workspace.id)
-                            && !native_editor_open;
+                            && !closing.contains(&workspace.id);
                         (window_id, visible)
                     })
                 })
@@ -2160,6 +2165,7 @@ impl Shell {
             .name_editor
             .as_ref()
             .zip(editor_display.as_deref())
+            .filter(|_| self.rename_editor_window.is_none())
             .map(|(editor, display_value)| RenameEditorRenderState {
                 label: match editor.target {
                     NameTarget::Workspace(_) => "Rename Workspace",
@@ -2241,6 +2247,31 @@ impl Shell {
         Ok(())
     }
 
+    fn initialize_rename_editor(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(chrome) = &self.chrome_window else {
+            return Ok(());
+        };
+        let (width, height) = rename_editor_logical_size();
+        let attributes = Window::default_attributes()
+            .with_title("vivida rename")
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_resizable(false)
+            .with_visible(false);
+        let Some(attributes) = rename_editor_window_attributes(chrome, attributes)? else {
+            return Ok(());
+        };
+        let window = Arc::new(event_loop.create_window(attributes)?);
+        let renderer =
+            RenameEditorRenderer::new(Arc::clone(&window), &self.config, window.scale_factor())?;
+        self.rename_editor_id = Some(window.id());
+        self.rename_editor_window = Some(window);
+        self.rename_editor_renderer = Some(renderer);
+        Ok(())
+    }
+
     fn set_settings_menu_open(&mut self, open: bool) {
         if self.settings_menu_open == open {
             return;
@@ -2275,6 +2306,10 @@ impl Shell {
     fn open_name_context_menu(&mut self, target: NameTarget, anchor: PhysicalPosition<f64>) {
         self.set_settings_menu_open(false);
         self.name_editor = None;
+        // Native terminal children sit above the chrome content surface. Keep a tab's primary
+        // Rename row wholly inside the tab strip so its click always reaches the chrome, including
+        // when the target tab is inactive.
+        let anchor = name_context_anchor(target, anchor);
         self.name_context_menu = Some(NameContextMenu { target, anchor });
         self.request_chrome_redraw();
     }
@@ -2302,10 +2337,26 @@ impl Shell {
         };
         self.name_context_menu = None;
         self.name_editor = Some(NameEditor::new(target, current));
-        self.sync_pane_visibility();
         #[cfg(target_os = "linux")]
         self.clear_embedded_focus();
-        if let Some(chrome) = &self.chrome_window {
+        if let (Some(chrome), Some(editor)) = (&self.chrome_window, &self.rename_editor_window) {
+            editor.set_ime_allowed(true);
+            editor.set_visible(true);
+            let chrome_size = chrome.inner_size();
+            let editor_size = editor.inner_size();
+            let x = chrome_size.width.saturating_sub(editor_size.width) / 2;
+            let y = chrome_size.height.saturating_sub(editor_size.height) / 3;
+            position_rename_editor(
+                chrome,
+                editor,
+                PhysicalPosition::new(
+                    i32::try_from(x).unwrap_or_default(),
+                    i32::try_from(y).unwrap_or_default(),
+                ),
+            );
+            editor.request_redraw();
+            editor.focus_window();
+        } else if let Some(chrome) = &self.chrome_window {
             chrome.set_ime_allowed(true);
             focus_chrome_input(chrome);
         }
@@ -2316,7 +2367,10 @@ impl Shell {
         if self.name_editor.take().is_none() {
             return;
         }
-        self.sync_pane_visibility();
+        if let Some(editor) = &self.rename_editor_window {
+            editor.set_ime_allowed(false);
+            editor.set_visible(false);
+        }
         if let Some(chrome) = &self.chrome_window {
             chrome.set_ime_allowed(false);
         }
@@ -2363,6 +2417,7 @@ impl Shell {
                 if let Some(editor) = &mut self.name_editor {
                     editor.error = Some(error.message);
                 }
+                self.request_rename_editor_redraw();
                 self.request_chrome_redraw();
             }
         }
@@ -2438,6 +2493,7 @@ impl Shell {
             _ => return true,
         }
         self.request_chrome_redraw();
+        self.request_rename_editor_redraw();
         true
     }
 
@@ -2454,7 +2510,38 @@ impl Shell {
             Ime::Enabled | Ime::Disabled => editor.preedit.clear(),
         }
         self.request_chrome_redraw();
+        self.request_rename_editor_redraw();
         true
+    }
+
+    fn request_rename_editor_redraw(&self) {
+        if let Some(window) = &self.rename_editor_window {
+            window.request_redraw();
+        }
+    }
+
+    fn render_rename_editor(&mut self) {
+        let (Some(window), Some(renderer), Some(editor)) = (
+            &self.rename_editor_window,
+            &mut self.rename_editor_renderer,
+            &self.name_editor,
+        ) else {
+            return;
+        };
+        let display_value = editor.display_value();
+        let state = RenameEditorRenderState {
+            label: match editor.target {
+                NameTarget::Workspace(_) => "Rename Workspace",
+                NameTarget::Tab { .. } => "Rename Tab",
+            },
+            display_value: &display_value,
+            error: editor.error.as_deref(),
+        };
+        match renderer.render(window.inner_size(), state) {
+            Ok(true) => (),
+            Ok(false) => window.request_redraw(),
+            Err(error) => eprintln!("failed to render rename editor: {error}"),
+        }
     }
 
     fn sync_settings_menu_window(&self) {
@@ -3070,8 +3157,7 @@ impl Shell {
                 self.clear_embedded_focus();
                 self.set_settings_menu_open(false);
                 self.name_context_menu = None;
-                if self.name_editor.take().is_some() {
-                    self.sync_pane_visibility();
+                if self.rename_editor_window.is_none() && self.name_editor.take().is_some() {
                     if let Some(chrome) = &self.chrome_window {
                         chrome.set_ime_allowed(false);
                     }
@@ -3429,6 +3515,16 @@ enum WindowFrameAction {
     Close,
 }
 
+fn name_context_anchor(
+    target: NameTarget,
+    requested: PhysicalPosition<f64>,
+) -> PhysicalPosition<f64> {
+    match target {
+        NameTarget::Tab { .. } => PhysicalPosition::new(requested.x, 0.0),
+        NameTarget::Workspace(_) => requested,
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn translated_pane_position(
     rect: PhysicalRect,
@@ -3545,6 +3641,39 @@ impl ApplicationHandler<Event> for Shell {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if Some(window_id) == self.rename_editor_id {
+            match event {
+                WindowEvent::CloseRequested | WindowEvent::Focused(false) => {
+                    self.close_name_editor();
+                }
+                WindowEvent::RedrawRequested => self.render_rename_editor(),
+                WindowEvent::Resized(size) => {
+                    if let Some(renderer) = &mut self.rename_editor_renderer {
+                        let scale = self
+                            .rename_editor_window
+                            .as_ref()
+                            .map_or(1.0, |window| window.scale_factor());
+                        renderer.resize(size, scale, &self.config);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    if let (Some(renderer), Some(window)) =
+                        (&mut self.rename_editor_renderer, &self.rename_editor_window)
+                    {
+                        renderer.resize(window.inner_size(), scale_factor, &self.config);
+                    }
+                }
+                WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+                WindowEvent::Ime(ime) => {
+                    self.handle_name_editor_ime(ime);
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    self.handle_name_editor_key(&event);
+                }
+                _ => (),
+            }
+            return;
+        }
         if Some(window_id) == self.settings_menu_id {
             match event {
                 WindowEvent::CloseRequested => self.set_settings_menu_open(false),
@@ -4322,6 +4451,23 @@ mod tests {
         editor.move_left();
         editor.delete();
         assert!(editor.text.is_empty());
+    }
+
+    #[test]
+    fn inactive_tab_rename_action_stays_in_the_chrome_tab_strip() {
+        let requested = PhysicalPosition::new(640.0, 28.0);
+        let tab_anchor = name_context_anchor(
+            NameTarget::Tab {
+                workspace_id: WorkspaceId(1),
+                tab_id: TabId(2),
+            },
+            requested,
+        );
+        assert_eq!(tab_anchor, PhysicalPosition::new(640.0, 0.0));
+        assert_eq!(
+            name_context_anchor(NameTarget::Workspace(WorkspaceId(1)), requested),
+            requested
+        );
     }
 
     #[test]

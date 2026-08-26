@@ -187,6 +187,59 @@ pub struct SettingsMenuRenderer {
     scale_factor: f64,
 }
 
+pub struct RenameEditorRenderer {
+    renderer: SceneRenderer,
+    text: TextSystem,
+    scale_factor: f64,
+}
+
+impl RenameEditorRenderer {
+    pub fn new(
+        window: Arc<Window>,
+        config: &UiConfig,
+        scale_factor: f64,
+    ) -> Result<Self, vivido::display::renderer::Error> {
+        let size = window.inner_size();
+        Ok(Self {
+            renderer: SceneRenderer::new(RenderSource::Surface(window), size, false)?,
+            text: text_system(config, scale_factor),
+            scale_factor,
+        })
+    }
+
+    pub fn resize(&mut self, size: PhysicalSize<u32>, scale_factor: f64, config: &UiConfig) {
+        self.renderer.resize(size);
+        if (scale_factor - self.scale_factor).abs() > f64::EPSILON {
+            self.scale_factor = scale_factor;
+            self.text = text_system(config, scale_factor);
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        size: PhysicalSize<u32>,
+        state: RenameEditorRenderState<'_>,
+    ) -> Result<bool, vivido::display::renderer::Error> {
+        let mut scene = Scene::new();
+        paint_rename_editor(
+            &mut self.text,
+            self.scale_factor,
+            &mut scene,
+            size,
+            state,
+            &mut PhysicalRect::default(),
+        );
+        self.renderer.render(
+            &scene,
+            Color::from_rgba8(SIDEBAR.r, SIDEBAR.g, SIDEBAR.b, u8::MAX),
+        )
+    }
+}
+
+pub fn rename_editor_logical_size() -> (f64, f64) {
+    (RENAME_EDITOR_WIDTH_LOGICAL, RENAME_EDITOR_HEIGHT_LOGICAL)
+}
+
 impl SettingsMenuRenderer {
     pub fn new(
         window: Arc<Window>,
@@ -932,79 +985,95 @@ impl ChromeRenderer {
         state: RenameEditorRenderState<'_>,
         hit_map: &mut ChromeHitMap,
     ) {
-        let scale = self.scale_factor;
-        let width = ((RENAME_EDITOR_WIDTH_LOGICAL * scale).round() as u32).min(size.width);
-        let height = ((RENAME_EDITOR_HEIGHT_LOGICAL * scale).round() as u32).min(size.height);
-        hit_map.rename_editor = PhysicalRect {
-            x: i32::try_from(size.width.saturating_sub(width) / 2).unwrap_or_default(),
-            y: i32::try_from(size.height.saturating_sub(height) / 3).unwrap_or_default(),
-            width,
-            height,
-        };
-        let field = PhysicalRect {
-            x: hit_map.rename_editor.x + (12.0 * scale).round() as i32,
-            y: hit_map.rename_editor.y + (38.0 * scale).round() as i32,
-            width: hit_map
-                .rename_editor
-                .width
-                .saturating_sub((24.0 * scale).round() as u32),
-            height: (34.0 * scale).round() as u32,
-        };
-        paint_rects(
+        paint_rename_editor(
+            &mut self.text,
+            self.scale_factor,
             scene,
-            [
-                rect(hit_map.rename_editor, SIDEBAR),
-                rect(field, BACKGROUND),
-                RenderRect::new(
-                    field.x as f32,
-                    field.y as f32,
-                    field.width as f32,
-                    scale.max(1.0) as f32,
-                    ACCENT,
-                    1.0,
-                ),
-            ],
+            size,
+            state,
+            &mut hit_map.rename_editor,
         );
-        self.text.paint_text(
-            scene,
-            state.label,
-            (
-                hit_map.rename_editor.x as f32 + 12.0 * scale as f32,
-                hit_map.rename_editor.y as f32 + 10.0 * scale as f32,
+    }
+}
+
+fn paint_rename_editor(
+    text: &mut TextSystem,
+    scale: f64,
+    scene: &mut Scene,
+    size: PhysicalSize<u32>,
+    state: RenameEditorRenderState<'_>,
+    editor_rect: &mut PhysicalRect,
+) {
+    let width = ((RENAME_EDITOR_WIDTH_LOGICAL * scale).round() as u32).min(size.width);
+    let height = ((RENAME_EDITOR_HEIGHT_LOGICAL * scale).round() as u32).min(size.height);
+    *editor_rect = PhysicalRect {
+        x: i32::try_from(size.width.saturating_sub(width) / 2).unwrap_or_default(),
+        y: i32::try_from(size.height.saturating_sub(height) / 3).unwrap_or_default(),
+        width,
+        height,
+    };
+    let field = PhysicalRect {
+        x: editor_rect.x + (12.0 * scale).round() as i32,
+        y: editor_rect.y + (38.0 * scale).round() as i32,
+        width: editor_rect
+            .width
+            .saturating_sub((24.0 * scale).round() as u32),
+        height: (34.0 * scale).round() as u32,
+    };
+    paint_rects(
+        scene,
+        [
+            rect(*editor_rect, SIDEBAR),
+            rect(field, BACKGROUND),
+            RenderRect::new(
+                field.x as f32,
+                field.y as f32,
+                field.width as f32,
+                scale.max(1.0) as f32,
+                ACCENT,
+                1.0,
             ),
-            TEXT,
-            true,
-        );
-        let field_clip = Rect::new(
-            f64::from(field.x),
-            f64::from(field.y),
-            f64::from(field.right()),
-            f64::from(field.bottom()),
-        );
-        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &field_clip);
-        self.text.paint_text(
+        ],
+    );
+    text.paint_text(
+        scene,
+        state.label,
+        (
+            editor_rect.x as f32 + 12.0 * scale as f32,
+            editor_rect.y as f32 + 10.0 * scale as f32,
+        ),
+        TEXT,
+        true,
+    );
+    let field_clip = Rect::new(
+        f64::from(field.x),
+        f64::from(field.y),
+        f64::from(field.right()),
+        f64::from(field.bottom()),
+    );
+    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &field_clip);
+    text.paint_text(
+        scene,
+        state.display_value,
+        (
+            field.x as f32 + 8.0 * scale as f32,
+            field.y as f32 + 8.0 * scale as f32,
+        ),
+        TEXT,
+        false,
+    );
+    scene.pop_layer();
+    if let Some(error) = state.error {
+        text.paint_text(
             scene,
-            state.display_value,
+            error,
             (
-                field.x as f32 + 8.0 * scale as f32,
-                field.y as f32 + 8.0 * scale as f32,
+                editor_rect.x as f32 + 12.0 * scale as f32,
+                field.bottom() as f32 + 7.0 * scale as f32,
             ),
-            TEXT,
+            DANGER,
             false,
         );
-        scene.pop_layer();
-        if let Some(error) = state.error {
-            self.text.paint_text(
-                scene,
-                error,
-                (
-                    hit_map.rename_editor.x as f32 + 12.0 * scale as f32,
-                    field.bottom() as f32 + 7.0 * scale as f32,
-                ),
-                DANGER,
-                false,
-            );
-        }
     }
 }
 

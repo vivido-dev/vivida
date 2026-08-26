@@ -58,6 +58,19 @@ pub fn settings_menu_window_attributes(
     }))
 }
 
+pub fn rename_editor_window_attributes(
+    chrome: &Window,
+    attributes: WindowAttributes,
+) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
+    // SAFETY: the shell retains the chrome until after its editor child is destroyed.
+    Ok(Some(unsafe {
+        attributes
+            .with_parent_window(Some(chrome.window_handle()?.as_raw()))
+            .with_decorations(false)
+            .with_active(true)
+    }))
+}
+
 pub fn position_settings_menu(
     _chrome: &Window,
     menu: &Window,
@@ -80,6 +93,34 @@ pub fn position_settings_menu(
             0,
             SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
         );
+    }
+}
+
+pub fn position_rename_editor(
+    _chrome: &Window,
+    editor: &Window,
+    position: winit::dpi::PhysicalPosition<i32>,
+) {
+    let Ok(editor_handle) = editor.window_handle() else {
+        return;
+    };
+    let Some(editor) = hwnd(editor_handle.as_raw()) else {
+        return;
+    };
+    // SAFETY: the editor HWND is a live child of the chrome HWND. A null insertion handle is
+    // HWND_TOP, keeping the editor above sibling terminal panes while it owns keyboard focus.
+    unsafe {
+        SetWindowPos(
+            editor,
+            std::ptr::null_mut(),
+            position.x,
+            position.y,
+            0,
+            0,
+            SWP_NOSIZE,
+        );
+        SetActiveWindow(editor);
+        SetFocus(editor);
     }
 }
 

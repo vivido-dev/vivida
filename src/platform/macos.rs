@@ -102,6 +102,19 @@ pub fn settings_menu_window_attributes(
     }))
 }
 
+pub fn rename_editor_window_attributes(
+    chrome: &Window,
+    attributes: WindowAttributes,
+) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
+    // SAFETY: Shell owns the chrome window until after the editor child is destroyed.
+    Ok(Some(unsafe {
+        attributes
+            .with_parent_window(Some(chrome.window_handle()?.as_raw()))
+            .with_decorations(false)
+            .with_active(true)
+    }))
+}
+
 pub fn position_settings_menu(chrome: &Window, menu: &Window, position: PhysicalPosition<i32>) {
     let Ok(origin) = chrome.inner_position() else {
         return;
@@ -121,6 +134,11 @@ pub fn position_settings_menu(chrome: &Window, menu: &Window, position: Physical
         // SAFETY: both windows are live on the main event-loop thread.
         unsafe { chrome.addChildWindow_ordered(&menu, NSWindowOrderingMode::Above) };
     }
+}
+
+pub fn position_rename_editor(chrome: &Window, editor: &Window, position: PhysicalPosition<i32>) {
+    position_settings_menu(chrome, editor, position);
+    editor.focus_window();
 }
 
 #[derive(Clone)]
