@@ -1835,7 +1835,7 @@ impl Shell {
             match request.action {
                 ShellAction::CreateTab(options) => {
                     if let Some(key) = self.pane_index.get(&request.source).copied() {
-                        let _ = self.host_create_tab(event_loop, Some(key.workspace_id.0), options);
+                        let _ = self.host_create_tab(event_loop, Some(key.workspace_id.0), *options);
                     }
                 }
                 action @ (ShellAction::SelectNextTab | ShellAction::SelectPreviousTab) => {
