@@ -86,6 +86,10 @@ pub fn finalize_chrome_window(window: &Window) {
     }
 }
 
+pub fn focus_chrome_input(window: &Window) {
+    window.focus_window();
+}
+
 pub fn settings_menu_window_attributes(
     chrome: &Window,
     attributes: WindowAttributes,

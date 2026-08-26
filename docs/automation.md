@@ -46,10 +46,14 @@ vivida msg resolve-pane --path left
 vivida msg resolve-pane --path down
 vivida msg resolve-pane --tab 2 --path down
 vivida msg resolve-pane --workspace 2 --tab 1 --path right,down
+vivida msg resolve-pane --workspace-name "Project A" --tab-name "Logs" --pane-id 3
 ```
 
 Workspace and tab numbers are one-based displayed positions. With no workspace or tab selector,
-the caller's own workspace and tab are used, including when that pane is currently hidden. A route
+the caller's own workspace and tab are used, including when that pane is currently hidden. Without
+a caller, an omitted workspace is accepted only when exactly one exists. `--workspace-name` and
+`--tab-name` match unique display names case-insensitively; `--pane-id` directly selects a stable
+pane within that named scope. Every pane's `locator` object reports this canonical triple. A route
 starts at the caller when it belongs to the selected tab, otherwise at that tab's focused pane;
 `--from-pane-id` selects another explicit starting point. Each `left`, `right`, `up`, or `down`
 step chooses the nearest pane in that direction using overlap, distance, and stable pane ID as
@@ -97,17 +101,26 @@ its complete workspace and split model:
 
 ```sh
 vivida msg create-workspace --working-directory /path/to/project
+vivida msg create-workspace --name "Project A" --working-directory /path/to/project
 vivida msg activate-pane --window-id 42
-vivida msg create-tab --workspace-id 2
+vivida msg create-tab --workspace-name "Project A" --name "Logs"
 vivida msg split-pane --window-id 42 --axis horizontal
 vivida msg close-pane --window-id 42
-vivida msg close-tab --workspace-id 2 --tab-id 3
-vivida msg close-workspace --workspace-id 2
+vivida msg rename-workspace --workspace-name "Project A" --name "Project Alpha"
+vivida msg rename-tab --workspace-name "Project Alpha" --tab-name "Logs" --name "Server"
+vivida msg reset-tab-title --workspace-name "Project Alpha" --tab-name "Server"
+vivida msg close-tab --workspace-name "Project Alpha" --tab-name "Server"
+vivida msg close-workspace --workspace-name "Project Alpha"
 ```
 
 Creation commands return the new workspace, tab, pane, and window IDs. Close replies acknowledge
 that shutdown was requested; use `wait exit` or `subscribe` when the agent must observe process
 termination. IDs must be rediscovered after Vivida restarts.
+
+Workspace names are globally unique and tab names are unique within a workspace. User-provided
+names are trimmed, bounded to 128 characters, and reject control characters. Context-driven titles
+that collide are assigned deterministic suffixes such as `pwsh (2)`. Renaming a tab pins its title;
+`reset-tab-title` or the UI's **Use Automatic Title** action resumes terminal-context updates.
 
 The endpoint accepts connections only from the same operating-system user. Capability material
 used by Vivid presentation is never included in layout, inspection, or diagnostic replies.

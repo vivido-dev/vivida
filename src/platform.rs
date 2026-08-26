@@ -81,8 +81,8 @@ mod macos;
 pub use macos::configure_chrome_window;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    NativePaneHost, configure_event_loop, finalize_chrome_window, position_settings_menu,
-    settings_menu_window_attributes,
+    NativePaneHost, configure_event_loop, finalize_chrome_window, focus_chrome_input,
+    position_settings_menu, settings_menu_window_attributes,
 };
 
 #[cfg(target_os = "windows")]
@@ -91,7 +91,7 @@ mod windows;
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    configure_event_loop, finalize_chrome_window, position_settings_menu,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, position_settings_menu,
     settings_menu_window_attributes,
 };
 #[cfg(target_os = "linux")]
@@ -100,6 +100,6 @@ mod linux;
 pub use linux::configure_chrome_window;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    configure_event_loop, finalize_chrome_window, position_settings_menu,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, position_settings_menu,
     settings_menu_window_attributes,
 };

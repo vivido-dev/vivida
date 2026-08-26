@@ -17,18 +17,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrome::{
-    ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, SettingsMenuRenderer,
-    SidebarMode, compute_chrome_layout, settings_menu_logical_size,
+    ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, ContextMenuRenderState,
+    RenameEditorRenderState, SettingsMenuRenderer, SidebarMode, compute_chrome_layout,
+    settings_menu_logical_size,
 };
 use clap::{Args, Parser, Subcommand};
 use layout::{Axis, PhysicalRect, compute_rects, resize_pane};
 use model::{
-    PaneId, PaneKey, TabId, Workspace, WorkspaceId, focus_owned_pane, remove_owned_pane,
-    workspace_label,
+    PaneId, PaneKey, TabId, Workspace, WorkspaceId, focus_owned_pane, names_equal, normalize_name,
+    remove_owned_pane, unique_name, workspace_label,
 };
 use platform::{
     NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
-    finalize_chrome_window, position_settings_menu, settings_menu_window_attributes,
+    finalize_chrome_window, focus_chrome_input, position_settings_menu,
+    settings_menu_window_attributes,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
@@ -43,9 +45,9 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
 use winit::event::TouchPhase;
-use winit::event::{ElementState, Event as WinitEvent, MouseButton, StartCause, WindowEvent};
+use winit::event::{ElementState, Event as WinitEvent, Ime, MouseButton, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 const CHROME_TITLE: &str = "vivida";
@@ -109,9 +111,9 @@ enum VividaMessage {
     ActivatePane(WindowTarget),
 
     /// Create a workspace and its initial terminal pane.
-    CreateWorkspace(WindowOptions),
+    CreateWorkspace(CreateWorkspaceOptions),
 
-    /// Create a tab in a workspace, defaulting to the active workspace.
+    /// Create a tab in the caller's workspace, or the sole workspace.
     CreateTab(CreateTabOptions),
 
     /// Split a terminal pane.
@@ -125,6 +127,15 @@ enum VividaMessage {
 
     /// Close a workspace and all of its terminal panes.
     CloseWorkspace(WorkspaceTarget),
+
+    /// Rename a workspace.
+    RenameWorkspace(RenameWorkspaceOptions),
+
+    /// Pin a tab to a custom title.
+    RenameTab(RenameTabOptions),
+
+    /// Resume context-driven naming for a tab.
+    ResetTabTitle(TabTarget),
 }
 
 #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
@@ -163,6 +174,10 @@ struct ResolvePaneOptions {
     #[arg(long)]
     workspace_id: Option<u64>,
 
+    /// Case-insensitive workspace name.
+    #[arg(long, conflicts_with_all = ["workspace", "workspace_id"])]
+    workspace_name: Option<String>,
+
     /// One-based tab position in the selected workspace.
     #[arg(long, conflicts_with = "tab_id", value_parser = clap::value_parser!(u64).range(1..))]
     tab: Option<u64>,
@@ -170,6 +185,14 @@ struct ResolvePaneOptions {
     /// Stable tab ID instead of its displayed position.
     #[arg(long)]
     tab_id: Option<u64>,
+
+    /// Case-insensitive tab name in the selected workspace.
+    #[arg(long, conflicts_with_all = ["tab", "tab_id"])]
+    tab_name: Option<String>,
+
+    /// Stable pane ID to resolve directly.
+    #[arg(long, conflicts_with_all = ["from_pane_id", "path"])]
+    pane_id: Option<u64>,
 
     /// Stable pane ID to start from instead of the caller or focused pane.
     #[arg(long)]
@@ -181,9 +204,26 @@ struct ResolvePaneOptions {
 }
 
 #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
-struct CreateTabOptions {
+struct CreateWorkspaceOptions {
+    /// Persistent workspace name. Defaults to a unique directory basename.
     #[arg(long)]
+    name: Option<String>,
+    #[command(flatten)]
+    #[serde(flatten)]
+    options: WindowOptions,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct CreateTabOptions {
+    #[arg(long, conflicts_with = "workspace_name")]
     workspace_id: Option<u64>,
+    #[arg(long, conflicts_with = "workspace_id")]
+    workspace_name: Option<String>,
+    #[arg(long = "from-window-id", env = "VIVIDO_WINDOW_ID")]
+    from_window_id: Option<u64>,
+    /// Persistent tab name. Without this, the terminal context controls the title.
+    #[arg(long)]
+    name: Option<String>,
     #[command(flatten)]
     options: WindowOptions,
 }
@@ -213,22 +253,167 @@ struct WindowTarget {
 
 #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
 struct TabTarget {
-    #[arg(long)]
-    workspace_id: u64,
-    #[arg(long)]
-    tab_id: u64,
+    #[arg(long, conflicts_with = "workspace_name")]
+    workspace_id: Option<u64>,
+    #[arg(long, conflicts_with = "workspace_id")]
+    workspace_name: Option<String>,
+    #[arg(long, conflicts_with = "tab_name")]
+    tab_id: Option<u64>,
+    #[arg(long, conflicts_with = "tab_id")]
+    tab_name: Option<String>,
+    #[arg(long = "from-window-id", env = "VIVIDO_WINDOW_ID")]
+    from_window_id: Option<u64>,
 }
 
 #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
 struct WorkspaceTarget {
+    #[arg(long, conflicts_with = "workspace_name")]
+    workspace_id: Option<u64>,
+    #[arg(long, conflicts_with = "workspace_id")]
+    workspace_name: Option<String>,
+    #[arg(long = "from-window-id", env = "VIVIDO_WINDOW_ID")]
+    from_window_id: Option<u64>,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct RenameWorkspaceOptions {
+    #[command(flatten)]
+    #[serde(flatten)]
+    target: WorkspaceTarget,
     #[arg(long)]
-    workspace_id: u64,
+    name: String,
+}
+
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+struct RenameTabOptions {
+    #[command(flatten)]
+    #[serde(flatten)]
+    target: TabTarget,
+    #[arg(long)]
+    name: String,
 }
 
 struct MotionProbe {
     origin: PhysicalPosition<i32>,
     frame: u16,
     next_frame: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameTarget {
+    Workspace(WorkspaceId),
+    Tab {
+        workspace_id: WorkspaceId,
+        tab_id: TabId,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NameContextMenu {
+    target: NameTarget,
+    anchor: PhysicalPosition<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct NameEditor {
+    target: NameTarget,
+    text: String,
+    cursor: usize,
+    preedit: String,
+    select_all: bool,
+    error: Option<String>,
+}
+
+impl NameEditor {
+    fn new(target: NameTarget, text: String) -> Self {
+        let cursor = text.len();
+        Self {
+            target,
+            text,
+            cursor,
+            preedit: String::new(),
+            select_all: true,
+            error: None,
+        }
+    }
+
+    fn display_value(&self) -> String {
+        let mut display = self.text.clone();
+        if self.select_all {
+            display = format!("[{display}]");
+            display.push('|');
+        } else {
+            display.insert_str(self.cursor, &self.preedit);
+            display.insert(self.cursor + self.preedit.len(), '|');
+        }
+        display
+    }
+
+    fn insert(&mut self, value: &str) {
+        if self.select_all {
+            self.text.clear();
+            self.cursor = 0;
+            self.select_all = false;
+        }
+        let remaining = model::MAX_NAME_CHARS.saturating_sub(self.text.chars().count());
+        let value = value
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(remaining)
+            .collect::<String>();
+        self.text.insert_str(self.cursor, &value);
+        self.cursor += value.len();
+        self.error = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.select_all {
+            self.text.clear();
+            self.cursor = 0;
+            self.select_all = false;
+        } else if self.cursor > 0 {
+            let previous = self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(index, _)| index);
+            self.text.replace_range(previous..self.cursor, "");
+            self.cursor = previous;
+        }
+        self.error = None;
+    }
+
+    fn delete(&mut self) {
+        if self.select_all {
+            self.text.clear();
+            self.cursor = 0;
+            self.select_all = false;
+        } else if let Some(character) = self.text[self.cursor..].chars().next() {
+            self.text
+                .replace_range(self.cursor..self.cursor + character.len_utf8(), "");
+        }
+        self.error = None;
+    }
+
+    fn move_left(&mut self) {
+        if self.select_all {
+            self.select_all = false;
+            self.cursor = 0;
+        } else if self.cursor > 0 {
+            self.cursor = self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(index, _)| index);
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.select_all {
+            self.select_all = false;
+            self.cursor = self.text.len();
+        } else if let Some(character) = self.text[self.cursor..].chars().next() {
+            self.cursor += character.len_utf8();
+        }
+    }
 }
 
 struct Shell {
@@ -251,6 +436,8 @@ struct Shell {
     sidebar_mode: SidebarMode,
     hovered_workspace: Option<WorkspaceId>,
     settings_menu_open: bool,
+    name_context_menu: Option<NameContextMenu>,
+    name_editor: Option<NameEditor>,
     workspaces: Vec<Workspace>,
     active_workspace: Option<WorkspaceId>,
     next_workspace_id: u64,
@@ -309,6 +496,9 @@ impl Shell {
             MethodCapability::host("vivida_close_pane", MethodClass::Window, true),
             MethodCapability::host("vivida_close_tab", MethodClass::Window, true),
             MethodCapability::host("vivida_close_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_rename_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_rename_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_reset_tab_title", MethodClass::Window, true),
         ]);
         let current_dir = std::env::current_dir()?;
         let launch_cwd = terminal_options
@@ -342,6 +532,8 @@ impl Shell {
             sidebar_mode: SidebarMode::default(),
             hovered_workspace: None,
             settings_menu_open: false,
+            name_context_menu: None,
+            name_editor: None,
             workspaces: Vec::new(),
             active_workspace: None,
             next_workspace_id: 1,
@@ -451,6 +643,7 @@ impl Shell {
                         saved_tab.id,
                         saved_tab.root,
                         saved_tab.title,
+                        saved_tab.custom_title,
                         saved_tab.focused_pane,
                         panes,
                     ));
@@ -458,13 +651,21 @@ impl Shell {
             }
             if !tabs.is_empty() {
                 self.next_workspace_id = self.next_workspace_id.max(saved_workspace.id.0 + 1);
-                self.workspaces.push(Workspace::restore(
+                let label = unique_name(
+                    &model::automatic_name(&saved_workspace.label, "workspace"),
+                    self.workspaces
+                        .iter()
+                        .map(|workspace| workspace.label.as_str()),
+                );
+                let mut workspace = Workspace::restore(
                     saved_workspace.id,
-                    saved_workspace.label,
+                    label,
                     saved_workspace.identity_cwd,
                     tabs,
                     saved_workspace.active_tab,
-                ));
+                );
+                workspace.refresh_tab_display_titles();
+                self.workspaces.push(workspace);
             }
         }
         self.active_workspace = saved
@@ -536,6 +737,183 @@ impl Shell {
         })
     }
 
+    fn caller_key(
+        &self,
+        ipc_window_id: Option<u64>,
+    ) -> Result<Option<PaneKey>, vivido::host::IpcError> {
+        let Some(ipc_window_id) = ipc_window_id else {
+            return Ok(None);
+        };
+        self.platform_window_id(ipc_window_id)
+            .and_then(|window_id| self.pane_index.get(&window_id).copied())
+            .map(Some)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new(
+                    "window_not_found",
+                    "calling pane is not part of this Vivida instance",
+                )
+            })
+    }
+
+    fn resolve_workspace_id(
+        &self,
+        workspace_id: Option<u64>,
+        workspace_name: Option<&str>,
+        workspace_ordinal: Option<u64>,
+        caller: Option<PaneKey>,
+    ) -> Result<WorkspaceId, vivido::host::IpcError> {
+        if [
+            workspace_id.is_some(),
+            workspace_name.is_some(),
+            workspace_ordinal.is_some(),
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count()
+            > 1
+        {
+            return Err(vivido::host::IpcError::new(
+                "invalid_params",
+                "workspace selectors are mutually exclusive",
+            ));
+        }
+        let matched = if let Some(id) = workspace_id {
+            self.workspaces
+                .iter()
+                .find(|workspace| workspace.id == WorkspaceId(id))
+        } else if let Some(name) = workspace_name {
+            let name = normalize_name(name).map_err(|error| {
+                vivido::host::IpcError::new("invalid_params", error.to_string())
+            })?;
+            self.workspaces
+                .iter()
+                .find(|workspace| names_equal(&workspace.label, &name))
+        } else if let Some(ordinal) = workspace_ordinal {
+            ordinal_index(ordinal).and_then(|index| self.workspaces.get(index))
+        } else if let Some(caller) = caller {
+            self.workspaces
+                .iter()
+                .find(|workspace| workspace.id == caller.workspace_id)
+        } else if self.workspaces.len() == 1 {
+            self.workspaces.first()
+        } else {
+            return Err(vivido::host::IpcError::new(
+                "ambiguous_selector",
+                "workspace must be specified when more than one workspace exists",
+            ));
+        };
+        matched.map(|workspace| workspace.id).ok_or_else(|| {
+            vivido::host::IpcError::new("window_not_found", "workspace selector did not match")
+        })
+    }
+
+    fn resolve_tab_id(
+        &self,
+        workspace_id: WorkspaceId,
+        tab_id: Option<u64>,
+        tab_name: Option<&str>,
+        tab_ordinal: Option<u64>,
+        caller: Option<PaneKey>,
+        use_active_default: bool,
+    ) -> Result<TabId, vivido::host::IpcError> {
+        if [tab_id.is_some(), tab_name.is_some(), tab_ordinal.is_some()]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count()
+            > 1
+        {
+            return Err(vivido::host::IpcError::new(
+                "invalid_params",
+                "tab selectors are mutually exclusive",
+            ));
+        }
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        let matched = if let Some(id) = tab_id {
+            workspace.tabs.iter().find(|tab| tab.id == TabId(id))
+        } else if let Some(name) = tab_name {
+            let name = normalize_name(name).map_err(|error| {
+                vivido::host::IpcError::new("invalid_params", error.to_string())
+            })?;
+            workspace
+                .tabs
+                .iter()
+                .find(|tab| names_equal(&tab.title, &name))
+        } else if let Some(ordinal) = tab_ordinal {
+            ordinal_index(ordinal).and_then(|index| workspace.tabs.get(index))
+        } else if let Some(caller) = caller.filter(|caller| caller.workspace_id == workspace_id) {
+            workspace.tabs.iter().find(|tab| tab.id == caller.tab_id)
+        } else if workspace.tabs.len() == 1 {
+            workspace.tabs.first()
+        } else if use_active_default {
+            workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.id == workspace.active_tab)
+        } else {
+            return Err(vivido::host::IpcError::new(
+                "ambiguous_selector",
+                "tab must be specified when more than one tab exists",
+            ));
+        };
+        matched.map(|tab| tab.id).ok_or_else(|| {
+            vivido::host::IpcError::new("window_not_found", "tab selector did not match")
+        })
+    }
+
+    fn validate_unique_workspace_name(
+        &self,
+        name: &str,
+        except: Option<WorkspaceId>,
+    ) -> Result<String, vivido::host::IpcError> {
+        let name = normalize_name(name)
+            .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
+        if self
+            .workspaces
+            .iter()
+            .any(|workspace| Some(workspace.id) != except && names_equal(&workspace.label, &name))
+        {
+            return Err(vivido::host::IpcError::new(
+                "name_conflict",
+                "workspace name is already in use",
+            ));
+        }
+        Ok(name)
+    }
+
+    fn validate_unique_tab_name(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+        except: Option<TabId>,
+    ) -> Result<String, vivido::host::IpcError> {
+        let name = normalize_name(name)
+            .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        if workspace
+            .tabs
+            .iter()
+            .any(|tab| Some(tab.id) != except && names_equal(&tab.title, &name))
+        {
+            return Err(vivido::host::IpcError::new(
+                "name_conflict",
+                "tab name is already in use in this workspace",
+            ));
+        }
+        Ok(name)
+    }
+
     fn create_workspace(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -544,7 +922,13 @@ impl Shell {
         let pane_window_id = self.create_pane_window(event_loop, &cwd)?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id += 1;
-        let workspace = Workspace::new(workspace_id, workspace_label(&cwd), cwd, pane_window_id);
+        let label = unique_name(
+            &workspace_label(&cwd),
+            self.workspaces
+                .iter()
+                .map(|workspace| workspace.label.as_str()),
+        );
+        let workspace = Workspace::new(workspace_id, label, cwd, pane_window_id);
         self.pane_index.insert(
             pane_window_id,
             PaneKey {
@@ -609,6 +993,7 @@ impl Shell {
         };
         let workspace_id = workspace.id;
         let tab_id = workspace.add_tab(window_id);
+        workspace.refresh_tab_display_titles();
         self.pane_index.insert(
             window_id,
             PaneKey {
@@ -776,25 +1161,32 @@ impl Shell {
     fn host_create_workspace(
         &mut self,
         event_loop: &ActiveEventLoop,
-        mut options: WindowOptions,
+        params: CreateWorkspaceOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let CreateWorkspaceOptions { name, mut options } = params;
         let cwd = options
             .terminal_options
             .working_directory
             .clone()
             .unwrap_or_else(|| self.active_pane_cwd());
         options.terminal_options.working_directory = Some(cwd.clone());
+        let label = if let Some(name) = name {
+            self.validate_unique_workspace_name(&name, None)?
+        } else {
+            unique_name(
+                &workspace_label(&cwd),
+                self.workspaces
+                    .iter()
+                    .map(|workspace| workspace.label.as_str()),
+            )
+        };
         let window_id = self
             .create_pane_window_with_options(event_loop, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id = self.next_workspace_id.saturating_add(1);
-        self.workspaces.push(Workspace::new(
-            workspace_id,
-            workspace_label(&cwd),
-            cwd,
-            window_id,
-        ));
+        self.workspaces
+            .push(Workspace::new(workspace_id, label, cwd, window_id));
         self.active_workspace = Some(workspace_id);
         self.closing_workspaces.remove(&workspace_id);
         self.pane_index.insert(
@@ -814,15 +1206,22 @@ impl Shell {
     fn host_create_tab(
         &mut self,
         event_loop: &ActiveEventLoop,
-        workspace_id: Option<u64>,
-        mut options: WindowOptions,
+        params: CreateTabOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
-        let workspace_id = workspace_id
-            .map(WorkspaceId)
-            .or(self.active_workspace)
-            .ok_or_else(|| {
-                vivido::host::IpcError::new("invalid_state", "Vivida has no workspace")
-            })?;
+        let CreateTabOptions {
+            workspace_id,
+            workspace_name,
+            from_window_id,
+            name,
+            mut options,
+        } = params;
+        let caller = self.caller_key(from_window_id)?;
+        let workspace_id =
+            self.resolve_workspace_id(workspace_id, workspace_name.as_deref(), None, caller)?;
+        let custom_title = name
+            .as_deref()
+            .map(|name| self.validate_unique_tab_name(workspace_id, name, None))
+            .transpose()?;
         let default_cwd = self
             .workspaces
             .iter()
@@ -845,6 +1244,12 @@ impl Shell {
                 vivido::host::IpcError::new("window_not_found", "workspace disappeared")
             })?;
         let tab_id = workspace.add_tab(window_id);
+        if let Some(title) = custom_title
+            && let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.set_custom_title(title);
+        }
+        workspace.refresh_tab_display_titles();
         self.active_workspace = Some(workspace_id);
         self.pane_index.insert(
             window_id,
@@ -951,8 +1356,21 @@ impl Shell {
         &mut self,
         target: TabTarget,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
-        let workspace_id = WorkspaceId(target.workspace_id);
-        let tab_id = TabId(target.tab_id);
+        let caller = self.caller_key(target.from_window_id)?;
+        let workspace_id = self.resolve_workspace_id(
+            target.workspace_id,
+            target.workspace_name.as_deref(),
+            None,
+            caller,
+        )?;
+        let tab_id = self.resolve_tab_id(
+            workspace_id,
+            target.tab_id,
+            target.tab_name.as_deref(),
+            None,
+            caller,
+            false,
+        )?;
         let workspace = self
             .workspaces
             .iter_mut()
@@ -975,83 +1393,174 @@ impl Shell {
         self.sync_visibility_and_geometry();
         self.focus_active_pane();
         Ok(
-            serde_json::json!({"accepted": true, "workspace_id": target.workspace_id, "tab_id": target.tab_id}),
+            serde_json::json!({"accepted": true, "workspace_id": workspace_id.0, "tab_id": tab_id.0}),
         )
+    }
+
+    fn host_rename_workspace(
+        &mut self,
+        params: RenameWorkspaceOptions,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let caller = self.caller_key(params.target.from_window_id)?;
+        let workspace_id = self.resolve_workspace_id(
+            params.target.workspace_id,
+            params.target.workspace_name.as_deref(),
+            None,
+            caller,
+        )?;
+        let name = self.validate_unique_workspace_name(&params.name, Some(workspace_id))?;
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        workspace.label.clone_from(&name);
+        self.request_chrome_redraw();
+        Ok(serde_json::json!({"workspace_id": workspace_id.0, "workspace_name": name}))
+    }
+
+    fn host_rename_tab(
+        &mut self,
+        params: RenameTabOptions,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let caller = self.caller_key(params.target.from_window_id)?;
+        let workspace_id = self.resolve_workspace_id(
+            params.target.workspace_id,
+            params.target.workspace_name.as_deref(),
+            None,
+            caller,
+        )?;
+        let tab_id = self.resolve_tab_id(
+            workspace_id,
+            params.target.tab_id,
+            params.target.tab_name.as_deref(),
+            None,
+            caller,
+            false,
+        )?;
+        let name = self.validate_unique_tab_name(workspace_id, &params.name, Some(tab_id))?;
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        let tab = workspace
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab not found"))?;
+        tab.set_custom_title(name.clone());
+        workspace.refresh_tab_display_titles();
+        self.request_chrome_redraw();
+        Ok(serde_json::json!({
+            "workspace_id": workspace_id.0,
+            "tab_id": tab_id.0,
+            "tab_name": name,
+            "custom_title": true,
+        }))
+    }
+
+    fn host_reset_tab_title(
+        &mut self,
+        target: TabTarget,
+    ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        let caller = self.caller_key(target.from_window_id)?;
+        let workspace_id = self.resolve_workspace_id(
+            target.workspace_id,
+            target.workspace_name.as_deref(),
+            None,
+            caller,
+        )?;
+        let tab_id = self.resolve_tab_id(
+            workspace_id,
+            target.tab_id,
+            target.tab_name.as_deref(),
+            None,
+            caller,
+            false,
+        )?;
+        let workspace = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        let tab = workspace
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab not found"))?;
+        tab.reset_title();
+        workspace.refresh_tab_display_titles();
+        let title = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default();
+        self.request_chrome_redraw();
+        Ok(serde_json::json!({
+            "workspace_id": workspace_id.0,
+            "tab_id": tab_id.0,
+            "tab_name": title,
+            "custom_title": false,
+        }))
     }
 
     fn host_resolve_pane(
         &self,
         params: ResolvePaneOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
-        let caller = params.from_window_id.and_then(|ipc_window_id| {
-            self.platform_window_id(ipc_window_id)
-                .and_then(|window_id| self.pane_index.get(&window_id).copied())
-        });
-        if params.from_window_id.is_some() && caller.is_none() {
+        if params.pane_id.is_some() && (params.from_pane_id.is_some() || !params.path.is_empty()) {
             return Err(vivido::host::IpcError::new(
-                "window_not_found",
-                "calling pane is not part of this Vivida instance",
+                "invalid_params",
+                "pane_id cannot be combined with from_pane_id or path",
             ));
         }
-
-        let (workspace_index, workspace) = if let Some(workspace_id) = params.workspace_id {
-            self.workspaces
-                .iter()
-                .enumerate()
-                .find(|(_, workspace)| workspace.id == WorkspaceId(workspace_id))
-        } else if let Some(ordinal) = params.workspace {
-            ordinal_index(ordinal).and_then(|index| {
-                self.workspaces
-                    .get(index)
-                    .map(|workspace| (index, workspace))
-            })
-        } else if let Some(caller) = caller {
-            self.workspaces
-                .iter()
-                .enumerate()
-                .find(|(_, workspace)| workspace.id == caller.workspace_id)
-        } else {
-            self.active_workspace.and_then(|workspace_id| {
-                self.workspaces
-                    .iter()
-                    .enumerate()
-                    .find(|(_, workspace)| workspace.id == workspace_id)
-            })
-        }
-        .ok_or_else(|| {
-            vivido::host::IpcError::new("window_not_found", "workspace selector did not match")
-        })?;
-
-        let caller_tab = caller
-            .filter(|caller| caller.workspace_id == workspace.id)
-            .map(|caller| caller.tab_id);
-        let (tab_index, tab) = if let Some(tab_id) = params.tab_id {
-            workspace
-                .tabs
-                .iter()
-                .enumerate()
-                .find(|(_, tab)| tab.id == TabId(tab_id))
-        } else if let Some(ordinal) = params.tab {
-            ordinal_index(ordinal)
-                .and_then(|index| workspace.tabs.get(index).map(|tab| (index, tab)))
-        } else {
-            let tab_id = caller_tab.unwrap_or(workspace.active_tab);
-            workspace
-                .tabs
-                .iter()
-                .enumerate()
-                .find(|(_, tab)| tab.id == tab_id)
-        }
-        .ok_or_else(|| {
-            vivido::host::IpcError::new("window_not_found", "tab selector did not match")
-        })?;
+        let caller = self.caller_key(params.from_window_id)?;
+        let workspace_id = self.resolve_workspace_id(
+            params.workspace_id,
+            params.workspace_name.as_deref(),
+            params.workspace,
+            caller,
+        )?;
+        let tab_id = self.resolve_tab_id(
+            workspace_id,
+            params.tab_id,
+            params.tab_name.as_deref(),
+            params.tab,
+            caller,
+            true,
+        )?;
+        let (workspace_index, workspace) = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find(|(_, workspace)| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                vivido::host::IpcError::new("window_not_found", "workspace not found")
+            })?;
+        let (tab_index, tab) = workspace
+            .tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| tab.id == tab_id)
+            .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab not found"))?;
 
         let scale = self
             .chrome_window
             .as_ref()
             .map_or(1.0, |chrome| chrome.scale_factor());
         let rects = compute_rects(&tab.root, self.chrome_layout.content, scale);
-        let source_pane_id = if let Some(pane_id) = params.from_pane_id {
+        let source_pane_id = if let Some(pane_id) = params.pane_id {
+            let pane_id = PaneId(pane_id);
+            tab.panes.contains_key(&pane_id).then_some(pane_id)
+        } else if let Some(pane_id) = params.from_pane_id {
             let pane_id = PaneId(pane_id);
             tab.panes.contains_key(&pane_id).then_some(pane_id)
         } else {
@@ -1088,6 +1597,11 @@ impl Shell {
         let rect = rects.get(&pane_id).copied().unwrap_or_default();
         let target = serde_json::json!({
             "pane_id": pane_id.0,
+            "locator": {
+                "workspace_name": workspace.label,
+                "tab_name": tab.title,
+                "pane_id": pane_id.0,
+            },
             "split_path": tab.root.pane_path(pane_id),
             "window_id": pane.ipc_window_id(),
             "title": pane.title(),
@@ -1100,8 +1614,11 @@ impl Shell {
             "selector": {
                 "workspace": params.workspace,
                 "workspace_id": params.workspace_id,
+                "workspace_name": params.workspace_name,
                 "tab": params.tab,
                 "tab_id": params.tab_id,
+                "tab_name": params.tab_name,
+                "pane_id": params.pane_id,
                 "from_pane_id": params.from_pane_id,
                 "path": params.path,
             },
@@ -1150,6 +1667,11 @@ impl Shell {
                                     && !self.closing_workspaces.contains(&workspace.id);
                                 Some(serde_json::json!({
                                     "pane_id": pane_id.0,
+                                    "locator": {
+                                        "workspace_name": workspace.label,
+                                        "tab_name": tab.title,
+                                        "pane_id": pane_id.0,
+                                    },
                                     "split_path": tab.root.pane_path(*pane_id),
                                     "window_id": pane.ipc_window_id(),
                                     "is_caller": caller_window_id == Some(pane.ipc_window_id()),
@@ -1172,9 +1694,10 @@ impl Shell {
                             })
                             .collect::<Vec<_>>();
                         serde_json::json!({
-                            "tab_id": tab.id.0,
+                        "tab_id": tab.id.0,
                             "tab_index": tab_index + 1,
-                            "title": tab.title,
+                        "title": tab.title,
+                        "custom_title": tab.is_title_custom(),
                             "active": workspace.active_tab == tab.id,
                             "focused_pane_id": tab.focused_pane.0,
                             "layout": layout_node_json(&tab.root, tab, &self.processor),
@@ -1213,8 +1736,10 @@ impl Shell {
                         "window_id": ipc_window_id,
                         "workspace_index": workspace_index + 1,
                         "workspace_id": key.workspace_id.0,
+                        "workspace_name": workspace.label,
                         "tab_index": tab_index + 1,
                         "tab_id": key.tab_id.0,
+                        "tab_name": tab.title,
                         "pane_id": key.pane_id.0,
                         "split_path": tab.root.pane_path(key.pane_id),
                         "selected_in_host": self.active_workspace == Some(key.workspace_id)
@@ -1264,6 +1789,7 @@ impl Shell {
     fn sync_pane_visibility(&mut self) {
         let active = self.active_workspace;
         let closing = &self.closing_workspaces;
+        let native_editor_open = self.name_editor.is_some() && !cfg!(target_os = "linux");
         let visibility = self
             .workspaces
             .iter()
@@ -1272,7 +1798,8 @@ impl Shell {
                     tab.panes.values().copied().map(move |window_id| {
                         let visible = Some(workspace.id) == active
                             && tab.id == workspace.active_tab
-                            && !closing.contains(&workspace.id);
+                            && !closing.contains(&workspace.id)
+                            && !native_editor_open;
                         (window_id, visible)
                     })
                 })
@@ -1424,6 +1951,19 @@ impl Shell {
                 .chrome_hits
                 .settings_menu
                 .contains(position.x, position.y)
+        {
+            return None;
+        }
+        if (self.name_context_menu.is_some()
+            && self
+                .chrome_hits
+                .context_menu
+                .contains(position.x, position.y))
+            || (self.name_editor.is_some()
+                && self
+                    .chrome_hits
+                    .rename_editor
+                    .contains(position.x, position.y))
         {
             return None;
         }
@@ -1600,6 +2140,34 @@ impl Shell {
                 ),
             });
         }
+        let context_menu = self.name_context_menu.map(|menu| ContextMenuRenderState {
+            anchor: menu.anchor,
+            automatic_title_action: match menu.target {
+                NameTarget::Workspace(_) => false,
+                NameTarget::Tab {
+                    workspace_id,
+                    tab_id,
+                } => self
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)
+                    .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
+                    .is_some_and(model::Tab::is_title_custom),
+            },
+        });
+        let editor_display = self.name_editor.as_ref().map(NameEditor::display_value);
+        let rename_editor = self
+            .name_editor
+            .as_ref()
+            .zip(editor_display.as_deref())
+            .map(|(editor, display_value)| RenameEditorRenderState {
+                label: match editor.target {
+                    NameTarget::Workspace(_) => "Rename Workspace",
+                    NameTarget::Tab { .. } => "Rename Tab",
+                },
+                display_value,
+                error: editor.error.as_deref(),
+            });
         let Some(renderer) = &mut self.chrome_renderer else {
             return;
         };
@@ -1612,6 +2180,8 @@ impl Shell {
                 hovered_workspace: self.hovered_workspace,
                 fullscreen: chrome.fullscreen().is_some(),
                 settings_menu_open: self.settings_menu_open && self.settings_menu_window.is_none(),
+                context_menu,
+                rename_editor,
                 embedded_frames: &embedded_frames,
             },
         ) {
@@ -1680,6 +2250,213 @@ impl Shell {
         self.request_chrome_redraw();
     }
 
+    fn name_target_at(&self, position: PhysicalPosition<f64>) -> Option<NameTarget> {
+        if let Some(tab_id) = self
+            .chrome_hits
+            .tab_rows
+            .iter()
+            .find_map(|(id, rect)| rect.contains(position.x, position.y).then_some(*id))
+            && let Some(workspace_id) = self.active_workspace
+        {
+            return Some(NameTarget::Tab {
+                workspace_id,
+                tab_id,
+            });
+        }
+        self.chrome_hits
+            .workspace_rows
+            .iter()
+            .find_map(|(id, rect)| {
+                rect.contains(position.x, position.y)
+                    .then_some(NameTarget::Workspace(*id))
+            })
+    }
+
+    fn open_name_context_menu(&mut self, target: NameTarget, anchor: PhysicalPosition<f64>) {
+        self.set_settings_menu_open(false);
+        self.name_editor = None;
+        self.name_context_menu = Some(NameContextMenu { target, anchor });
+        self.request_chrome_redraw();
+    }
+
+    fn start_name_editor(&mut self, target: NameTarget) {
+        let current = match target {
+            NameTarget::Workspace(workspace_id) => self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .map(|workspace| workspace.label.clone()),
+            NameTarget::Tab {
+                workspace_id,
+                tab_id,
+            } => self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
+                .map(|tab| tab.title.clone()),
+        };
+        let Some(current) = current else {
+            self.name_context_menu = None;
+            return;
+        };
+        self.name_context_menu = None;
+        self.name_editor = Some(NameEditor::new(target, current));
+        self.sync_pane_visibility();
+        #[cfg(target_os = "linux")]
+        self.clear_embedded_focus();
+        if let Some(chrome) = &self.chrome_window {
+            chrome.set_ime_allowed(true);
+            focus_chrome_input(chrome);
+        }
+        self.request_chrome_redraw();
+    }
+
+    fn close_name_editor(&mut self) {
+        if self.name_editor.take().is_none() {
+            return;
+        }
+        self.sync_pane_visibility();
+        if let Some(chrome) = &self.chrome_window {
+            chrome.set_ime_allowed(false);
+        }
+        self.focus_active_pane();
+        self.request_chrome_redraw();
+    }
+
+    fn commit_name_editor(&mut self) {
+        let Some(editor) = &self.name_editor else {
+            return;
+        };
+        let target = editor.target;
+        let name = editor.text.clone();
+        let result = match target {
+            NameTarget::Workspace(workspace_id) => self
+                .host_rename_workspace(RenameWorkspaceOptions {
+                    target: WorkspaceTarget {
+                        workspace_id: Some(workspace_id.0),
+                        workspace_name: None,
+                        from_window_id: None,
+                    },
+                    name,
+                })
+                .map(|_| ()),
+            NameTarget::Tab {
+                workspace_id,
+                tab_id,
+            } => self
+                .host_rename_tab(RenameTabOptions {
+                    target: TabTarget {
+                        workspace_id: Some(workspace_id.0),
+                        workspace_name: None,
+                        tab_id: Some(tab_id.0),
+                        tab_name: None,
+                        from_window_id: None,
+                    },
+                    name,
+                })
+                .map(|_| ()),
+        };
+        match result {
+            Ok(()) => self.close_name_editor(),
+            Err(error) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.error = Some(error.message);
+                }
+                self.request_chrome_redraw();
+            }
+        }
+    }
+
+    fn reset_context_tab_title(&mut self, workspace_id: WorkspaceId, tab_id: TabId) {
+        let _ = self.host_reset_tab_title(TabTarget {
+            workspace_id: Some(workspace_id.0),
+            workspace_name: None,
+            tab_id: Some(tab_id.0),
+            tab_name: None,
+            from_window_id: None,
+        });
+        self.name_context_menu = None;
+        self.focus_active_pane();
+        self.request_chrome_redraw();
+    }
+
+    fn handle_name_editor_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.name_editor.is_none() || event.state != ElementState::Pressed {
+            return false;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => self.commit_name_editor(),
+            Key::Named(NamedKey::Escape) => self.close_name_editor(),
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.backspace();
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.delete();
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.move_left();
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.move_right();
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                let editor = self.name_editor.as_mut().unwrap();
+                editor.select_all = false;
+                editor.cursor = 0;
+            }
+            Key::Named(NamedKey::End) => {
+                let editor = self.name_editor.as_mut().unwrap();
+                editor.select_all = false;
+                editor.cursor = editor.text.len();
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.insert(" ");
+                }
+            }
+            Key::Character(text)
+                if shell_modifier_pressed(self.modifiers) && text.eq_ignore_ascii_case("a") =>
+            {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.select_all = true;
+                }
+            }
+            Key::Character(text) if !shell_modifier_pressed(self.modifiers) => {
+                if let Some(editor) = &mut self.name_editor {
+                    editor.insert(text);
+                }
+            }
+            _ => return true,
+        }
+        self.request_chrome_redraw();
+        true
+    }
+
+    fn handle_name_editor_ime(&mut self, ime: Ime) -> bool {
+        let Some(editor) = &mut self.name_editor else {
+            return false;
+        };
+        match ime {
+            Ime::Preedit(text, _) => editor.preedit = text,
+            Ime::Commit(text) => {
+                editor.preedit.clear();
+                editor.insert(&text);
+            }
+            Ime::Enabled | Ime::Disabled => editor.preedit.clear(),
+        }
+        self.request_chrome_redraw();
+        true
+    }
+
     fn sync_settings_menu_window(&self) {
         let (Some(chrome), Some(menu)) = (&self.chrome_window, &self.settings_menu_window) else {
             return;
@@ -1724,7 +2501,18 @@ impl Shell {
                     .map_err(|error| {
                         vivido::host::IpcError::new("invalid_params", error.to_string())
                     })
-                    .and_then(|options| self.host_create_tab(event_loop, None, options)),
+                    .and_then(|options| {
+                        self.host_create_tab(
+                            event_loop,
+                            CreateTabOptions {
+                                workspace_id: self.active_workspace.map(|id| id.0),
+                                workspace_name: None,
+                                from_window_id: None,
+                                name: None,
+                                options,
+                            },
+                        )
+                    }),
                 "vivida_layout" => serde_json::from_value::<LayoutOptions>(request.params.clone())
                     .map_err(|error| {
                         vivido::host::IpcError::new("invalid_params", error.to_string())
@@ -1765,7 +2553,7 @@ impl Shell {
                         })
                 }
                 "vivida_create_workspace" => {
-                    serde_json::from_value::<WindowOptions>(request.params.clone())
+                    serde_json::from_value::<CreateWorkspaceOptions>(request.params.clone())
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
@@ -1776,9 +2564,7 @@ impl Shell {
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|params| {
-                            self.host_create_tab(event_loop, params.workspace_id, params.options)
-                        })
+                        .and_then(|params| self.host_create_tab(event_loop, params))
                 }
                 "vivida_split_pane" => {
                     serde_json::from_value::<SplitPaneOptions>(request.params.clone())
@@ -1804,20 +2590,37 @@ impl Shell {
                 )
                 .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))
                 .and_then(|target| {
-                    let workspace_id = WorkspaceId(target.workspace_id);
-                    if !self
-                        .workspaces
-                        .iter()
-                        .any(|workspace| workspace.id == workspace_id)
-                    {
-                        return Err(vivido::host::IpcError::new(
-                            "window_not_found",
-                            "workspace not found",
-                        ));
-                    }
+                    let caller = self.caller_key(target.from_window_id)?;
+                    let workspace_id = self.resolve_workspace_id(
+                        target.workspace_id,
+                        target.workspace_name.as_deref(),
+                        None,
+                        caller,
+                    )?;
                     self.close_workspace(workspace_id);
-                    Ok(serde_json::json!({"accepted": true, "workspace_id": target.workspace_id}))
+                    Ok(serde_json::json!({"accepted": true, "workspace_id": workspace_id.0}))
                 }),
+                "vivida_rename_workspace" => {
+                    serde_json::from_value::<RenameWorkspaceOptions>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|params| self.host_rename_workspace(params))
+                }
+                "vivida_rename_tab" => {
+                    serde_json::from_value::<RenameTabOptions>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|params| self.host_rename_tab(params))
+                }
+                "vivida_reset_tab_title" => {
+                    serde_json::from_value::<TabTarget>(request.params.clone())
+                        .map_err(|error| {
+                            vivido::host::IpcError::new("invalid_params", error.to_string())
+                        })
+                        .and_then(|target| self.host_reset_tab_title(target))
+                }
                 unknown => Err(vivido::host::IpcError::new(
                     "unsupported",
                     format!("Vivida does not answer {unknown}"),
@@ -1835,7 +2638,16 @@ impl Shell {
             match request.action {
                 ShellAction::CreateTab(options) => {
                     if let Some(key) = self.pane_index.get(&request.source).copied() {
-                        let _ = self.host_create_tab(event_loop, Some(key.workspace_id.0), *options);
+                        let _ = self.host_create_tab(
+                            event_loop,
+                            CreateTabOptions {
+                                workspace_id: Some(key.workspace_id.0),
+                                workspace_name: None,
+                                from_window_id: None,
+                                name: None,
+                                options: *options,
+                            },
+                        );
                     }
                 }
                 action @ (ShellAction::SelectNextTab | ShellAction::SelectPreviousTab) => {
@@ -1945,6 +2757,36 @@ impl Shell {
         let Some(cursor) = self.cursor_position else {
             return false;
         };
+        if self.name_editor.is_some() {
+            if !self.chrome_hits.rename_editor.contains(cursor.x, cursor.y) {
+                self.close_name_editor();
+            }
+            return true;
+        }
+        if let Some(menu) = self.name_context_menu {
+            let item = self
+                .chrome_hits
+                .context_items
+                .iter()
+                .position(|rect| rect.contains(cursor.x, cursor.y));
+            match item {
+                Some(0) => self.start_name_editor(menu.target),
+                Some(1) => {
+                    if let NameTarget::Tab {
+                        workspace_id,
+                        tab_id,
+                    } = menu.target
+                    {
+                        self.reset_context_tab_title(workspace_id, tab_id);
+                    }
+                }
+                _ => {
+                    self.name_context_menu = None;
+                    self.request_chrome_redraw();
+                }
+            }
+            return true;
+        }
         if self.settings_menu_open {
             match settings_menu_click(&self.chrome_hits, cursor) {
                 SettingsMenuClick::Item(_) | SettingsMenuClick::Outside => {
@@ -2184,7 +3026,7 @@ impl Shell {
     }
 
     fn handle_chrome_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
-        if self.handle_shell_shortcut(event_loop, &event) {
+        if self.name_editor.is_none() && self.handle_shell_shortcut(event_loop, &event) {
             return;
         }
         match event {
@@ -2219,12 +3061,22 @@ impl Shell {
             // remembered terminal child so activation, task switching, and startup all type into
             // the pane rather than the chrome surface.
             WindowEvent::Focused(true) => {
-                self.focus_active_pane();
+                if self.name_editor.is_none() {
+                    self.focus_active_pane();
+                }
             }
             WindowEvent::Focused(false) => {
                 #[cfg(target_os = "linux")]
                 self.clear_embedded_focus();
                 self.set_settings_menu_open(false);
+                self.name_context_menu = None;
+                if self.name_editor.take().is_some() {
+                    self.sync_pane_visibility();
+                    if let Some(chrome) = &self.chrome_window {
+                        chrome.set_ime_allowed(false);
+                    }
+                    self.request_chrome_redraw();
+                }
             }
             WindowEvent::RedrawRequested => self.render_chrome(),
             WindowEvent::CursorMoved {
@@ -2289,6 +3141,19 @@ impl Shell {
             } => {
                 #[cfg(not(target_os = "linux"))]
                 let _ = device_id;
+                if state == ElementState::Pressed && button == MouseButton::Right {
+                    if let Some(position) = self.cursor_position
+                        && let Some(target) = self.name_target_at(position)
+                    {
+                        self.open_name_context_menu(target, position);
+                        return;
+                    }
+                    if self.name_context_menu.take().is_some() || self.name_editor.is_some() {
+                        self.close_name_editor();
+                        self.request_chrome_redraw();
+                        return;
+                    }
+                }
                 #[cfg(target_os = "linux")]
                 {
                     if state == ElementState::Pressed
@@ -2359,6 +3224,9 @@ impl Shell {
                 }
             }
             WindowEvent::Ime(ime) => {
+                if self.handle_name_editor_ime(ime.clone()) {
+                    return;
+                }
                 #[cfg(not(target_os = "linux"))]
                 let _ = ime;
                 #[cfg(target_os = "linux")]
@@ -2395,6 +3263,7 @@ impl Shell {
                     }
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } if self.handle_name_editor_key(&event) => {}
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape)
@@ -2524,15 +3393,16 @@ impl Shell {
             .iter()
             .flat_map(|workspace| {
                 workspace.tabs.iter().filter_map(|tab| {
+                    if tab.is_title_custom() {
+                        return None;
+                    }
                     let window = tab.window_id(tab.root.first_pane())?;
                     let title = self.processor.window(window)?.title().to_owned();
-                    (title != tab.title).then_some((workspace.id, tab.id, title))
+                    Some((workspace.id, tab.id, title))
                 })
             })
             .collect::<Vec<_>>();
-        if updates.is_empty() {
-            return;
-        }
+        let mut changed = false;
         for (workspace_id, tab_id, title) in updates {
             if let Some(tab) = self
                 .workspaces
@@ -2540,10 +3410,15 @@ impl Shell {
                 .find(|workspace| workspace.id == workspace_id)
                 .and_then(|workspace| workspace.tabs.iter_mut().find(|tab| tab.id == tab_id))
             {
-                tab.title = title;
+                changed |= tab.set_context_title(&title);
             }
         }
-        self.request_chrome_redraw();
+        for workspace in &mut self.workspaces {
+            changed |= workspace.refresh_tab_display_titles();
+        }
+        if changed {
+            self.request_chrome_redraw();
+        }
     }
 }
 
@@ -2996,6 +3871,13 @@ fn send_vivida_message(options: VividaMessageOptions) -> Result<(), Box<dyn Erro
         VividaMessage::CloseWorkspace(target) => {
             ("vivida_close_workspace", serde_json::to_value(target)?)
         }
+        VividaMessage::RenameWorkspace(options) => {
+            ("vivida_rename_workspace", serde_json::to_value(options)?)
+        }
+        VividaMessage::RenameTab(options) => ("vivida_rename_tab", serde_json::to_value(options)?),
+        VividaMessage::ResetTabTitle(target) => {
+            ("vivida_reset_tab_title", serde_json::to_value(target)?)
+        }
         VividaMessage::Vivido(_) => unreachable!("standard messages returned above"),
     };
     let (_, result) = vivido::host::request_method(socket, target.as_deref(), method, params)?;
@@ -3322,6 +4204,43 @@ mod tests {
                 )
         ));
 
+        let named = VividaOptions::try_parse_from([
+            "vivida",
+            "msg",
+            "resolve-pane",
+            "--workspace-name",
+            "Project A",
+            "--tab-name",
+            "Logs",
+            "--pane-id",
+            "3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            named.command.as_ref(),
+            Some(VividaCommand::Msg(options))
+                if matches!(
+                    &options.message,
+                    VividaMessage::ResolvePane(ResolvePaneOptions {
+                        workspace_name: Some(workspace_name),
+                        tab_name: Some(tab_name),
+                        pane_id: Some(3),
+                        ..
+                    }) if workspace_name == "Project A" && tab_name == "Logs"
+                )
+        ));
+
+        for command in ["rename-workspace", "rename-tab", "reset-tab-title"] {
+            let mut arguments = vec!["vivida", "msg", command, "--workspace-name", "Project A"];
+            if command != "rename-workspace" {
+                arguments.extend(["--tab-name", "Logs"]);
+            }
+            if command != "reset-tab-title" {
+                arguments.extend(["--name", "Server"]);
+            }
+            VividaOptions::try_parse_from(arguments).unwrap();
+        }
+
         let activate =
             VividaOptions::try_parse_from(["vivida", "msg", "activate-pane", "--window-id", "42"])
                 .unwrap();
@@ -3391,6 +4310,18 @@ mod tests {
             directional_neighbor(&tab, &rects, PaneId(3), PaneDirection::Left),
             Some(PaneId(4))
         );
+    }
+
+    #[test]
+    fn name_editor_replaces_selection_and_edits_unicode_by_character() {
+        let mut editor = NameEditor::new(NameTarget::Workspace(WorkspaceId(1)), "Old Name".into());
+        editor.insert("界a");
+        assert_eq!(editor.text, "界a");
+        editor.backspace();
+        assert_eq!(editor.text, "界");
+        editor.move_left();
+        editor.delete();
+        assert!(editor.text.is_empty());
     }
 
     #[test]

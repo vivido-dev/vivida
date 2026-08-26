@@ -15,6 +15,10 @@ pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes
     attributes.with_decorations(false)
 }
 pub fn finalize_chrome_window(_window: &Window) {}
+
+pub fn focus_chrome_input(window: &Window) {
+    window.focus_window();
+}
 pub fn settings_menu_window_attributes(
     _chrome: &Window,
     _attributes: WindowAttributes,

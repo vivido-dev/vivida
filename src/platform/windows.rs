@@ -4,6 +4,7 @@ use std::error::Error;
 
 use vivido::Event;
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
 };
@@ -26,6 +27,23 @@ pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes
 }
 
 pub fn finalize_chrome_window(_window: &Window) {}
+
+pub fn focus_chrome_input(window: &Window) {
+    window.focus_window();
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let Some(window) = hwnd(handle.as_raw()) else {
+        return;
+    };
+    // SAFETY: the chrome HWND is live and belongs to the event-loop thread. Native terminal panes
+    // are child HWNDs on that same thread, so explicitly assigning focus to their parent is the
+    // inverse of PaneHost::focus and ensures keyboard messages reach the rename editor.
+    unsafe {
+        SetActiveWindow(window);
+        SetFocus(window);
+    }
+}
 
 pub fn settings_menu_window_attributes(
     chrome: &Window,

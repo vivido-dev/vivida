@@ -12,7 +12,7 @@ use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::display::renderer::SceneRenderer;
 use vivido::display::text::TextSystem;
 use vivido::display::window::RenderSource;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
 use crate::layout::PhysicalRect;
@@ -29,6 +29,10 @@ const NEW_TAB_LOGICAL: f64 = 36.0;
 const MACOS_TRAFFIC_LIGHTS_LOGICAL: f64 = 64.0;
 const SETTINGS_MENU_WIDTH_LOGICAL: f64 = 190.0;
 const SETTINGS_MENU_ROW_LOGICAL: f64 = 34.0;
+const CONTEXT_MENU_WIDTH_LOGICAL: f64 = 210.0;
+const CONTEXT_MENU_ROW_LOGICAL: f64 = 34.0;
+const RENAME_EDITOR_WIDTH_LOGICAL: f64 = 380.0;
+const RENAME_EDITOR_HEIGHT_LOGICAL: f64 = 112.0;
 
 const SETTINGS_MENU_ITEMS: [&str; 3] = ["Settings", "Shortcuts", "Documentation"];
 
@@ -85,6 +89,9 @@ pub struct ChromeHitMap {
     pub close: PhysicalRect,
     pub settings_menu: PhysicalRect,
     pub settings_items: Vec<PhysicalRect>,
+    pub context_menu: PhysicalRect,
+    pub context_items: Vec<PhysicalRect>,
+    pub rename_editor: PhysicalRect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -156,7 +163,22 @@ pub struct ChromeRenderState<'a> {
     pub hovered_workspace: Option<WorkspaceId>,
     pub fullscreen: bool,
     pub settings_menu_open: bool,
+    pub context_menu: Option<ContextMenuRenderState>,
+    pub rename_editor: Option<RenameEditorRenderState<'a>>,
     pub embedded_frames: &'a [EmbeddedFramePlacement<'a>],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ContextMenuRenderState {
+    pub anchor: PhysicalPosition<f64>,
+    pub automatic_title_action: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RenameEditorRenderState<'a> {
+    pub label: &'a str,
+    pub display_value: &'a str,
+    pub error: Option<&'a str>,
 }
 
 pub struct SettingsMenuRenderer {
@@ -423,13 +445,35 @@ impl ChromeRenderer {
         if state.settings_menu_open {
             self.paint_settings_menu(&mut scene, size, &mut hit_map);
         }
+        if let Some(menu) = state.context_menu {
+            self.paint_context_menu(&mut scene, size, menu, &mut hit_map);
+        }
+        if let Some(editor) = state.rename_editor {
+            self.paint_rename_editor(&mut scene, size, editor, &mut hit_map);
+        }
 
+        let overlay = if state.rename_editor.is_some() {
+            hit_map.rename_editor
+        } else if state.context_menu.is_some() {
+            hit_map.context_menu
+        } else {
+            PhysicalRect::default()
+        };
+        let overlay = (overlay.width > 0 && overlay.height > 0).then(|| {
+            (
+                PhysicalPosition::new(
+                    u32::try_from(overlay.x).unwrap_or_default(),
+                    u32::try_from(overlay.y).unwrap_or_default(),
+                ),
+                PhysicalSize::new(overlay.width, overlay.height),
+            )
+        });
         let background_alpha = if self.transparent_content { 0 } else { u8::MAX };
         let presented = self.renderer.render_composited(
             &scene,
             Color::from_rgba8(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b, background_alpha),
             state.embedded_frames,
-            None,
+            overlay,
         )?;
         Ok((layout, hit_map, presented))
     }
@@ -823,6 +867,141 @@ impl ChromeRenderer {
                     row.y as f32 + 9.0 * scale as f32,
                 ),
                 TEXT,
+                false,
+            );
+        }
+    }
+
+    fn paint_context_menu(
+        &mut self,
+        scene: &mut Scene,
+        size: PhysicalSize<u32>,
+        state: ContextMenuRenderState,
+        hit_map: &mut ChromeHitMap,
+    ) {
+        let scale = self.scale_factor;
+        let width = (CONTEXT_MENU_WIDTH_LOGICAL * scale).round() as u32;
+        let row_height = (CONTEXT_MENU_ROW_LOGICAL * scale).round() as u32;
+        let rows = if state.automatic_title_action { 2 } else { 1 };
+        let height = row_height.saturating_mul(rows);
+        let max_x = size.width.saturating_sub(width);
+        let max_y = size.height.saturating_sub(height);
+        hit_map.context_menu = PhysicalRect {
+            x: state.anchor.x.max(0.0).min(f64::from(max_x)).round() as i32,
+            y: state.anchor.y.max(0.0).min(f64::from(max_y)).round() as i32,
+            width: width.min(size.width),
+            height: height.min(size.height),
+        };
+        paint_rects(scene, [rect(hit_map.context_menu, SIDEBAR)]);
+        let labels = if state.automatic_title_action {
+            &["Rename", "Use Automatic Title"][..]
+        } else {
+            &["Rename"][..]
+        };
+        for (index, label) in labels.iter().enumerate() {
+            let row = PhysicalRect {
+                x: hit_map.context_menu.x,
+                y: hit_map.context_menu.y
+                    + i32::try_from(index as u32 * row_height).unwrap_or_default(),
+                width: hit_map.context_menu.width,
+                height: row_height.min(
+                    hit_map
+                        .context_menu
+                        .height
+                        .saturating_sub(index as u32 * row_height),
+                ),
+            };
+            hit_map.context_items.push(row);
+            self.text.paint_text(
+                scene,
+                label,
+                (
+                    row.x as f32 + 12.0 * scale as f32,
+                    row.y as f32 + 9.0 * scale as f32,
+                ),
+                TEXT,
+                false,
+            );
+        }
+    }
+
+    fn paint_rename_editor(
+        &mut self,
+        scene: &mut Scene,
+        size: PhysicalSize<u32>,
+        state: RenameEditorRenderState<'_>,
+        hit_map: &mut ChromeHitMap,
+    ) {
+        let scale = self.scale_factor;
+        let width = ((RENAME_EDITOR_WIDTH_LOGICAL * scale).round() as u32).min(size.width);
+        let height = ((RENAME_EDITOR_HEIGHT_LOGICAL * scale).round() as u32).min(size.height);
+        hit_map.rename_editor = PhysicalRect {
+            x: i32::try_from(size.width.saturating_sub(width) / 2).unwrap_or_default(),
+            y: i32::try_from(size.height.saturating_sub(height) / 3).unwrap_or_default(),
+            width,
+            height,
+        };
+        let field = PhysicalRect {
+            x: hit_map.rename_editor.x + (12.0 * scale).round() as i32,
+            y: hit_map.rename_editor.y + (38.0 * scale).round() as i32,
+            width: hit_map
+                .rename_editor
+                .width
+                .saturating_sub((24.0 * scale).round() as u32),
+            height: (34.0 * scale).round() as u32,
+        };
+        paint_rects(
+            scene,
+            [
+                rect(hit_map.rename_editor, SIDEBAR),
+                rect(field, BACKGROUND),
+                RenderRect::new(
+                    field.x as f32,
+                    field.y as f32,
+                    field.width as f32,
+                    scale.max(1.0) as f32,
+                    ACCENT,
+                    1.0,
+                ),
+            ],
+        );
+        self.text.paint_text(
+            scene,
+            state.label,
+            (
+                hit_map.rename_editor.x as f32 + 12.0 * scale as f32,
+                hit_map.rename_editor.y as f32 + 10.0 * scale as f32,
+            ),
+            TEXT,
+            true,
+        );
+        let field_clip = Rect::new(
+            f64::from(field.x),
+            f64::from(field.y),
+            f64::from(field.right()),
+            f64::from(field.bottom()),
+        );
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &field_clip);
+        self.text.paint_text(
+            scene,
+            state.display_value,
+            (
+                field.x as f32 + 8.0 * scale as f32,
+                field.y as f32 + 8.0 * scale as f32,
+            ),
+            TEXT,
+            false,
+        );
+        scene.pop_layer();
+        if let Some(error) = state.error {
+            self.text.paint_text(
+                scene,
+                error,
+                (
+                    hit_map.rename_editor.x as f32 + 12.0 * scale as f32,
+                    field.bottom() as f32 + 7.0 * scale as f32,
+                ),
+                DANGER,
                 false,
             );
         }

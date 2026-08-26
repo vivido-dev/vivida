@@ -1,10 +1,85 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use winit::window::WindowId;
 
 use crate::layout::{Axis, Node};
+
+pub const MAX_NAME_CHARS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameError {
+    Empty,
+    ControlCharacter,
+}
+
+impl fmt::Display for NameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("name must not be empty"),
+            Self::ControlCharacter => {
+                formatter.write_str("name must not contain control characters")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
+
+pub fn normalize_name(name: &str) -> Result<String, NameError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(NameError::Empty);
+    }
+    if name.chars().any(char::is_control) {
+        return Err(NameError::ControlCharacter);
+    }
+    Ok(name.chars().take(MAX_NAME_CHARS).collect())
+}
+
+pub fn names_equal(left: &str, right: &str) -> bool {
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .eq(right.chars().flat_map(char::to_lowercase))
+}
+
+pub fn automatic_name(name: &str, fallback: &str) -> String {
+    let filtered = name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    normalize_name(&filtered)
+        .or_else(|_| normalize_name(fallback))
+        .expect("the internal fallback name is valid")
+}
+
+pub fn unique_name<'a>(base: &str, used: impl IntoIterator<Item = &'a str>) -> String {
+    let used = used.into_iter().map(folded_name).collect::<HashSet<_>>();
+    if !used.contains(&folded_name(base)) {
+        return base.to_owned();
+    }
+    for ordinal in 2u64.. {
+        let suffix = format!(" ({ordinal})");
+        let keep = MAX_NAME_CHARS.saturating_sub(suffix.chars().count());
+        let candidate = format!("{}{}", base.chars().take(keep).collect::<String>(), suffix);
+        if !used.contains(&folded_name(&candidate)) {
+            return candidate;
+        }
+    }
+    unreachable!("the unbounded ordinal space must contain an unused name")
+}
+
+fn folded_name(name: &str) -> String {
+    name.chars().flat_map(char::to_lowercase).collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(pub u64);
@@ -27,6 +102,8 @@ pub struct Tab {
     pub id: TabId,
     pub root: Node,
     pub title: String,
+    context_title: String,
+    custom_title: Option<String>,
     pub focused_pane: PaneId,
     pub panes: BTreeMap<PaneId, WindowId>,
     next_pane_id: u64,
@@ -39,6 +116,8 @@ impl Tab {
             id,
             root: Node::Leaf(pane_id),
             title: "shell".to_owned(),
+            context_title: "shell".to_owned(),
+            custom_title: None,
             focused_pane: pane_id,
             panes: BTreeMap::from([(pane_id, pane_window_id)]),
             next_pane_id: 2,
@@ -49,6 +128,7 @@ impl Tab {
         id: TabId,
         root: Node,
         title: String,
+        custom_title: bool,
         focused_pane: PaneId,
         panes: BTreeMap<PaneId, WindowId>,
     ) -> Self {
@@ -58,14 +138,50 @@ impl Tab {
         } else {
             root.first_pane()
         };
+        let title = automatic_name(&title, "shell");
         Self {
             id,
             root,
-            title,
+            title: title.clone(),
+            context_title: if custom_title {
+                "shell".to_owned()
+            } else {
+                title.clone()
+            },
+            custom_title: custom_title.then_some(title),
             focused_pane,
             panes,
             next_pane_id,
         }
+    }
+
+    pub fn is_title_custom(&self) -> bool {
+        self.custom_title.is_some()
+    }
+
+    pub fn persisted_title(&self) -> &str {
+        self.custom_title.as_deref().unwrap_or(&self.context_title)
+    }
+
+    pub fn set_context_title(&mut self, title: &str) -> bool {
+        if self.custom_title.is_some() {
+            return false;
+        }
+        let title = automatic_name(title, "shell");
+        if self.context_title == title {
+            return false;
+        }
+        self.context_title = title;
+        true
+    }
+
+    pub fn set_custom_title(&mut self, title: String) {
+        self.title.clone_from(&title);
+        self.custom_title = Some(title);
+    }
+
+    pub fn reset_title(&mut self) {
+        self.custom_title = None;
     }
 
     pub fn window_id(&self, pane_id: PaneId) -> Option<WindowId> {
@@ -183,6 +299,40 @@ impl Workspace {
     pub fn pane_count(&self) -> usize {
         self.tabs.iter().map(|tab| tab.panes.len()).sum()
     }
+
+    pub fn refresh_tab_display_titles(&mut self) -> bool {
+        let mut used = HashSet::new();
+        let mut changed = false;
+        for tab in self
+            .tabs
+            .iter_mut()
+            .filter(|tab| tab.custom_title.is_some())
+        {
+            let custom = tab.custom_title.as_deref().unwrap_or_default();
+            let display = unique_name(custom, used.iter().map(String::as_str));
+            used.insert(folded_name(&display));
+            if tab.custom_title.as_deref() != Some(display.as_str()) {
+                tab.custom_title = Some(display.clone());
+                changed = true;
+            }
+            if tab.title != display {
+                tab.title = display;
+                changed = true;
+            }
+        }
+        for tab in &mut self.tabs {
+            if tab.custom_title.is_some() {
+                continue;
+            }
+            let display = unique_name(&tab.context_title, used.iter().map(String::as_str));
+            used.insert(folded_name(&display));
+            if tab.title != display {
+                tab.title = display;
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 pub fn remove_owned_pane(workspaces: &mut [Workspace], key: PaneKey) -> bool {
@@ -224,11 +374,13 @@ pub fn focus_owned_pane(
 }
 
 pub fn workspace_label(cwd: &std::path::Path) -> String {
-    cwd.file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("workspace")
-        .to_owned()
+    automatic_name(
+        cwd.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("workspace"),
+        "workspace",
+    )
 }
 
 #[cfg(test)]
@@ -383,5 +535,42 @@ mod tests {
             "project"
         );
         assert_eq!(workspace_label(std::path::Path::new("/")), "workspace");
+    }
+
+    #[test]
+    fn names_are_trimmed_bounded_and_case_insensitive() {
+        assert_eq!(normalize_name("  Project A  ").unwrap(), "Project A");
+        assert_eq!(
+            normalize_name(&"x".repeat(200)).unwrap().chars().count(),
+            128
+        );
+        assert!(normalize_name("bad\nname").is_err());
+        assert!(names_equal("RÉSUMÉ", "résumé"));
+    }
+
+    #[test]
+    fn automatic_tab_names_are_unique_and_custom_names_take_priority() {
+        let mut workspace = Workspace::new(
+            WorkspaceId(1),
+            "one".into(),
+            "/one".into(),
+            WindowId::from(10),
+        );
+        let second = workspace.add_tab(WindowId::from(20));
+        workspace.tabs[1].set_custom_title("shell".into());
+        assert!(workspace.refresh_tab_display_titles());
+        assert_eq!(workspace.tabs[0].title, "shell (2)");
+        assert_eq!(workspace.tabs[1].title, "shell");
+        assert_eq!(workspace.tabs[1].id, second);
+    }
+
+    #[test]
+    fn pinned_title_ignores_context_until_reset() {
+        let mut tab = Tab::new(TabId(1), WindowId::from(10));
+        tab.set_custom_title("Editor".into());
+        assert!(!tab.set_context_title("server"));
+        assert_eq!(tab.title, "Editor");
+        tab.reset_title();
+        assert!(tab.set_context_title("server"));
     }
 }
