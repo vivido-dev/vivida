@@ -41,6 +41,28 @@ impl Node {
         }
     }
 
+    /// One-based child indexes from the root split to a pane.
+    pub fn pane_path(&self, pane_id: PaneId) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        self.write_pane_path(pane_id, &mut path).then_some(path)
+    }
+
+    fn write_pane_path(&self, pane_id: PaneId, path: &mut Vec<usize>) -> bool {
+        match self {
+            Self::Leaf(candidate) => *candidate == pane_id,
+            Self::Split { children, .. } => {
+                for (index, child) in children.iter().enumerate() {
+                    path.push(index + 1);
+                    if child.write_pane_path(pane_id, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+        }
+    }
+
     pub fn split(&mut self, pane_id: PaneId, new_pane_id: PaneId, axis: Axis) -> bool {
         match self {
             Self::Leaf(candidate) if *candidate == pane_id => {
@@ -132,6 +154,136 @@ pub fn compute_rects(
     let mut rects = HashMap::new();
     compute_node_rects(node, area, scale_factor, &mut rects);
     rects
+}
+
+/// Adjust split weights so `pane_id` approaches the requested physical size without moving
+/// sibling panes out of the tab's content area. Returns the resulting pane rectangle.
+pub fn resize_pane(
+    root: &mut Node,
+    pane_id: PaneId,
+    width: u32,
+    height: u32,
+    area: PhysicalRect,
+    scale_factor: f64,
+) -> Option<PhysicalRect> {
+    resize_pane_axis(root, pane_id, Axis::Horizontal, width, area, scale_factor)?;
+    resize_pane_axis(root, pane_id, Axis::Vertical, height, area, scale_factor)?;
+    compute_rects(root, area, scale_factor).remove(&pane_id)
+}
+
+fn resize_pane_axis(
+    root: &mut Node,
+    pane_id: PaneId,
+    axis: Axis,
+    requested: u32,
+    area: PhysicalRect,
+    scale_factor: f64,
+) -> Option<()> {
+    let mut targets = Vec::new();
+    collect_split_targets(root, pane_id, axis, &mut Vec::new(), &mut targets);
+
+    // The closest split gives the most direct adjustment. If it cannot reach the requested
+    // extent, progressively adjust its ancestors while preserving all other weight ratios.
+    for (path, child_index) in targets.into_iter().rev() {
+        let current = compute_rects(root, area, scale_factor).remove(&pane_id)?;
+        if pane_extent(current, axis) == requested {
+            break;
+        }
+
+        let baseline = root.clone();
+        let mut best = baseline.clone();
+        let mut best_error = pane_extent(current, axis).abs_diff(requested);
+        let mut low = 0.0f32;
+        let mut high = 1.0f32;
+
+        for _ in 0..32 {
+            let fraction = (low + high) / 2.0;
+            let mut candidate = baseline.clone();
+            set_child_fraction(&mut candidate, &path, child_index, fraction);
+            let candidate_rect = compute_rects(&candidate, area, scale_factor)
+                .remove(&pane_id)
+                .expect("the target pane remains in an unchanged split tree");
+            let extent = pane_extent(candidate_rect, axis);
+            let error = extent.abs_diff(requested);
+            if error < best_error {
+                best = candidate;
+                best_error = error;
+            }
+            if extent < requested {
+                low = fraction;
+            } else {
+                high = fraction;
+            }
+        }
+
+        *root = best;
+    }
+    Some(())
+}
+
+fn pane_extent(rect: PhysicalRect, axis: Axis) -> u32 {
+    match axis {
+        Axis::Horizontal => rect.width,
+        Axis::Vertical => rect.height,
+    }
+}
+
+fn collect_split_targets(
+    node: &Node,
+    pane_id: PaneId,
+    axis: Axis,
+    path: &mut Vec<usize>,
+    targets: &mut Vec<(Vec<usize>, usize)>,
+) {
+    let Node::Split {
+        axis: split_axis,
+        children,
+        ..
+    } = node
+    else {
+        return;
+    };
+    let Some(child_index) = children.iter().position(|child| child.contains(pane_id)) else {
+        return;
+    };
+    if *split_axis == axis {
+        targets.push((path.clone(), child_index));
+    }
+    path.push(child_index);
+    collect_split_targets(&children[child_index], pane_id, axis, path, targets);
+    path.pop();
+}
+
+fn set_child_fraction(root: &mut Node, path: &[usize], child_index: usize, fraction: f32) {
+    let mut node = root;
+    for &index in path {
+        let Node::Split { children, .. } = node else {
+            return;
+        };
+        node = &mut children[index];
+    }
+    let Node::Split { sizes, .. } = node else {
+        return;
+    };
+
+    let fraction = fraction.clamp(0.000_1, 0.999_9);
+    let other_total = sizes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != child_index)
+        .map(|(_, size)| *size)
+        .sum::<f32>();
+    let remaining = 1.0 - fraction;
+    let other_count = sizes.len().saturating_sub(1).max(1) as f32;
+    for (index, size) in sizes.iter_mut().enumerate() {
+        if index == child_index {
+            *size = fraction;
+        } else if other_total > f32::EPSILON {
+            *size = *size / other_total * remaining;
+        } else {
+            *size = remaining / other_count;
+        }
+    }
 }
 
 fn compute_node_rects(
@@ -229,6 +381,18 @@ mod tests {
     }
 
     #[test]
+    fn pane_paths_address_nested_split_children() {
+        let mut root = Node::Leaf(PaneId(1));
+        root.split(PaneId(1), PaneId(2), Axis::Horizontal);
+        root.split(PaneId(2), PaneId(3), Axis::Vertical);
+
+        assert_eq!(root.pane_path(PaneId(1)), Some(vec![1]));
+        assert_eq!(root.pane_path(PaneId(2)), Some(vec![2, 1]));
+        assert_eq!(root.pane_path(PaneId(3)), Some(vec![2, 2]));
+        assert_eq!(root.pane_path(PaneId(99)), None);
+    }
+
+    #[test]
     fn computed_rects_leave_one_physical_handle_gap() {
         let mut root = Node::Leaf(PaneId(1));
         root.split(PaneId(1), PaneId(2), Axis::Horizontal);
@@ -260,5 +424,28 @@ mod tests {
                 height: 80
             }
         );
+    }
+
+    #[test]
+    fn resize_updates_nested_split_weights_and_preserves_siblings() {
+        let mut root = Node::Leaf(PaneId(1));
+        root.split(PaneId(1), PaneId(2), Axis::Horizontal);
+        root.split(PaneId(1), PaneId(3), Axis::Vertical);
+        let area = PhysicalRect {
+            x: 10,
+            y: 20,
+            width: 604,
+            height: 404,
+        };
+
+        let resized = resize_pane(&mut root, PaneId(1), 400, 300, area, 1.0).unwrap();
+        assert_eq!((resized.width, resized.height), (400, 300));
+
+        let rects = compute_rects(&root, area, 1.0);
+        assert_eq!(rects.len(), 3);
+        assert!(rects[&PaneId(2)].width > 0);
+        assert!(rects[&PaneId(3)].height > 0);
+        assert_eq!(rects[&PaneId(1)].x, area.x);
+        assert_eq!(rects[&PaneId(1)].y, area.y);
     }
 }

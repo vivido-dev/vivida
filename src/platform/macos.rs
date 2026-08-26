@@ -170,6 +170,24 @@ impl PaneHost for NativePaneHost {
         Ok(pane_id)
     }
 
+    fn create_pane_with_options(
+        &self,
+        processor: &mut Processor,
+        event_loop: &ActiveEventLoop,
+        mut options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        // SAFETY: NativePaneHost retains the parent for the lifetime of every created child.
+        let parent = unsafe { ParentWindowHandle::new(self.chrome.window_handle()?.as_raw()) };
+        options.no_activate = true;
+        options.parent_window = Some(parent);
+        let pane_id =
+            WindowId::from(processor.create_window(LoopHandle::Winit(event_loop), options)?);
+        if let Some(pane) = processor.window_mut(pane_id) {
+            pane.display.window.set_resizable(false);
+        }
+        Ok(pane_id)
+    }
+
     fn move_pane(&self, processor: &mut Processor, pane_id: WindowId, rect: PhysicalRect) {
         let Ok(origin) = self.chrome.inner_position() else {
             return;

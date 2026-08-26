@@ -429,6 +429,7 @@ impl ChromeRenderer {
             &scene,
             Color::from_rgba8(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b, background_alpha),
             state.embedded_frames,
+            None,
         )?;
         Ok((layout, hit_map, presented))
     }

@@ -8,7 +8,7 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use vivido::Processor;
 #[cfg(target_os = "macos")]
-use vivido::cli::TerminalOptions;
+use vivido::cli::{TerminalOptions, WindowOptions};
 #[cfg(target_os = "macos")]
 use winit::event_loop::ActiveEventLoop;
 #[cfg(target_os = "macos")]
@@ -53,6 +53,19 @@ pub trait PaneHost {
         cwd: &Path,
         terminal_options: &TerminalOptions,
     ) -> Result<WindowId, Box<dyn Error>>;
+    fn create_pane_with_options(
+        &self,
+        processor: &mut Processor,
+        event_loop: &ActiveEventLoop,
+        mut options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let cwd = options
+            .terminal_options
+            .working_directory
+            .take()
+            .unwrap_or_default();
+        self.create_pane(processor, event_loop, &cwd, &options.terminal_options)
+    }
     fn move_pane(&self, processor: &mut Processor, pane: WindowId, rect: PhysicalRect);
     fn reveal(&self, processor: &mut Processor, pane: WindowId, visible: bool);
     fn focus(&self, processor: &mut Processor, pane: WindowId);
