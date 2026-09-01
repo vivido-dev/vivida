@@ -46,15 +46,13 @@ use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
 use winit::event::TouchPhase;
 use winit::event::{ElementState, Event as WinitEvent, Ime, MouseButton, StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 const CHROME_TITLE: &str = "vivida";
 const INITIAL_WIDTH: f64 = 1100.0;
 const INITIAL_HEIGHT: f64 = 700.0;
-const PROBE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const PROBE_FRAMES: u16 = 120;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -293,12 +291,6 @@ struct RenameTabOptions {
     name: String,
 }
 
-struct MotionProbe {
-    origin: PhysicalPosition<i32>,
-    frame: u16,
-    next_frame: Instant,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NameTarget {
     Workspace(WorkspaceId),
@@ -449,9 +441,6 @@ struct Shell {
     closing_workspaces: HashSet<WorkspaceId>,
     launch_cwd: PathBuf,
     session_path: Option<PathBuf>,
-    drag_samples: u64,
-    max_drag_drift: u32,
-    motion_probe: Option<MotionProbe>,
     last_title_click: Option<(Instant, PhysicalPosition<f64>)>,
     #[cfg(target_os = "linux")]
     embedded_hovered_pane: Option<WindowId>,
@@ -548,9 +537,6 @@ impl Shell {
             closing_workspaces: HashSet::new(),
             launch_cwd,
             session_path: session::path(),
-            drag_samples: 0,
-            max_drag_drift: 0,
-            motion_probe: None,
             last_title_click: None,
             #[cfg(target_os = "linux")]
             embedded_hovered_pane: None,
@@ -609,13 +595,6 @@ impl Shell {
         }
         self.request_chrome_redraw();
         self.focus_active_pane();
-
-        println!("vivida ready");
-        println!("process id: {}", std::process::id());
-        println!("chrome window: {chrome_id:?}");
-        println!("native child relationship: verified");
-        println!("drag invariant: WindowEvent::Moved performs read-only drift sampling");
-        println!("press P on the chrome to run the 60 Hz motion probe");
         Ok(())
     }
 
@@ -3025,93 +3004,6 @@ impl Shell {
         })
     }
 
-    fn sample_drag_alignment(&mut self) {
-        let Some(chrome) = &self.chrome_window else {
-            return;
-        };
-        let Ok(chrome_position) = chrome.inner_position() else {
-            return;
-        };
-        let placements = self
-            .pane_rects
-            .iter()
-            .map(|(id, rect)| (*id, *rect))
-            .collect::<Vec<_>>();
-        if placements.is_empty() {
-            return;
-        }
-
-        let mut sample_max = 0;
-        for (window_id, rect) in placements {
-            let Some(pane_position) = self
-                .processor
-                .window(window_id)
-                .and_then(|pane| pane.display.window.outer_position())
-            else {
-                continue;
-            };
-            let expected_x = chrome_position.x.saturating_add(rect.x);
-            let expected_y = chrome_position.y.saturating_add(rect.y);
-            sample_max = sample_max
-                .max(expected_x.abs_diff(pane_position.x))
-                .max(expected_y.abs_diff(pane_position.y));
-        }
-        self.drag_samples += 1;
-        self.max_drag_drift = self.max_drag_drift.max(sample_max);
-        chrome.set_title(&format!(
-            "{CHROME_TITLE} — {} samples, max drift {} px",
-            self.drag_samples, self.max_drag_drift
-        ));
-    }
-
-    fn start_motion_probe(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(origin) = self
-            .chrome_window
-            .as_ref()
-            .and_then(|chrome| chrome.outer_position().ok())
-        else {
-            return;
-        };
-        self.drag_samples = 0;
-        self.max_drag_drift = 0;
-        self.motion_probe = Some(MotionProbe {
-            origin,
-            frame: 0,
-            next_frame: Instant::now(),
-        });
-        event_loop.set_control_flow(ControlFlow::Poll);
-    }
-
-    fn advance_motion_probe(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(probe) = &mut self.motion_probe else {
-            return;
-        };
-        let now = Instant::now();
-        if now < probe.next_frame {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(probe.next_frame));
-            return;
-        }
-
-        let outward_frame = if probe.frame <= PROBE_FRAMES / 2 {
-            probe.frame
-        } else {
-            PROBE_FRAMES - probe.frame
-        };
-        if let Some(chrome) = &self.chrome_window {
-            chrome.set_outer_position(PhysicalPosition::new(
-                probe.origin.x + i32::from(outward_frame) * 5,
-                probe.origin.y + i32::from(outward_frame) * 2,
-            ));
-        }
-        probe.frame += 1;
-        probe.next_frame = now + PROBE_FRAME_INTERVAL;
-        if probe.frame > PROBE_FRAMES {
-            self.motion_probe = None;
-        } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(probe.next_frame));
-        }
-    }
-
     fn handle_chrome_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if self.name_editor.is_none() && self.handle_shell_shortcut(event_loop, &event) {
             return;
@@ -3357,12 +3249,6 @@ impl Shell {
             {
                 self.set_settings_menu_open(false);
             }
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed
-                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyP) =>
-            {
-                self.start_motion_probe(event_loop);
-            }
             WindowEvent::KeyboardInput {
                 device_id,
                 event,
@@ -3382,9 +3268,6 @@ impl Shell {
                     );
                 }
             }
-            // Read-only verification: the native window system moves parent and children as one
-            // hierarchy. No child geometry mutation is allowed here.
-            WindowEvent::Moved(_) => self.sample_drag_alignment(),
             _ => (),
         }
     }
@@ -3437,10 +3320,6 @@ impl Shell {
             }
             PhysicalKey::Code(KeyCode::BracketLeft) if self.modifiers.shift_key() => {
                 self.cycle_tab(-1);
-                true
-            }
-            PhysicalKey::Code(KeyCode::KeyP) if self.modifiers.shift_key() => {
-                self.start_motion_probe(event_loop);
                 true
             }
             PhysicalKey::Code(code) => workspace_shortcut_index(code)
@@ -3755,15 +3634,10 @@ impl ApplicationHandler<Event> for Shell {
         }
         self.reap_closed_panes(event_loop);
         self.refresh_tab_titles();
-        self.advance_motion_probe(event_loop);
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         self.save_session();
-        println!(
-            "drag samples: {}; maximum child drift: {} px",
-            self.drag_samples, self.max_drag_drift
-        );
         let pane_ids = self.pane_index.keys().copied().collect::<Vec<_>>();
         for window_id in pane_ids {
             if let Some(pane) = self.processor.window(window_id) {
