@@ -86,16 +86,33 @@ pub fn finalize_chrome_window(window: &Window) {
     }
 }
 
+pub fn focus_chrome_input(window: &Window) {
+    window.focus_window();
+}
+
 pub fn settings_menu_window_attributes(
-    chrome: &Window,
+    _chrome: &Window,
     attributes: WindowAttributes,
 ) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
-    // SAFETY: Shell owns the chrome window until after the menu child is destroyed.
-    Ok(Some(unsafe {
-        attributes
-            .with_parent_window(Some(chrome.window_handle()?.as_raw()))
-            .with_decorations(false)
-    }))
+    Ok(Some(detached_popup_window_attributes(attributes)))
+}
+
+pub fn rename_editor_window_attributes(
+    _chrome: &Window,
+    attributes: WindowAttributes,
+) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
+    Ok(Some(
+        detached_popup_window_attributes(attributes).with_active(true),
+    ))
+}
+
+fn detached_popup_window_attributes(attributes: WindowAttributes) -> WindowAttributes {
+    // Winit implements a parent window on macOS by calling `addChildWindow` while constructing
+    // the NSWindow. AppKit can order that child with its parent even when the requested initial
+    // visibility is false, exposing an unpainted white popup when the chrome first appears.
+    // Keep auxiliary windows detached while hidden; `position_settings_menu` attaches either
+    // popup immediately before it is shown.
+    attributes.with_decorations(false)
 }
 
 pub fn position_settings_menu(chrome: &Window, menu: &Window, position: PhysicalPosition<i32>) {
@@ -117,6 +134,11 @@ pub fn position_settings_menu(chrome: &Window, menu: &Window, position: Physical
         // SAFETY: both windows are live on the main event-loop thread.
         unsafe { chrome.addChildWindow_ordered(&menu, NSWindowOrderingMode::Above) };
     }
+}
+
+pub fn position_rename_editor(chrome: &Window, editor: &Window, position: PhysicalPosition<i32>) {
+    position_settings_menu(chrome, editor, position);
+    editor.focus_window();
 }
 
 #[derive(Clone)]
@@ -249,4 +271,19 @@ fn ns_window(raw: RawWindowHandle) -> Option<objc2::rc::Retained<objc2_app_kit::
     // SAFETY: winit supplied this live view; calls are confined to the main event loop.
     let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
     view.window()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_popup_starts_detached_from_the_chrome() {
+        let attributes =
+            detached_popup_window_attributes(Window::default_attributes().with_visible(false));
+
+        assert!(!attributes.visible);
+        assert!(!attributes.decorations);
+        assert!(attributes.parent_window().is_none());
+    }
 }

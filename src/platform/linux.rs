@@ -15,10 +15,26 @@ pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes
     attributes.with_decorations(false)
 }
 pub fn finalize_chrome_window(_window: &Window) {}
+
+pub fn focus_chrome_input(window: &Window) {
+    window.focus_window();
+}
 pub fn settings_menu_window_attributes(
     _chrome: &Window,
     _attributes: WindowAttributes,
 ) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
     Ok(None)
 }
+pub fn rename_editor_window_attributes(
+    _chrome: &Window,
+    _attributes: WindowAttributes,
+) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
+    Ok(None)
+}
 pub fn position_settings_menu(_chrome: &Window, _menu: &Window, _position: PhysicalPosition<i32>) {}
+pub fn position_rename_editor(
+    _chrome: &Window,
+    _editor: &Window,
+    _position: PhysicalPosition<i32>,
+) {
+}

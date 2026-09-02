@@ -29,6 +29,8 @@ pub struct TabSnapshot {
     pub id: TabId,
     pub root: Node,
     pub title: String,
+    #[serde(default)]
+    pub custom_title: bool,
     pub focused_pane: PaneId,
     pub pane_cwds: Vec<(PaneId, PathBuf)>,
 }
@@ -119,7 +121,8 @@ impl Session {
                     .map(|tab| TabSnapshot {
                         id: tab.id,
                         root: tab.root.clone(),
-                        title: tab.title.clone(),
+                        title: tab.persisted_title().to_owned(),
+                        custom_title: tab.is_title_custom(),
                         focused_pane: tab.focused_pane,
                         pane_cwds: tab
                             .panes
@@ -161,6 +164,7 @@ mod tests {
                     id: TabId(3),
                     root: Node::Leaf(PaneId(1)),
                     title: "shell".into(),
+                    custom_title: true,
                     focused_pane: PaneId(1),
                     pane_cwds: vec![(PaneId(1), "/repo".into())],
                 }],
@@ -171,5 +175,23 @@ mod tests {
         assert_eq!(decoded.sidebar_mode, SidebarMode::Compact);
         assert_eq!(decoded.active_workspace, Some(WorkspaceId(2)));
         assert_eq!(decoded.workspaces[0].tabs[0].root, Node::Leaf(PaneId(1)));
+        assert!(decoded.workspaces[0].tabs[0].custom_title);
+    }
+
+    #[test]
+    fn legacy_tab_titles_default_to_automatic() {
+        let json = r#"{
+            "sidebar_mode":"expanded",
+            "active_workspace":1,
+            "workspaces":[{
+                "id":1,"label":"repo","identity_cwd":"/repo",
+                "active_tab":1,"tabs":[{
+                    "id":1,"root":{"Leaf":1},"title":"shell",
+                    "focused_pane":1,"pane_cwds":[]
+                }]
+            }]
+        }"#;
+        let decoded: Session = serde_json::from_str(json).unwrap();
+        assert!(!decoded.workspaces[0].tabs[0].custom_title);
     }
 }
