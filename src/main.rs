@@ -306,6 +306,12 @@ struct NameContextMenu {
     anchor: PhysicalPosition<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecoveryMenu {
+    pane: WindowId,
+    anchor: PhysicalPosition<f64>,
+}
+
 #[derive(Clone, Debug)]
 struct NameEditor {
     target: NameTarget,
@@ -432,6 +438,7 @@ struct Shell {
     hovered_workspace: Option<WorkspaceId>,
     settings_menu_open: bool,
     name_context_menu: Option<NameContextMenu>,
+    recovery_menu: Option<RecoveryMenu>,
     name_editor: Option<NameEditor>,
     workspaces: Vec<Workspace>,
     active_workspace: Option<WorkspaceId>,
@@ -528,6 +535,7 @@ impl Shell {
             hovered_workspace: None,
             settings_menu_open: false,
             name_context_menu: None,
+            recovery_menu: None,
             name_editor: None,
             workspaces: Vec::new(),
             active_workspace: None,
@@ -1921,7 +1929,6 @@ impl Shell {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn focused_pane_id(&self) -> Option<WindowId> {
         self.active_workspace()
             .and_then(Workspace::active_tab)
@@ -1938,7 +1945,7 @@ impl Shell {
         {
             return None;
         }
-        if (self.name_context_menu.is_some()
+        if ((self.name_context_menu.is_some() || self.recovery_menu.is_some())
             && self
                 .chrome_hits
                 .context_menu
@@ -2124,21 +2131,35 @@ impl Shell {
                 ),
             });
         }
-        let context_menu = self.name_context_menu.map(|menu| ContextMenuRenderState {
-            anchor: menu.anchor,
-            automatic_title_action: match menu.target {
-                NameTarget::Workspace(_) => false,
-                NameTarget::Tab {
-                    workspace_id,
-                    tab_id,
-                } => self
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)
-                    .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
-                    .is_some_and(model::Tab::is_title_custom),
-            },
-        });
+        let context_menu = self
+            .recovery_menu
+            .map(|menu| ContextMenuRenderState {
+                anchor: menu.anchor,
+                automatic_title_action: false,
+                terminal_actions: false,
+                recovery_actions: true,
+            })
+            .or_else(|| {
+                self.name_context_menu.map(|menu| ContextMenuRenderState {
+                    anchor: menu.anchor,
+                    automatic_title_action: match menu.target {
+                        NameTarget::Workspace(_) => false,
+                        NameTarget::Tab {
+                            workspace_id,
+                            tab_id,
+                        } => self
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == workspace_id)
+                            .and_then(|workspace| {
+                                workspace.tabs.iter().find(|tab| tab.id == tab_id)
+                            })
+                            .is_some_and(model::Tab::is_title_custom),
+                    },
+                    terminal_actions: matches!(menu.target, NameTarget::Tab { .. }),
+                    recovery_actions: false,
+                })
+            });
         let editor_display = self.name_editor.as_ref().map(NameEditor::display_value);
         let rename_editor = self
             .name_editor
@@ -2283,6 +2304,7 @@ impl Shell {
     }
 
     fn open_name_context_menu(&mut self, target: NameTarget, anchor: PhysicalPosition<f64>) {
+        self.close_recovery_menu();
         self.set_settings_menu_open(false);
         self.name_editor = None;
         // Native terminal children sit above the chrome content surface. Keep a tab's primary
@@ -2291,6 +2313,59 @@ impl Shell {
         let anchor = name_context_anchor(target, anchor);
         self.name_context_menu = Some(NameContextMenu { target, anchor });
         self.request_chrome_redraw();
+    }
+
+    fn open_recovery_menu(&mut self, pane: WindowId) {
+        self.close_recovery_menu();
+        self.set_settings_menu_open(false);
+        self.name_context_menu = None;
+        self.name_editor = None;
+        let anchor =
+            self.chrome_window
+                .as_ref()
+                .map_or(PhysicalPosition::new(0.0, 0.0), |window| {
+                    let size = window.inner_size();
+                    PhysicalPosition::new(f64::from(size.width) / 2.0, f64::from(size.height) / 3.0)
+                });
+        self.recovery_menu = Some(RecoveryMenu { pane, anchor });
+        self.set_native_pane_visibility(pane, false);
+        self.request_chrome_redraw();
+    }
+
+    fn close_recovery_menu(&mut self) {
+        if self.recovery_menu.take().is_some() {
+            self.sync_pane_visibility();
+            self.focus_active_pane();
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn recover_pane(&mut self, pane: WindowId, restart: bool) {
+        let Some(ipc_window_id) = self
+            .processor
+            .window(pane)
+            .map(|window| window.ipc_window_id())
+        else {
+            self.close_recovery_menu();
+            return;
+        };
+        let result = if restart {
+            self.processor.restart_terminal(ipc_window_id)
+        } else {
+            self.processor.reset_terminal(ipc_window_id).map(|_| ())
+        };
+        if let Err(error) = result {
+            eprintln!("terminal recovery failed: {}", error.message);
+        }
+        self.close_recovery_menu();
+    }
+
+    fn focused_pane_in_tab(&self, workspace_id: WorkspaceId, tab_id: TabId) -> Option<WindowId> {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
+            .and_then(|tab| tab.window_id(tab.focused_pane))
     }
 
     fn start_name_editor(&mut self, target: NameTarget) {
@@ -2829,22 +2904,64 @@ impl Shell {
             }
             return true;
         }
-        if let Some(menu) = self.name_context_menu {
+        if let Some(menu) = self.recovery_menu {
             let item = self
                 .chrome_hits
                 .context_items
                 .iter()
                 .position(|rect| rect.contains(cursor.x, cursor.y));
             match item {
-                Some(0) => self.start_name_editor(menu.target),
-                Some(1) => {
-                    if let NameTarget::Tab {
+                Some(0) => self.recover_pane(menu.pane, false),
+                Some(1) => self.recover_pane(menu.pane, true),
+                _ => self.close_recovery_menu(),
+            }
+            return true;
+        }
+        if let Some(menu) = self.name_context_menu {
+            let item = self
+                .chrome_hits
+                .context_items
+                .iter()
+                .position(|rect| rect.contains(cursor.x, cursor.y));
+            let automatic_title_action = match menu.target {
+                NameTarget::Workspace(_) => false,
+                NameTarget::Tab {
+                    workspace_id,
+                    tab_id,
+                } => self
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)
+                    .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
+                    .is_some_and(model::Tab::is_title_custom),
+            };
+            match (menu.target, item) {
+                (target, Some(0)) => self.start_name_editor(target),
+                (
+                    NameTarget::Tab {
                         workspace_id,
                         tab_id,
-                    } = menu.target
-                    {
-                        self.reset_context_tab_title(workspace_id, tab_id);
+                    },
+                    Some(1),
+                ) if automatic_title_action => {
+                    self.reset_context_tab_title(workspace_id, tab_id);
+                }
+                (
+                    NameTarget::Tab {
+                        workspace_id,
+                        tab_id,
+                    },
+                    Some(index),
+                ) => {
+                    let reset_index = 1 + usize::from(automatic_title_action);
+                    if let Some(pane) = self.focused_pane_in_tab(workspace_id, tab_id) {
+                        if index == reset_index {
+                            self.recover_pane(pane, false);
+                        } else if index == reset_index + 1 {
+                            self.recover_pane(pane, true);
+                        }
                     }
+                    self.name_context_menu = None;
                 }
                 _ => {
                     self.name_context_menu = None;
@@ -3049,6 +3166,9 @@ impl Shell {
                 self.clear_embedded_focus();
                 self.set_settings_menu_open(false);
                 self.name_context_menu = None;
+                if self.recovery_menu.take().is_some() {
+                    self.sync_pane_visibility();
+                }
                 if self.rename_editor_window.is_none() && self.name_editor.take().is_some() {
                     if let Some(chrome) = &self.chrome_window {
                         chrome.set_ime_allowed(false);
@@ -3126,7 +3246,14 @@ impl Shell {
                         self.open_name_context_menu(target, position);
                         return;
                     }
-                    if self.name_context_menu.take().is_some() || self.name_editor.is_some() {
+                    let closed_recovery = self.recovery_menu.is_some();
+                    if closed_recovery {
+                        self.close_recovery_menu();
+                    }
+                    if self.name_context_menu.take().is_some()
+                        || closed_recovery
+                        || self.name_editor.is_some()
+                    {
                         self.close_name_editor();
                         self.request_chrome_redraw();
                         return;
@@ -3276,7 +3403,19 @@ impl Shell {
         let WindowEvent::KeyboardInput { event, .. } = event else {
             return false;
         };
-        if event.state != ElementState::Pressed || !shell_modifier_pressed(self.modifiers) {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        if event.physical_key == PhysicalKey::Code(KeyCode::F12)
+            && self.modifiers.control_key()
+            && self.modifiers.shift_key()
+        {
+            if let Some(pane) = self.focused_pane_id() {
+                self.open_recovery_menu(pane);
+            }
+            return true;
+        }
+        if !shell_modifier_pressed(self.modifiers) {
             return false;
         }
         match event.physical_key {

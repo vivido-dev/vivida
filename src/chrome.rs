@@ -172,6 +172,8 @@ pub struct ChromeRenderState<'a> {
 pub struct ContextMenuRenderState {
     pub anchor: PhysicalPosition<f64>,
     pub automatic_title_action: bool,
+    pub terminal_actions: bool,
+    pub recovery_actions: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -935,7 +937,11 @@ impl ChromeRenderer {
         let scale = self.scale_factor;
         let width = (CONTEXT_MENU_WIDTH_LOGICAL * scale).round() as u32;
         let row_height = (CONTEXT_MENU_ROW_LOGICAL * scale).round() as u32;
-        let rows = if state.automatic_title_action { 2 } else { 1 };
+        let rows: u32 = if state.recovery_actions {
+            3
+        } else {
+            1 + u32::from(state.automatic_title_action) + 2 * u32::from(state.terminal_actions)
+        };
         let height = row_height.saturating_mul(rows);
         let max_x = size.width.saturating_sub(width);
         let max_y = size.height.saturating_sub(height);
@@ -946,8 +952,19 @@ impl ChromeRenderer {
             height: height.min(size.height),
         };
         paint_rects(scene, [rect(hit_map.context_menu, SIDEBAR)]);
-        let labels = if state.automatic_title_action {
+        let labels = if state.recovery_actions {
+            &["Reset Terminal", "Restart Terminal", "Cancel"][..]
+        } else if state.automatic_title_action && state.terminal_actions {
+            &[
+                "Rename",
+                "Use Automatic Title",
+                "Reset Terminal",
+                "Restart Terminal",
+            ][..]
+        } else if state.automatic_title_action {
             &["Rename", "Use Automatic Title"][..]
+        } else if state.terminal_actions {
+            &["Rename", "Reset Terminal", "Restart Terminal"][..]
         } else {
             &["Rename"][..]
         };
