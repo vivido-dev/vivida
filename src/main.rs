@@ -475,6 +475,11 @@ impl Shell {
         let automation_paths = SessionPaths::for_session(&automation_name)?;
         automation_paths.prepare_endpoint(&automation_name)?;
         options.automation_name = Some(automation_name.clone());
+        // A pane here is a hosted Vivido window, but its space and tab belong to Vivida — so
+        // Vivida, not Vivido, is the runtime the agent mesh addresses it through. Two strings;
+        // Vivida links no mesh crate and opens no store.
+        vivido::binary::session::publish_runtime_kind("vivida");
+        vivido::binary::session::publish_instance_name(&automation_name);
         options.socket = Some(automation_paths.socket.clone());
 
         let terminfo = vivido::tty::setup_env();
