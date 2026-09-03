@@ -1,5 +1,6 @@
 //! Native workspace shell embedding Vivido panes in one process.
 
+#![windows_subsystem = "windows"]
 #![warn(rust_2018_idioms, future_incompatible)]
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(clippy, deny(warnings))]
