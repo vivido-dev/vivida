@@ -3156,10 +3156,8 @@ impl Shell {
             // Activating the top-level host gives its HWND keyboard focus. Restore focus to the
             // remembered terminal child so activation, task switching, and startup all type into
             // the pane rather than the chrome surface.
-            WindowEvent::Focused(true) => {
-                if self.name_editor.is_none() {
-                    self.focus_active_pane();
-                }
+            WindowEvent::Focused(true) if self.name_editor.is_none() => {
+                self.focus_active_pane();
             }
             WindowEvent::Focused(false) => {
                 #[cfg(target_os = "linux")]
