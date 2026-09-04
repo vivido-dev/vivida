@@ -480,6 +480,7 @@ impl Shell {
         // Vivida links no mesh crate and opens no store.
         vivido::binary::session::publish_runtime_kind("vivida");
         vivido::binary::session::publish_instance_name(&automation_name);
+        vivido::binary::session::start_mesh_watcher();
         options.socket = Some(automation_paths.socket.clone());
 
         let terminfo = vivido::tty::setup_env();
