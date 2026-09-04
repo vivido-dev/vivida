@@ -241,7 +241,50 @@ struct SplitPaneOptions {
     #[arg(long, value_enum)]
     axis: SplitAxis,
     #[command(flatten)]
-    options: WindowOptions,
+    options: NewPaneOptions,
+}
+
+/// `WindowOptions` for the pane a split creates, with its ID argument renamed.
+///
+/// `WindowOptions` calls the ID to assign `--window-id`, which reads correctly for `create-window`
+/// and wrongly here: this command's own `--window-id` names the pane being *split*, matching
+/// `close-pane` and `activate-pane`. Two arguments claiming one long name trip a clap debug
+/// assertion, so `split-pane` panicked in a debug build; a release build bound both to the target,
+/// which made the assigned ID unreachable from the CLI anyway. Renaming keeps both meanings, both
+/// spellings, and the wire shape.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct NewPaneOptions(WindowOptions);
+
+impl clap::Args for NewPaneOptions {
+    fn augment_args(command: clap::Command) -> clap::Command {
+        rename_assigned_window_id(WindowOptions::augment_args(command))
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        rename_assigned_window_id(WindowOptions::augment_args_for_update(command))
+    }
+}
+
+impl clap::FromArgMatches for NewPaneOptions {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        WindowOptions::from_arg_matches(matches).map(Self)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches(matches)
+    }
+}
+
+/// Present the assigned-ID argument as `--new-window-id`, leaving every other option alone.
+fn rename_assigned_window_id(command: clap::Command) -> clap::Command {
+    command.mut_args(|argument| {
+        if argument.get_id() == "ipc_window_id" {
+            argument.long("new-window-id").short(None)
+        } else {
+            argument
+        }
+    })
 }
 
 #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
@@ -478,6 +521,8 @@ impl Shell {
         // A pane here is a hosted Vivido window, but its space and tab belong to Vivida — so
         // Vivida, not Vivido, is the runtime the agent mesh addresses it through. Two strings;
         // Vivida links no mesh crate and opens no store.
+        // SAFETY: no thread has been started yet; the IPC listener is spawned below.
+        unsafe { vivido::binary::session::scrub_inherited_mesh_environment() };
         vivido::binary::session::publish_runtime_kind("vivida");
         vivido::binary::session::publish_instance_name(&automation_name);
         vivido::binary::session::start_mesh_watcher();
@@ -1282,7 +1327,7 @@ impl Shell {
             .window(target)
             .and_then(|pane| pane.current_directory())
             .unwrap_or_else(|| self.launch_cwd.clone());
-        let mut options = params.options;
+        let mut options = params.options.0;
         if options.terminal_options.working_directory.is_none() {
             options.terminal_options.working_directory = Some(cwd);
         }
@@ -4079,6 +4124,50 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn every_command_has_unambiguous_arguments() {
+        // `split-pane` shipped with two arguments claiming `--window-id`: its own pane target and
+        // the assigned ID flattened in from `WindowOptions`. clap only checks that under
+        // `debug_assertions`, so a release build silently bound both to the first. This asserts it
+        // for the whole CLI rather than one command, since any future flatten can repeat it.
+        use clap::CommandFactory;
+
+        VividaOptions::command().debug_assert();
+    }
+
+    #[test]
+    fn split_pane_names_the_target_and_the_new_pane_separately() {
+        let parsed = VividaOptions::try_parse_from([
+            "vivida",
+            "msg",
+            "split-pane",
+            "--window-id",
+            "7",
+            "--axis",
+            "horizontal",
+            "--new-window-id",
+            "500",
+        ])
+        .expect("split-pane accepts both IDs");
+
+        let Some(VividaCommand::Msg(message)) = parsed.command else {
+            panic!("expected a msg command");
+        };
+        let VividaMessage::SplitPane(options) = message.message else {
+            panic!("expected split-pane");
+        };
+
+        assert_eq!(
+            options.window_id, 7,
+            "--window-id names the pane being split"
+        );
+        assert_eq!(
+            options.options.0.ipc_window_id,
+            Some(500),
+            "--new-window-id names the pane the split creates"
+        );
+    }
 
     #[test]
     fn shell_loads_vivido_window_opacity() {
