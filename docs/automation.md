@@ -113,6 +113,11 @@ vivida msg close-tab --workspace-name "Project Alpha" --tab-name "Server"
 vivida msg close-workspace --workspace-name "Project Alpha"
 ```
 
+`split-pane` takes `--window-id` for the pane being split and `--axis horizontal|vertical`. The
+optional `--new-window-id` names the IPC ID for the pane it creates; it is spelled differently here
+because `--window-id` already names the target, unlike `create-tab` and `create-workspace` where the
+flattened window options own that name.
+
 Creation commands return the new workspace, tab, pane, and window IDs. Close replies acknowledge
 that shutdown was requested; use `wait exit` or `subscribe` when the agent must observe process
 termination. IDs must be rediscovered after Vivida restarts.

@@ -51,53 +51,18 @@ automation caller — so one reader cannot drift, where eight scattered index wr
 to publish. Reconciling calls the same path as `vvagent readdress`: only the address moves, never
 the endpoint id, its mailbox, or its pending work. A window dragged across a workspace loses no mail.
 
-### Binding does not work on Linux today
+A window id is small and monotonic — `1`, `2`, `3` — precisely so it can be an address segment,
+which is a one-based `u32`. It is not the winit window id, which on Wayland starts at 2^63 and used
+to be published here, failing every bind with ``invalid_request: `92233…` does not fit an address
+index`` and leaving every reconcile pass reporting `seen: 0`.
 
-A mesh address index is a `u32`. Vivida's public window ids are winit window ids, which on Wayland
-start at 2^63:
+A caller may still claim an arbitrary id with `create-window --window-id N`. One outside the `u32`
+range stays fully addressable by automation but gets **no** `AGENT_MESH_ADDRESS`: that pane binds
+and is reachable by alias, with no position on the mesh. `scripts/panes.py` marks such panes.
 
-```console
-$ vvagent bind --alias reviewer          # run inside a Vivida pane
-{"error":{"candidates":[],"code":"invalid_request",
-          "message":"`9223372036854775809` does not fit an address index"}}
-```
-
-Verified live in a headed Vivida under Weston, and equally in standalone and headless Vivido, whose
-ids come from the same source. Two consequences:
-
-- **No agent can bind from inside a pane.** `vvagent bind` refuses the inherited address outright,
-  so the endpoint is never created and nothing else in this document applies.
-- **Reconcile silently skips every pane.** It reads each pane's `window_id` through a `u32`
-  conversion, so no placement is produced and no address is ever corrected.
-
-`scripts/panes.py` reports which panes have no usable address, so this is visible rather than
-mysterious.
-
-`--address` cannot rescue it: `resolve_address` parses `AGENT_MESH_ADDRESS` as a prefix *before*
-joining anything you pass, so the bad value fails first. The environment variable has to be gone:
-
-```sh
-env -u AGENT_MESH_ADDRESS vvagent bind --alias reviewer --address s1t1w7
-```
-
-That works, but the address is now a number you invented rather than the pane's real position, so it
-is only safe when you assign every endpoint by hand. For alias-addressed messaging, which needs no
-position at all, prefer binding outside the pane entirely:
-
-```sh
-vvagent run --alias reviewer --runtime wrapper --instance dev -- codex
-```
-
-Elsewhere, bind and launch in one step, which also releases the binding when the child exits:
-
-```sh
-vvagent run --alias reviewer --instance dev -- codex
-```
-
-`--runtime` is `vvmux`, `vivido`, `vivida`, or `wrapper`. With `wrapper`, `--instance NAME` also
-derives the instance id, so the same name rebinds the same durable slot after a restart.
-`vvagent unbind --endpoint ID --incarnation ID` releases a binding; the mailbox and its pending work
-survive it.
+Vivida also clears any `AGENT_MESH_*` it inherited before building a pane. A pane's coordinates are
+written as *overrides*, so without that a Vivida launched from inside another pane would hand its
+own panes the launching pane's instance — a different runtime instance, which is worse than none.
 
 ## Addressing
 

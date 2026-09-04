@@ -178,11 +178,6 @@ wildcards, so `w5` reaches window 5 across any space or tab and you rarely type 
 Only `t` needs help, since a tab position repeats in every space. An address is a locator, not an
 identity: it resolves to an endpoint id at use time.
 
-> **Binding does not work on Linux today.** Vivida's window IDs are winit ids near 2^63, and a mesh
-> address index is a `u32`, so `vvagent bind` fails with ``invalid_request: `92233…` does not fit an
-> address index`` and the watcher's reconcile pass skips every pane. Verified live. See
-> [references/agent-mesh.md](references/agent-mesh.md) before trying to use the mesh here.
-
 If a provider's MCP config points at `vvagent mcp`, the same mailbox arrives as tools
 (`agent_mesh_identity`, `_list`, `_send`, `_receive`, `_reply`, `_wait`) with no shelling out.
 

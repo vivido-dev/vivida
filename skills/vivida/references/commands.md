@@ -115,7 +115,8 @@ vivida msg reset-tab-title --workspace-name "Project Alpha" --tab-name "Server"
   plus `--name`. `create-tab` scopes with `--workspace-id`, `--workspace-name`, or
   `--from-window-id`.
 - `create-window` remains compatible and creates a tab in the active workspace.
-- `split-pane --axis` is `horizontal` or `vertical`.
+- `split-pane --axis` is `horizontal` or `vertical`; `--window-id` is the pane being split and
+  `--new-window-id` optionally names the id for the pane it creates.
 - `close-tab`, `close-workspace`, `rename-*`, and `reset-tab-title` scope with
   `--workspace-id`/`--workspace-name`, `--tab-id`/`--tab-name`, or `--from-window-id`.
 - Renaming a tab pins its title; `reset-tab-title` (or the UI's **Use Automatic Title**) resumes
@@ -130,10 +131,12 @@ shutdown was *requested* — use `wait exit` or `subscribe` to observe terminati
 Hosted `resize`, geometry, visibility, and level requests are applied through Vivida's layout and
 top-level chrome. Hiding the active target selects a deterministic sibling when one exists.
 
-> **`split-pane` panics in a debug build.** Two arguments claim `--window-id` (the pane target, and
-> the embedded window options' `-w`), which trips a clap debug assertion: `Long option names must be
-> unique for each argument`. Release builds parse it, the pane target wins, and the command works —
-> but `--help` lists `--window-id` twice. Use a release build for `split-pane`.
+`split-pane` is the one command where `--window-id` and the assigned id would collide, so the id for
+the new pane is `--new-window-id` there. Everywhere else `--window-id` still names the id to assign:
+
+```sh
+vivida msg split-pane --window-id 42 --axis horizontal --new-window-id 500
+```
 
 ## Focus and revealing
 
@@ -326,14 +329,13 @@ vivida msg subscribe --all --since-event "$sequence"
 ```
 
 The handshake's `event_kinds` is also the `--events` allowlist, so take the list from `capabilities`
-rather than prose. As of this build: `screen_changed`, `output`, `frame_presented`, `title_changed`,
-`focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`, `window_closed`,
-`client_fault`, `client_recovered`, `overflow`.
+rather than prose: `screen_changed`, `output`, `frame_presented`, `title_changed`,
+`directory_changed`, `focus_changed`, `resized`, `moved`, `bell`, `child_exit`, `window_created`,
+`window_closed`, `client_fault`, `client_recovered`, `overflow`.
 
-Vivido's `docs/ipc.md` additionally documents `directory_changed` carrying `{"directory":"/path"}`
-from OSC 7. The event loop emits it, but it is missing from the advertised kinds — and since that
-list is also the filter allowlist, `--events directory_changed` is rejected with `invalid_params:
-unknown event kind`. Watch the working directory through `layout` or `inspect` instead.
+`directory_changed` carries `{"directory":"/path"}` when the shell reports a new working directory
+through OSC 7, which needs shell integration; `layout` and `inspect` answer the same question by
+polling and need none.
 
 Up to 32 subscriptions per process, 256 queued events each; the replay ring is bounded by 4 MiB and
 4,096 events. `--since-event` atomically replays retained matching events before live delivery; if

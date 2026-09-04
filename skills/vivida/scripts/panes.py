@@ -132,12 +132,18 @@ def render(records: list[dict]) -> str:
     if unaddressable:
         out.append("")
         out.append(
-            f"{len(unaddressable)} of {len(records)} panes have no usable mesh address: a window id"
+            f"no mesh address for {len(unaddressable)} of {len(records)} panes: an address index is"
         )
         out.append(
-            f"above {MAX_ADDRESS_INDEX} cannot be an address index, so `vvagent bind` refuses it and"
+            "a one-based u32 and those ids are outside it. Vivida's own window ids are small, so"
         )
-        out.append("reconcile skips the pane. Target these panes by --window-id as usual.")
+        out.append(
+            "such an id was claimed with `create-window --window-id N`. The pane still binds, is"
+        )
+        out.append(
+            "reachable by alias, and takes --window-id as usual; it has no position, so reconcile"
+        )
+        out.append("leaves it alone.")
     return "\n".join(out)
 
 
