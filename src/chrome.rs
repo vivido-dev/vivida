@@ -12,6 +12,7 @@ use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::display::renderer::SceneRenderer;
 use vivido::display::text::TextSystem;
 use vivido::display::window::RenderSource;
+use vivido::shell::LaunchEntry;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
@@ -163,17 +164,19 @@ pub struct ChromeRenderState<'a> {
     pub hovered_workspace: Option<WorkspaceId>,
     pub fullscreen: bool,
     pub settings_menu_open: bool,
-    pub context_menu: Option<ContextMenuRenderState>,
+    pub context_menu: Option<ContextMenuRenderState<'a>>,
     pub rename_editor: Option<RenameEditorRenderState<'a>>,
     pub embedded_frames: &'a [EmbeddedFramePlacement<'a>],
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ContextMenuRenderState {
+pub struct ContextMenuRenderState<'a> {
     pub anchor: PhysicalPosition<f64>,
     pub automatic_title_action: bool,
     pub terminal_actions: bool,
     pub recovery_actions: bool,
+    pub launch_entries: Option<&'a [LaunchEntry]>,
+    pub selected: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -931,13 +934,15 @@ impl ChromeRenderer {
         &mut self,
         scene: &mut Scene,
         size: PhysicalSize<u32>,
-        state: ContextMenuRenderState,
+        state: ContextMenuRenderState<'_>,
         hit_map: &mut ChromeHitMap,
     ) {
         let scale = self.scale_factor;
         let width = (CONTEXT_MENU_WIDTH_LOGICAL * scale).round() as u32;
         let row_height = (CONTEXT_MENU_ROW_LOGICAL * scale).round() as u32;
-        let rows: u32 = if state.recovery_actions {
+        let rows: u32 = if let Some(entries) = state.launch_entries {
+            u32::try_from(entries.len()).unwrap_or(u32::MAX)
+        } else if state.recovery_actions {
             3
         } else {
             1 + u32::from(state.automatic_title_action) + 2 * u32::from(state.terminal_actions)
@@ -952,21 +957,23 @@ impl ChromeRenderer {
             height: height.min(size.height),
         };
         paint_rects(scene, [rect(hit_map.context_menu, SIDEBAR)]);
-        let labels = if state.recovery_actions {
-            &["Reset Terminal", "Restart Terminal", "Cancel"][..]
+        let labels = if let Some(entries) = state.launch_entries {
+            entries.iter().map(|entry| entry.label.as_str()).collect()
+        } else if state.recovery_actions {
+            vec!["Reset Terminal", "Restart Terminal", "Cancel"]
         } else if state.automatic_title_action && state.terminal_actions {
-            &[
+            vec![
                 "Rename",
                 "Use Automatic Title",
                 "Reset Terminal",
                 "Restart Terminal",
-            ][..]
+            ]
         } else if state.automatic_title_action {
-            &["Rename", "Use Automatic Title"][..]
+            vec!["Rename", "Use Automatic Title"]
         } else if state.terminal_actions {
-            &["Rename", "Reset Terminal", "Restart Terminal"][..]
+            vec!["Rename", "Reset Terminal", "Restart Terminal"]
         } else {
-            &["Rename"][..]
+            vec!["Rename"]
         };
         for (index, label) in labels.iter().enumerate() {
             let row = PhysicalRect {
@@ -982,6 +989,9 @@ impl ChromeRenderer {
                 ),
             };
             hit_map.context_items.push(row);
+            if state.selected == Some(index) {
+                paint_rects(scene, [rect(row, ACTIVE)]);
+            }
             self.text.paint_text(
                 scene,
                 label,

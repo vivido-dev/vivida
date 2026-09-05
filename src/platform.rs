@@ -91,6 +91,8 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
+pub use windows::show_launch_menu;
+#[cfg(target_os = "windows")]
 pub use windows::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, position_rename_editor,
     position_settings_menu, rename_editor_window_attributes, settings_menu_window_attributes,

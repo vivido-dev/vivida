@@ -130,3 +130,65 @@ fn hwnd(raw: RawWindowHandle) -> Option<HWND> {
     };
     Some(handle.hwnd.get() as HWND)
 }
+
+/// Show a native popup above terminal child windows without changing pane visibility.
+pub fn show_launch_menu(
+    chrome: &Window,
+    entries: &[vivido::shell::LaunchEntry],
+    anchor: winit::dpi::PhysicalPosition<i32>,
+) -> Result<Option<usize>, Box<dyn Error>> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        TrackPopupMenu,
+    };
+
+    let handle = chrome.window_handle()?;
+    let owner = hwnd(handle.as_raw()).ok_or("chrome has no Windows handle")?;
+    // SAFETY: all handles are used on the owning event-loop thread. Labels are NUL-terminated
+    // and copied by AppendMenuW. The menu is destroyed on both success and failure.
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let result = (|| {
+            for (index, entry) in entries.iter().enumerate() {
+                let id = u32::try_from(index)?
+                    .checked_add(1)
+                    .ok_or("too many launch entries")?;
+                let label = entry
+                    .label
+                    .replace('&', "&&")
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect::<Vec<_>>();
+                if AppendMenuW(menu, MF_STRING, id as usize, label.as_ptr()) == 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            let mut point = POINT {
+                x: anchor.x,
+                y: anchor.y,
+            };
+            if ClientToScreen(owner, &mut point) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let selected = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                0,
+                owner,
+                std::ptr::null(),
+            );
+            Ok(usize::try_from(selected)
+                .ok()
+                .and_then(|id| id.checked_sub(1)))
+        })();
+        DestroyMenu(menu);
+        result
+    }
+}
