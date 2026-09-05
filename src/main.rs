@@ -45,7 +45,7 @@ use vivido::config::ui_config::Program;
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
-use vivido::shell::ShellAction;
+use vivido::shell::{LaunchAction, LaunchEntry, ShellAction, launch_entries};
 use vivido::{Event, Processor};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
@@ -363,6 +363,12 @@ struct RecoveryMenu {
     anchor: PhysicalPosition<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LaunchMenu {
+    anchor: PhysicalPosition<f64>,
+    selected: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 struct NameEditor {
     target: NameTarget,
@@ -500,6 +506,8 @@ struct Shell {
     settings_menu_open: bool,
     name_context_menu: Option<NameContextMenu>,
     recovery_menu: Option<RecoveryMenu>,
+    launch_menu: Option<LaunchMenu>,
+    launch_entries: Option<Vec<LaunchEntry>>,
     name_editor: Option<NameEditor>,
     workspaces: Vec<Workspace>,
     active_workspace: Option<WorkspaceId>,
@@ -615,6 +623,8 @@ impl Shell {
             settings_menu_open: false,
             name_context_menu: None,
             recovery_menu: None,
+            launch_menu: None,
+            launch_entries: None,
             name_editor: None,
             workspaces: Vec::new(),
             active_workspace: None,
@@ -2044,7 +2054,9 @@ impl Shell {
         {
             return None;
         }
-        if ((self.name_context_menu.is_some() || self.recovery_menu.is_some())
+        if ((self.name_context_menu.is_some()
+            || self.recovery_menu.is_some()
+            || self.launch_menu.is_some())
             && self
                 .chrome_hits
                 .context_menu
@@ -2261,33 +2273,48 @@ impl Shell {
             });
         }
         let context_menu = self
-            .recovery_menu
+            .launch_menu
             .map(|menu| ContextMenuRenderState {
                 anchor: menu.anchor,
                 automatic_title_action: false,
                 terminal_actions: false,
-                recovery_actions: true,
+                recovery_actions: false,
+                launch_entries: self.launch_entries.as_deref(),
+                selected: menu.selected,
             })
             .or_else(|| {
-                self.name_context_menu.map(|menu| ContextMenuRenderState {
-                    anchor: menu.anchor,
-                    automatic_title_action: match menu.target {
-                        NameTarget::Workspace(_) => false,
-                        NameTarget::Tab {
-                            workspace_id,
-                            tab_id,
-                        } => self
-                            .workspaces
-                            .iter()
-                            .find(|workspace| workspace.id == workspace_id)
-                            .and_then(|workspace| {
-                                workspace.tabs.iter().find(|tab| tab.id == tab_id)
-                            })
-                            .is_some_and(model::Tab::is_title_custom),
-                    },
-                    terminal_actions: matches!(menu.target, NameTarget::Tab { .. }),
-                    recovery_actions: false,
-                })
+                self.recovery_menu
+                    .map(|menu| ContextMenuRenderState {
+                        anchor: menu.anchor,
+                        automatic_title_action: false,
+                        terminal_actions: false,
+                        recovery_actions: true,
+                        launch_entries: None,
+                        selected: None,
+                    })
+                    .or_else(|| {
+                        self.name_context_menu.map(|menu| ContextMenuRenderState {
+                            anchor: menu.anchor,
+                            automatic_title_action: match menu.target {
+                                NameTarget::Workspace(_) => false,
+                                NameTarget::Tab {
+                                    workspace_id,
+                                    tab_id,
+                                } => self
+                                    .workspaces
+                                    .iter()
+                                    .find(|workspace| workspace.id == workspace_id)
+                                    .and_then(|workspace| {
+                                        workspace.tabs.iter().find(|tab| tab.id == tab_id)
+                                    })
+                                    .is_some_and(model::Tab::is_title_custom),
+                            },
+                            terminal_actions: matches!(menu.target, NameTarget::Tab { .. }),
+                            recovery_actions: false,
+                            launch_entries: None,
+                            selected: None,
+                        })
+                    })
             });
         let editor_display = self.name_editor.as_ref().map(NameEditor::display_value);
         let rename_editor = self
@@ -2653,6 +2680,7 @@ impl Shell {
     }
 
     fn open_name_context_menu(&mut self, target: NameTarget, anchor: PhysicalPosition<f64>) {
+        self.close_launch_menu();
         self.close_recovery_menu();
         self.set_settings_menu_open(false);
         self.name_editor = None;
@@ -2665,6 +2693,7 @@ impl Shell {
     }
 
     fn open_recovery_menu(&mut self, pane: WindowId) {
+        self.close_launch_menu();
         self.close_recovery_menu();
         self.set_settings_menu_open(false);
         self.name_context_menu = None;
@@ -2686,6 +2715,101 @@ impl Shell {
             self.sync_pane_visibility();
             self.focus_active_pane();
             self.request_chrome_redraw();
+        }
+    }
+
+    fn open_launch_menu(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(windows)]
+        {
+            self.close_recovery_menu();
+            self.set_settings_menu_open(false);
+            self.name_context_menu = None;
+            self.close_name_editor();
+            let entries = self.launch_entries.get_or_insert_with(launch_entries);
+            if let Some(chrome) = &self.chrome_window {
+                let anchor = PhysicalPosition::new(
+                    self.chrome_hits.new_tab.x,
+                    self.chrome_hits.new_tab.bottom(),
+                );
+                match platform::show_launch_menu(chrome, entries, anchor) {
+                    Ok(Some(index)) => self.activate_launch_entry(event_loop, index),
+                    Ok(None) => self.focus_active_pane(),
+                    Err(error) => eprintln!("failed to show launch menu: {error}"),
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = event_loop;
+            if self.launch_menu.is_some() {
+                self.close_launch_menu();
+                return;
+            }
+            self.close_recovery_menu();
+            self.set_settings_menu_open(false);
+            self.name_context_menu = None;
+            self.name_editor = None;
+            let entries = self.launch_entries.get_or_insert_with(launch_entries);
+            if entries.is_empty() || self.chrome_hits.new_tab.width == 0 {
+                return;
+            }
+            let anchor = PhysicalPosition::new(
+                f64::from(self.chrome_hits.new_tab.x),
+                f64::from(self.chrome_hits.new_tab.bottom()),
+            );
+            self.launch_menu = Some(LaunchMenu {
+                anchor,
+                selected: None,
+            });
+            #[cfg(target_os = "linux")]
+            self.clear_embedded_focus();
+            if let Some(chrome) = &self.chrome_window {
+                focus_chrome_input(chrome);
+            }
+            self.sync_pane_visibility();
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn close_launch_menu(&mut self) {
+        if self.launch_menu.take().is_some() {
+            self.sync_pane_visibility();
+            self.focus_active_pane();
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn activate_launch_entry(&mut self, event_loop: &ActiveEventLoop, index: usize) {
+        let action = self
+            .launch_entries
+            .as_ref()
+            .and_then(|entries| entries.get(index))
+            .map(|entry| entry.action.clone());
+        self.close_launch_menu();
+        match action {
+            Some(LaunchAction::NewTab(program)) => {
+                let mut options = WindowOptions::default();
+                options.terminal_options = self.terminal_options.clone();
+                options.terminal_options.working_directory = Some(self.active_pane_cwd());
+                if let Some(program) = &program {
+                    options.terminal_options.set_command(program);
+                }
+                self.create_tab_with_options(event_loop, Some(options));
+            }
+            Some(LaunchAction::NewWindow) => self.spawn_new_instance(),
+            None => {}
+        }
+    }
+
+    fn spawn_new_instance(&self) {
+        let result = std::env::current_exe().and_then(|executable| {
+            std::process::Command::new(executable)
+                .args(std::env::args_os().skip(1))
+                .spawn()
+                .map(|_| ())
+        });
+        if let Err(error) = result {
+            eprintln!("failed to create Vivida window: {error}");
         }
     }
 
@@ -3304,6 +3428,19 @@ impl Shell {
             }
             return true;
         }
+        if self.launch_menu.is_some() {
+            let item = self
+                .chrome_hits
+                .context_items
+                .iter()
+                .position(|rect| rect.contains(cursor.x, cursor.y));
+            if let Some(index) = item {
+                self.activate_launch_entry(event_loop, index);
+            } else {
+                self.close_launch_menu();
+            }
+            return true;
+        }
         if let Some(menu) = self.recovery_menu {
             let item = self
                 .chrome_hits
@@ -3534,6 +3671,9 @@ impl Shell {
     }
 
     fn handle_chrome_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        if self.handle_launch_menu_key(event_loop, &event) {
+            return;
+        }
         if self.name_editor.is_none() && self.handle_shell_shortcut(event_loop, &event) {
             return;
         }
@@ -3568,7 +3708,9 @@ impl Shell {
             // Activating the top-level host gives its HWND keyboard focus. Restore focus to the
             // remembered terminal child so activation, task switching, and startup all type into
             // the pane rather than the chrome surface.
-            WindowEvent::Focused(true) if self.name_editor.is_none() => {
+            WindowEvent::Focused(true)
+                if self.name_editor.is_none() && self.launch_menu.is_none() =>
+            {
                 self.focus_active_pane();
             }
             WindowEvent::Focused(false) => {
@@ -3581,6 +3723,10 @@ impl Shell {
                     self.set_settings_menu_open(false);
                 }
                 self.name_context_menu = None;
+                if self.launch_menu.take().is_some() {
+                    self.sync_pane_visibility();
+                    self.request_chrome_redraw();
+                }
                 if self.recovery_menu.take().is_some() {
                     self.sync_pane_visibility();
                 }
@@ -3604,6 +3750,17 @@ impl Shell {
                 if self.shortcuts_open && self.shortcuts_window.is_none() {
                     self.shortcuts_cursor = Some(position);
                     self.hover_shortcuts_close();
+                }
+                if let Some(menu) = &mut self.launch_menu {
+                    let selected = self
+                        .chrome_hits
+                        .context_items
+                        .iter()
+                        .position(|rect| rect.contains(position.x, position.y));
+                    if menu.selected != selected {
+                        menu.selected = selected;
+                        self.request_chrome_redraw();
+                    }
                 }
                 #[cfg(target_os = "linux")]
                 {
@@ -3659,6 +3816,12 @@ impl Shell {
                 #[cfg(not(target_os = "linux"))]
                 let _ = device_id;
                 if state == ElementState::Pressed && button == MouseButton::Right {
+                    if self.cursor_position.is_some_and(|position| {
+                        self.chrome_hits.new_tab.contains(position.x, position.y)
+                    }) {
+                        self.open_launch_menu(event_loop);
+                        return;
+                    }
                     if let Some(position) = self.cursor_position
                         && let Some(target) = self.name_target_at(position)
                     {
@@ -3666,10 +3829,15 @@ impl Shell {
                         return;
                     }
                     let closed_recovery = self.recovery_menu.is_some();
+                    let closed_launch = self.launch_menu.is_some();
+                    if closed_launch {
+                        self.close_launch_menu();
+                    }
                     if closed_recovery {
                         self.close_recovery_menu();
                     }
                     if self.name_context_menu.take().is_some()
+                        || closed_launch
                         || closed_recovery
                         || self.name_editor.is_some()
                     {
@@ -3903,6 +4071,44 @@ impl Shell {
                 }),
             _ => false,
         }
+    }
+
+    fn handle_launch_menu_key(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) -> bool {
+        let Some(menu) = &mut self.launch_menu else {
+            return false;
+        };
+        let WindowEvent::KeyboardInput { event, .. } = event else {
+            return false;
+        };
+        if event.state != ElementState::Pressed {
+            return true;
+        }
+        let len = self.launch_entries.as_ref().map_or(0, Vec::len);
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_launch_menu(),
+            Key::Named(NamedKey::ArrowDown) if len > 0 => {
+                menu.selected = Some(menu.selected.map_or(0, |index| (index + 1) % len));
+                self.request_chrome_redraw();
+            }
+            Key::Named(NamedKey::ArrowUp) if len > 0 => {
+                menu.selected = Some(
+                    menu.selected
+                        .map_or(len - 1, |index| (index + len - 1) % len),
+                );
+                self.request_chrome_redraw();
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(index) = menu.selected {
+                    self.activate_launch_entry(event_loop, index);
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn cycle_tab(&mut self, direction: isize) {

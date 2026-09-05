@@ -133,6 +133,8 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
+pub use windows::show_launch_menu;
+#[cfg(target_os = "windows")]
 pub use windows::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
     position_popup, set_popup_visible,
