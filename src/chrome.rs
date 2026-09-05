@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use vello::Scene;
-use vello::kurbo::{Affine, BezPath, Circle, Rect, Stroke};
+use vello::kurbo::{Affine, BezPath, Circle, Rect, Shape, Stroke};
 use vello::peniko::{Color, Fill};
 use vivido::config::UiConfig;
 use vivido::config::font::FontSize;
@@ -18,6 +18,7 @@ use winit::window::Window;
 use crate::layout::PhysicalRect;
 use crate::model::{TabId, Workspace, WorkspaceId};
 use crate::platform::{pane_bottom_resize_gutter, pane_side_resize_gutter};
+use crate::shortcuts;
 
 pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 220.0;
 pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
@@ -27,14 +28,46 @@ pub const MIN_PANE_HEIGHT_LOGICAL: f64 = 80.0;
 const CHROME_CONTROL_LOGICAL: f64 = 34.0;
 const NEW_TAB_LOGICAL: f64 = 36.0;
 const MACOS_TRAFFIC_LIGHTS_LOGICAL: f64 = 64.0;
+const GEAR_TEETH: usize = 8;
+const GEAR_TIP_LOGICAL: f64 = 8.0;
+const GEAR_ROOT_LOGICAL: f64 = 5.8;
+const GEAR_HUB_LOGICAL: f64 = 2.6;
 const SETTINGS_MENU_WIDTH_LOGICAL: f64 = 190.0;
 const SETTINGS_MENU_ROW_LOGICAL: f64 = 34.0;
 const CONTEXT_MENU_WIDTH_LOGICAL: f64 = 210.0;
 const CONTEXT_MENU_ROW_LOGICAL: f64 = 34.0;
+const SHORTCUTS_WIDTH_LOGICAL: f64 = 460.0;
+const SHORTCUTS_MAX_HEIGHT_LOGICAL: f64 = 560.0;
+const SHORTCUTS_HEADER_LOGICAL: f64 = 38.0;
+const SHORTCUTS_SECTION_LOGICAL: f64 = 34.0;
+const SHORTCUTS_ROW_LOGICAL: f64 = 26.0;
+const SHORTCUTS_PADDING_LOGICAL: f64 = 14.0;
 const RENAME_EDITOR_WIDTH_LOGICAL: f64 = 380.0;
 const RENAME_EDITOR_HEIGHT_LOGICAL: f64 = 112.0;
 
-const SETTINGS_MENU_ITEMS: [&str; 3] = ["Settings", "Shortcuts", "Documentation"];
+/// Rows of the gear menu, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsMenuItem {
+    Settings,
+    Shortcuts,
+    Documentation,
+}
+
+impl SettingsMenuItem {
+    pub const ALL: [Self; 3] = [Self::Settings, Self::Shortcuts, Self::Documentation];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Settings => "Settings",
+            Self::Shortcuts => "Shortcuts",
+            Self::Documentation => "Documentation",
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+}
 
 const BACKGROUND: Rgb = Rgb::new(24, 24, 29);
 const SIDEBAR: Rgb = Rgb::new(30, 30, 37);
@@ -89,6 +122,8 @@ pub struct ChromeHitMap {
     pub close: PhysicalRect,
     pub settings_menu: PhysicalRect,
     pub settings_items: Vec<PhysicalRect>,
+    pub shortcuts: PhysicalRect,
+    pub shortcuts_close: PhysicalRect,
     pub context_menu: PhysicalRect,
     pub context_items: Vec<PhysicalRect>,
     pub rename_editor: PhysicalRect,
@@ -163,6 +198,8 @@ pub struct ChromeRenderState<'a> {
     pub hovered_workspace: Option<WorkspaceId>,
     pub fullscreen: bool,
     pub settings_menu_open: bool,
+    pub settings_menu_hover: Option<SettingsMenuItem>,
+    pub shortcuts: Option<ShortcutsRenderState>,
     pub context_menu: Option<ContextMenuRenderState>,
     pub rename_editor: Option<RenameEditorRenderState<'a>>,
     pub embedded_frames: &'a [EmbeddedFramePlacement<'a>],
@@ -279,6 +316,7 @@ impl SettingsMenuRenderer {
     pub fn render(
         &mut self,
         size: PhysicalSize<u32>,
+        hovered: Option<SettingsMenuItem>,
     ) -> Result<bool, vivido::display::renderer::Error> {
         let scale = self.scale_factor;
         let row_height = (SETTINGS_MENU_ROW_LOGICAL * scale).round() as u32;
@@ -304,14 +342,25 @@ impl SettingsMenuRenderer {
                 ),
             ],
         );
-        for (index, label) in SETTINGS_MENU_ITEMS.iter().enumerate() {
+        for (index, item) in SettingsMenuItem::ALL.into_iter().enumerate() {
+            let top = (index as u32 * row_height) as f32;
+            if hovered == Some(item) {
+                paint_rects(
+                    &mut scene,
+                    [RenderRect::new(
+                        0.0,
+                        top,
+                        size.width as f32,
+                        row_height as f32,
+                        HOVER,
+                        1.0,
+                    )],
+                );
+            }
             self.text.paint_text(
                 &mut scene,
-                label,
-                (
-                    12.0 * scale as f32,
-                    (index as u32 * row_height) as f32 + 9.0 * scale as f32,
-                ),
+                item.label(),
+                (12.0 * scale as f32, top + 9.0 * scale as f32),
                 TEXT,
                 false,
             );
@@ -327,10 +376,278 @@ impl SettingsMenuRenderer {
     }
 }
 
+/// Row under `position` within a detached settings-menu window, in that window's own coordinates.
+pub fn settings_menu_item_at(
+    size: PhysicalSize<u32>,
+    scale_factor: f64,
+    position: PhysicalPosition<f64>,
+) -> Option<SettingsMenuItem> {
+    if position.x < 0.0
+        || position.y < 0.0
+        || position.x >= f64::from(size.width)
+        || position.y >= f64::from(size.height)
+    {
+        return None;
+    }
+    let row_height = (SETTINGS_MENU_ROW_LOGICAL * scale_factor).round().max(1.0);
+    SettingsMenuItem::from_index((position.y / row_height) as usize)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShortcutsRenderState {
+    pub scroll: f64,
+    pub hovered_close: bool,
+}
+
+pub struct ShortcutsRenderer {
+    renderer: SceneRenderer,
+    text: TextSystem,
+    scale_factor: f64,
+}
+
+impl ShortcutsRenderer {
+    pub fn new(
+        window: Arc<Window>,
+        config: &UiConfig,
+        scale_factor: f64,
+    ) -> Result<Self, vivido::display::renderer::Error> {
+        let size = window.inner_size();
+        Ok(Self {
+            renderer: SceneRenderer::new(RenderSource::Surface(window), size, false)?,
+            text: text_system(config, scale_factor),
+            scale_factor,
+        })
+    }
+
+    pub fn new_embedded(
+        size: PhysicalSize<u32>,
+        config: &UiConfig,
+        scale_factor: f64,
+    ) -> Result<Self, vivido::display::renderer::Error> {
+        Ok(Self {
+            renderer: SceneRenderer::new(RenderSource::Embedded, size, false)?,
+            text: text_system(config, scale_factor),
+            scale_factor,
+        })
+    }
+
+    pub fn resize(&mut self, size: PhysicalSize<u32>, scale_factor: f64, config: &UiConfig) {
+        self.renderer.resize(size);
+        if (scale_factor - self.scale_factor).abs() > f64::EPSILON {
+            self.scale_factor = scale_factor;
+            self.text = text_system(config, scale_factor);
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        size: PhysicalSize<u32>,
+        state: ShortcutsRenderState,
+    ) -> Result<bool, vivido::display::renderer::Error> {
+        let mut scene = Scene::new();
+        paint_shortcuts_panel(
+            &mut self.text,
+            self.scale_factor,
+            &mut scene,
+            PhysicalRect {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height,
+            },
+            state,
+        );
+        self.renderer.render(
+            &scene,
+            Color::from_rgba8(SIDEBAR.r, SIDEBAR.g, SIDEBAR.b, u8::MAX),
+        )
+    }
+
+    pub fn embedded_frame(&self) -> Option<vivido::display::renderer::EmbeddedFrame<'_>> {
+        self.renderer.embedded_frame()
+    }
+}
+
+/// Height of one shortcut row, which is also the wheel and arrow-key scroll step.
+pub fn shortcuts_row_height(scale_factor: f64) -> f64 {
+    (SHORTCUTS_ROW_LOGICAL * scale_factor).round()
+}
+
+/// Height of the shortcuts panel's fixed header, above the scrolling list.
+pub fn shortcuts_header_height(scale_factor: f64) -> f64 {
+    (SHORTCUTS_HEADER_LOGICAL * scale_factor).round()
+}
+
+pub fn shortcuts_logical_size() -> (f64, f64) {
+    let content = SHORTCUTS_HEADER_LOGICAL + shortcuts_content_height(1.0);
+    (
+        SHORTCUTS_WIDTH_LOGICAL,
+        content.min(SHORTCUTS_MAX_HEIGHT_LOGICAL),
+    )
+}
+
+/// Height of the scrolling list, excluding the fixed header.
+pub fn shortcuts_content_height(scale_factor: f64) -> f64 {
+    let sections = shortcuts::sections();
+    let rows: usize = sections.iter().map(|section| section.rows.len()).sum();
+    let logical = sections.len() as f64 * SHORTCUTS_SECTION_LOGICAL
+        + rows as f64 * SHORTCUTS_ROW_LOGICAL
+        + SHORTCUTS_PADDING_LOGICAL;
+    logical * scale_factor
+}
+
+/// Close button of a shortcuts panel occupying `panel`.
+pub fn shortcuts_close_rect(panel: PhysicalRect, scale_factor: f64) -> PhysicalRect {
+    let header = (SHORTCUTS_HEADER_LOGICAL * scale_factor).round() as u32;
+    let size = header.min(panel.height);
+    PhysicalRect {
+        x: panel.right() - i32::try_from(size.min(panel.width)).unwrap_or_default(),
+        y: panel.y,
+        width: size.min(panel.width),
+        height: size,
+    }
+}
+
+fn paint_shortcuts_panel(
+    text: &mut TextSystem,
+    scale: f64,
+    scene: &mut Scene,
+    panel: PhysicalRect,
+    state: ShortcutsRenderState,
+) {
+    let header = ((SHORTCUTS_HEADER_LOGICAL * scale).round() as u32).min(panel.height);
+    let padding = (SHORTCUTS_PADDING_LOGICAL * scale).round() as f32;
+    paint_rects(
+        scene,
+        [
+            rect(panel, SIDEBAR),
+            RenderRect::new(
+                panel.x as f32,
+                (panel.y + i32::try_from(header).unwrap_or_default()) as f32,
+                panel.width as f32,
+                scale.max(1.0) as f32,
+                BORDER,
+                1.0,
+            ),
+        ],
+    );
+    text.paint_text(
+        scene,
+        "Keyboard Shortcuts",
+        (
+            panel.x as f32 + padding,
+            panel.y as f32 + 11.0 * scale as f32,
+        ),
+        TEXT,
+        true,
+    );
+
+    let close = shortcuts_close_rect(panel, scale);
+    if state.hovered_close {
+        paint_rects(scene, [rect(close, HOVER)]);
+    }
+    let center = (
+        f64::from(close.x) + f64::from(close.width) / 2.0,
+        f64::from(close.y) + f64::from(close.height) / 2.0,
+    );
+    let arm = 4.5 * scale;
+    paint_line(
+        scene,
+        (center.0 - arm, center.1 - arm),
+        (center.0 + arm, center.1 + arm),
+        scale,
+    );
+    paint_line(
+        scene,
+        (center.0 + arm, center.1 - arm),
+        (center.0 - arm, center.1 + arm),
+        scale,
+    );
+
+    let list = PhysicalRect {
+        x: panel.x,
+        y: panel.y + i32::try_from(header).unwrap_or_default(),
+        width: panel.width,
+        height: panel.height.saturating_sub(header),
+    };
+    if list.height == 0 {
+        return;
+    }
+    scene.push_clip_layer(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &Rect::new(
+            f64::from(list.x),
+            f64::from(list.y),
+            f64::from(list.right()),
+            f64::from(list.bottom()),
+        ),
+    );
+    let section_height = (SHORTCUTS_SECTION_LOGICAL * scale).round() as f32;
+    let row_height = (SHORTCUTS_ROW_LOGICAL * scale).round() as f32;
+    let mut y = list.y as f32 + padding / 2.0 - state.scroll as f32;
+    for section in shortcuts::sections() {
+        text.paint_text(
+            scene,
+            section.title,
+            (panel.x as f32 + padding, y + 12.0 * scale as f32),
+            MUTED,
+            true,
+        );
+        y += section_height;
+        for row in section.rows {
+            // Rows scrolled out of view still cost a layout pass, so skip them outright.
+            if y + row_height >= list.y as f32 && y <= list.bottom() as f32 {
+                text.paint_text(
+                    scene,
+                    row.description,
+                    (panel.x as f32 + padding, y + 5.0 * scale as f32),
+                    TEXT,
+                    false,
+                );
+                let keys_width = text.measure_text(row.keys, false);
+                text.paint_text(
+                    scene,
+                    row.keys,
+                    (
+                        panel.right() as f32 - padding - keys_width,
+                        y + 5.0 * scale as f32,
+                    ),
+                    MUTED,
+                    false,
+                );
+            }
+            y += row_height;
+        }
+    }
+    scene.pop_layer();
+
+    let content = shortcuts_content_height(scale);
+    let viewport = f64::from(list.height);
+    if content > viewport {
+        let track = viewport;
+        let thumb = (track * viewport / content).max(f64::from((16.0 * scale) as u32));
+        let travel = track - thumb;
+        let offset = travel * (state.scroll / (content - viewport)).clamp(0.0, 1.0);
+        let width = (3.0 * scale).round().max(1.0) as f32;
+        paint_rects(
+            scene,
+            [RenderRect::new(
+                panel.right() as f32 - width - (3.0 * scale) as f32,
+                list.y as f32 + offset as f32,
+                width,
+                thumb as f32,
+                BORDER,
+                1.0,
+            )],
+        );
+    }
+}
+
 pub fn settings_menu_logical_size() -> (f64, f64) {
     (
         SETTINGS_MENU_WIDTH_LOGICAL,
-        SETTINGS_MENU_ROW_LOGICAL * SETTINGS_MENU_ITEMS.len() as f64,
+        SETTINGS_MENU_ROW_LOGICAL * SettingsMenuItem::ALL.len() as f64,
     )
 }
 
@@ -498,7 +815,10 @@ impl ChromeRenderer {
         }
 
         if state.settings_menu_open {
-            self.paint_settings_menu(&mut scene, size, &mut hit_map);
+            self.paint_settings_menu(&mut scene, size, state.settings_menu_hover, &mut hit_map);
+        }
+        if let Some(shortcuts) = state.shortcuts {
+            self.paint_shortcuts(&mut scene, size, shortcuts, &mut hit_map);
         }
         if let Some(menu) = state.context_menu {
             self.paint_context_menu(&mut scene, size, menu, &mut hit_map);
@@ -511,6 +831,8 @@ impl ChromeRenderer {
             hit_map.rename_editor
         } else if state.context_menu.is_some() {
             hit_map.context_menu
+        } else if state.shortcuts.is_some() {
+            hit_map.shortcuts
         } else {
             PhysicalRect::default()
         };
@@ -728,35 +1050,18 @@ impl ChromeRenderer {
     }
 
     fn paint_gear(&self, scene: &mut Scene, rect: PhysicalRect) {
-        let scale = self.scale_factor;
         let center = (
             rect.x as f64 + f64::from(rect.width) / 2.0,
             rect.y as f64 + f64::from(rect.height) / 2.0,
         );
-        let color = Color::from_rgb8(TEXT.r, TEXT.g, TEXT.b);
-        scene.stroke(
-            &Stroke::new(scale.max(1.0)),
+        // The hub is a second subpath, so an even-odd fill punches it out of the rim.
+        scene.fill(
+            Fill::EvenOdd,
             Affine::IDENTITY,
-            color,
+            Color::from_rgb8(TEXT.r, TEXT.g, TEXT.b),
             None,
-            &Circle::new(center, 4.5 * scale),
+            &gear_path(center, self.scale_factor),
         );
-        for index in 0..8 {
-            let angle = index as f64 * std::f64::consts::FRAC_PI_4;
-            let unit = (angle.cos(), angle.sin());
-            paint_line(
-                scene,
-                (
-                    center.0 + unit.0 * 5.5 * scale,
-                    center.1 + unit.1 * 5.5 * scale,
-                ),
-                (
-                    center.0 + unit.0 * 8.0 * scale,
-                    center.1 + unit.1 * 8.0 * scale,
-                ),
-                scale,
-            );
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -875,10 +1180,29 @@ impl ChromeRenderer {
         }
     }
 
+    fn paint_shortcuts(
+        &mut self,
+        scene: &mut Scene,
+        size: PhysicalSize<u32>,
+        state: ShortcutsRenderState,
+        hit_map: &mut ChromeHitMap,
+    ) {
+        hit_map.shortcuts = shortcuts_rect(size, self.scale_factor);
+        hit_map.shortcuts_close = shortcuts_close_rect(hit_map.shortcuts, self.scale_factor);
+        paint_shortcuts_panel(
+            &mut self.text,
+            self.scale_factor,
+            scene,
+            hit_map.shortcuts,
+            state,
+        );
+    }
+
     fn paint_settings_menu(
         &mut self,
         scene: &mut Scene,
         size: PhysicalSize<u32>,
+        hovered: Option<SettingsMenuItem>,
         hit_map: &mut ChromeHitMap,
     ) {
         let scale = self.scale_factor;
@@ -898,7 +1222,7 @@ impl ChromeRenderer {
                 ),
             ],
         );
-        for (index, label) in SETTINGS_MENU_ITEMS.iter().enumerate() {
+        for (index, item) in SettingsMenuItem::ALL.into_iter().enumerate() {
             let row = PhysicalRect {
                 x: hit_map.settings_menu.x,
                 y: hit_map.settings_menu.y + (index as u32 * row_height) as i32,
@@ -913,10 +1237,13 @@ impl ChromeRenderer {
             if row.height == 0 {
                 break;
             }
+            if hovered == Some(item) {
+                paint_rects(scene, [rect(row, HOVER)]);
+            }
             hit_map.settings_items.push(row);
             self.text.paint_text(
                 scene,
-                label,
+                item.label(),
                 (
                     row.x as f32 + 12.0 * scale as f32,
                     row.y as f32 + 9.0 * scale as f32,
@@ -1107,6 +1434,54 @@ fn paint_line(scene: &mut Scene, start: (f64, f64), end: (f64, f64), scale: f64)
     );
 }
 
+/// Outline of the settings cog, centred on `center`.
+///
+/// The rim carries [`GEAR_TEETH`] trapezoidal teeth — wider at the root than at the tip — and the
+/// hub follows as a second subpath so an even-odd fill leaves it hollow. Filling rather than
+/// stroking is what separates a gear from a sun: thin spokes standing off a thin circle read as
+/// rays at this size.
+fn gear_path(center: (f64, f64), scale: f64) -> BezPath {
+    let tip = GEAR_TIP_LOGICAL * scale;
+    let root = GEAR_ROOT_LOGICAL * scale;
+    let step = std::f64::consts::TAU / GEAR_TEETH as f64;
+    let tip_gap = step * 0.17;
+    let root_gap = step * 0.30;
+    let point = |radius: f64, angle: f64| {
+        (
+            center.0 + radius * angle.cos(),
+            center.1 + radius * angle.sin(),
+        )
+    };
+    // Control point for a quadratic that hugs the root circle across the gap between two teeth,
+    // so the rim between them stays round instead of collapsing into a chord.
+    let half_valley = (step - 2.0 * root_gap) / 2.0;
+    let valley_radius = root / half_valley.cos();
+
+    let mut path = BezPath::new();
+    path.move_to(point(root, -root_gap));
+    for index in 0..GEAR_TEETH {
+        let angle = index as f64 * step;
+        if index > 0 {
+            path.quad_to(
+                point(valley_radius, angle - step / 2.0),
+                point(root, angle - root_gap),
+            );
+        }
+        path.line_to(point(tip, angle - tip_gap));
+        path.line_to(point(tip, angle + tip_gap));
+        path.line_to(point(root, angle + root_gap));
+    }
+    let wrap = std::f64::consts::TAU;
+    path.quad_to(
+        point(valley_radius, wrap - step / 2.0),
+        point(root, wrap - root_gap),
+    );
+    path.close_path();
+
+    path.extend(Circle::new(center, GEAR_HUB_LOGICAL * scale).path_elements(0.05));
+    path
+}
+
 fn control_rect(offset: u32, tab_bar: PhysicalRect, width: u32) -> PhysicalRect {
     PhysicalRect {
         x: tab_bar.x + offset as i32,
@@ -1134,10 +1509,24 @@ fn leading_control_inset(scale: f64, fullscreen: bool) -> u32 {
     }
 }
 
+/// Placement of an in-chrome shortcuts panel: centred horizontally, a third of the way down, and
+/// clamped to the chrome so it never overhangs.
+fn shortcuts_rect(size: PhysicalSize<u32>, scale: f64) -> PhysicalRect {
+    let (width_logical, height_logical) = shortcuts_logical_size();
+    let width = ((width_logical * scale).round() as u32).min(size.width);
+    let height = ((height_logical * scale).round() as u32).min(size.height);
+    PhysicalRect {
+        x: i32::try_from(size.width.saturating_sub(width) / 2).unwrap_or_default(),
+        y: i32::try_from(size.height.saturating_sub(height) / 3).unwrap_or_default(),
+        width,
+        height,
+    }
+}
+
 fn settings_menu_rect(gear: PhysicalRect, size: PhysicalSize<u32>, scale: f64) -> PhysicalRect {
     let width = (SETTINGS_MENU_WIDTH_LOGICAL * scale).round() as u32;
     let height =
-        ((SETTINGS_MENU_ROW_LOGICAL * SETTINGS_MENU_ITEMS.len() as f64) * scale).round() as u32;
+        ((SETTINGS_MENU_ROW_LOGICAL * SettingsMenuItem::ALL.len() as f64) * scale).round() as u32;
     let right = gear.right().max(0) as u32;
     let x = right
         .saturating_sub(width)
@@ -1239,6 +1628,8 @@ fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
 
 #[cfg(test)]
 mod tests {
+    use vello::kurbo::{PathEl, Point};
+
     use super::*;
 
     #[test]
@@ -1469,6 +1860,119 @@ mod tests {
                 height: 102
             }
         );
+    }
+
+    #[test]
+    fn gear_path_teeth_span_root_to_tip_radii() {
+        let center = (20.0, 20.0);
+        let path = gear_path(center, 2.0);
+        let rim = path
+            .elements()
+            .iter()
+            .take_while(|element| !matches!(element, PathEl::ClosePath))
+            .filter_map(|element| match element {
+                PathEl::MoveTo(point) | PathEl::LineTo(point) => Some(*point),
+                PathEl::QuadTo(_, point) => Some(*point),
+                _ => None,
+            })
+            .map(|point| point.distance(Point::new(center.0, center.1)))
+            .collect::<Vec<_>>();
+
+        // Four points per tooth, plus the closing repeat of the starting root point.
+        assert_eq!(rim.len(), GEAR_TEETH * 4 + 1);
+        let tip = GEAR_TIP_LOGICAL * 2.0;
+        let root = GEAR_ROOT_LOGICAL * 2.0;
+        assert!(rim.iter().all(|radius| *radius >= root - 1e-6));
+        assert!(rim.iter().all(|radius| *radius <= tip + 1e-6));
+        assert_eq!(
+            rim.iter()
+                .filter(|radius| (*radius - tip).abs() < 1e-6)
+                .count(),
+            GEAR_TEETH * 2
+        );
+        assert_eq!(
+            rim.iter()
+                .filter(|radius| (*radius - root).abs() < 1e-6)
+                .count(),
+            GEAR_TEETH * 2 + 1
+        );
+    }
+
+    #[test]
+    fn gear_path_hub_is_a_hole_inside_the_rim() {
+        let center = (20.0, 20.0);
+        let path = gear_path(center, 2.0);
+        // Everything after the rim's `ClosePath` is the hub subpath.
+        let hub = path
+            .elements()
+            .iter()
+            .skip_while(|element| !matches!(element, PathEl::ClosePath))
+            .skip(1)
+            .filter_map(|element| match element {
+                PathEl::MoveTo(point) | PathEl::LineTo(point) => Some(*point),
+                PathEl::CurveTo(_, _, point) => Some(*point),
+                _ => None,
+            })
+            .map(|point| point.distance(Point::new(center.0, center.1)))
+            .collect::<Vec<_>>();
+
+        assert!(!hub.is_empty());
+        assert!(hub.iter().all(|radius| *radius < GEAR_ROOT_LOGICAL * 2.0));
+    }
+
+    #[test]
+    fn settings_menu_rows_map_to_items_and_reject_the_margins() {
+        let size = PhysicalSize::new(190, 102);
+        assert_eq!(
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 5.0)),
+            Some(SettingsMenuItem::Settings)
+        );
+        assert_eq!(
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 40.0)),
+            Some(SettingsMenuItem::Shortcuts)
+        );
+        assert_eq!(
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 101.0)),
+            Some(SettingsMenuItem::Documentation)
+        );
+        assert_eq!(
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 102.0)),
+            None
+        );
+        assert_eq!(
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(-1.0, 40.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_shortcuts_panel_is_centred_and_clamped_to_the_chrome() {
+        let (width, height) = shortcuts_logical_size();
+        let panel = shortcuts_rect(PhysicalSize::new(1000, 800), 1.0);
+        assert_eq!(panel.width, width as u32);
+        assert_eq!(panel.height, height as u32);
+        assert_eq!(panel.x, (1000 - width as i32) / 2);
+
+        // A chrome smaller than the panel gets a panel trimmed to fit, still fully on screen.
+        let cramped = shortcuts_rect(PhysicalSize::new(200, 150), 1.0);
+        assert_eq!(cramped.x, 0);
+        assert_eq!(cramped.y, 0);
+        assert_eq!(cramped.width, 200);
+        assert_eq!(cramped.height, 150);
+    }
+
+    #[test]
+    fn the_shortcuts_close_button_sits_in_the_header_trailing_corner() {
+        let panel = PhysicalRect {
+            x: 100,
+            y: 40,
+            width: 460,
+            height: 560,
+        };
+        let close = shortcuts_close_rect(panel, 1.0);
+        assert_eq!(close.right(), panel.right());
+        assert_eq!(close.y, panel.y);
+        assert_eq!(close.height as f64, shortcuts_header_height(1.0));
     }
 
     #[test]

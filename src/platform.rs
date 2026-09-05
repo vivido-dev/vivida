@@ -1,5 +1,7 @@
 //! Platform boundary for native pane hosting and event-loop integration.
 
+use std::process::{Command, Stdio};
+
 #[cfg(target_os = "macos")]
 use std::error::Error;
 #[cfg(target_os = "macos")]
@@ -44,6 +46,47 @@ pub fn pane_side_resize_gutter(scale_factor: f64) -> u32 {
     }
 }
 
+/// Whether a popup window takes the keyboard when it is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupFocus {
+    /// The popup owns the keyboard while it is open, as the rename editor and the shortcuts
+    /// window do.
+    Keyboard,
+    /// The popup appears without disturbing whoever holds the keyboard. The chrome dismisses its
+    /// menus when it resigns focus, so a menu that stole focus on open would close itself.
+    None,
+}
+
+/// Hand a URL to the platform browser.
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let (program, args): (&str, &[&str]) = ("open", &[]);
+    #[cfg(target_os = "linux")]
+    let (program, args): (&str, &[&str]) = ("xdg-open", &[]);
+    // `start` treats its first quoted argument as the window title, so it needs an empty one
+    // before the URL.
+    #[cfg(target_os = "windows")]
+    let (program, args): (&str, &[&str]) = ("cmd", &["/c", "start", ""]);
+
+    match Command::new(program)
+        .args(args)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        // The opener exits as soon as the browser has the URL. Reap it off the event loop so it
+        // does not linger as a zombie for the rest of the session.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => eprintln!("failed to open {url}: {error}"),
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub trait PaneHost {
     fn create_pane(
@@ -82,8 +125,7 @@ pub use macos::configure_chrome_window;
 #[cfg(target_os = "macos")]
 pub use macos::{
     NativePaneHost, configure_event_loop, finalize_chrome_window, focus_chrome_input,
-    position_rename_editor, position_settings_menu, rename_editor_window_attributes,
-    settings_menu_window_attributes,
+    popup_window_attributes, position_popup, set_popup_visible,
 };
 
 #[cfg(target_os = "windows")]
@@ -92,8 +134,8 @@ mod windows;
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    configure_event_loop, finalize_chrome_window, focus_chrome_input, position_rename_editor,
-    position_settings_menu, rename_editor_window_attributes, settings_menu_window_attributes,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };
 #[cfg(target_os = "linux")]
 mod linux;
@@ -101,6 +143,6 @@ mod linux;
 pub use linux::configure_chrome_window;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    configure_event_loop, finalize_chrome_window, focus_chrome_input, position_rename_editor,
-    position_settings_menu, rename_editor_window_attributes, settings_menu_window_attributes,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };

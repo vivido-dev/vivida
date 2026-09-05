@@ -16,7 +16,7 @@ use winit::platform::macos::{
 };
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use super::PaneHost;
+use super::{PaneHost, PopupFocus};
 use crate::layout::PhysicalRect;
 
 pub fn configure_event_loop(builder: &mut EventLoopBuilder<Event>) {
@@ -90,55 +90,77 @@ pub fn focus_chrome_input(window: &Window) {
     window.focus_window();
 }
 
-pub fn settings_menu_window_attributes(
+pub fn popup_window_attributes(
     _chrome: &Window,
     attributes: WindowAttributes,
+    focus: PopupFocus,
 ) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
-    Ok(Some(detached_popup_window_attributes(attributes)))
+    Ok(Some(detached_popup_window_attributes(attributes, focus)))
 }
 
-pub fn rename_editor_window_attributes(
-    _chrome: &Window,
+fn detached_popup_window_attributes(
     attributes: WindowAttributes,
-) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
-    Ok(Some(
-        detached_popup_window_attributes(attributes).with_active(true),
-    ))
-}
-
-fn detached_popup_window_attributes(attributes: WindowAttributes) -> WindowAttributes {
+    focus: PopupFocus,
+) -> WindowAttributes {
     // Winit implements a parent window on macOS by calling `addChildWindow` while constructing
     // the NSWindow. AppKit can order that child with its parent even when the requested initial
     // visibility is false, exposing an unpainted white popup when the chrome first appears.
-    // Keep auxiliary windows detached while hidden; `position_settings_menu` attaches either
-    // popup immediately before it is shown.
-    attributes.with_decorations(false)
+    // Keep auxiliary windows detached while hidden; `position_popup` attaches them immediately
+    // before they are shown.
+    attributes
+        .with_decorations(false)
+        .with_active(focus == PopupFocus::Keyboard)
 }
 
-pub fn position_settings_menu(chrome: &Window, menu: &Window, position: PhysicalPosition<i32>) {
+pub fn position_popup(
+    chrome: &Window,
+    popup: &Window,
+    position: PhysicalPosition<i32>,
+    focus: PopupFocus,
+) {
     let Ok(origin) = chrome.inner_position() else {
         return;
     };
-    menu.set_outer_position(PhysicalPosition::new(
+    popup.set_outer_position(PhysicalPosition::new(
         origin.x.saturating_add(position.x),
         origin.y.saturating_add(position.y),
     ));
-    let (Ok(chrome_handle), Ok(menu_handle)) = (chrome.window_handle(), menu.window_handle())
+    let (Ok(chrome_handle), Ok(popup_handle)) = (chrome.window_handle(), popup.window_handle())
     else {
         return;
     };
-    if let (Some(chrome), Some(menu)) = (
+    if let (Some(chrome), Some(child)) = (
         ns_window(chrome_handle.as_raw()),
-        ns_window(menu_handle.as_raw()),
+        ns_window(popup_handle.as_raw()),
     ) {
         // SAFETY: both windows are live on the main event-loop thread.
-        unsafe { chrome.addChildWindow_ordered(&menu, NSWindowOrderingMode::Above) };
+        unsafe { chrome.addChildWindow_ordered(&child, NSWindowOrderingMode::Above) };
+    }
+    if focus == PopupFocus::Keyboard {
+        popup.focus_window();
     }
 }
 
-pub fn position_rename_editor(chrome: &Window, editor: &Window, position: PhysicalPosition<i32>) {
-    position_settings_menu(chrome, editor, position);
-    editor.focus_window();
+pub fn set_popup_visible(window: &Window, visible: bool) {
+    // Winit's `set_visible(true)` is `makeKeyAndOrderFront:`, which takes the keyboard away from
+    // the chrome. The chrome dismisses its menus when it resigns key, so showing a popup that way
+    // would close it again within the same click. Order it in without touching key status and let
+    // `position_popup` hand over the keyboard only where a popup asked for it.
+    let popup = window
+        .window_handle()
+        .ok()
+        .and_then(|handle| ns_window(handle.as_raw()));
+    let Some(popup) = popup else {
+        window.set_visible(visible);
+        return;
+    };
+    if visible {
+        // `orderFrontRegardless` also works while another application is active, which
+        // `orderFront:` does not.
+        popup.orderFrontRegardless();
+    } else {
+        popup.orderOut(None);
+    }
 }
 
 #[derive(Clone)]
@@ -277,11 +299,16 @@ mod tests {
 
     #[test]
     fn hidden_popup_starts_detached_from_the_chrome() {
-        let attributes =
-            detached_popup_window_attributes(Window::default_attributes().with_visible(false));
+        for focus in [PopupFocus::Keyboard, PopupFocus::None] {
+            let attributes = detached_popup_window_attributes(
+                Window::default_attributes().with_visible(false),
+                focus,
+            );
 
-        assert!(!attributes.visible);
-        assert!(!attributes.decorations);
-        assert!(attributes.parent_window().is_none());
+            assert!(!attributes.visible);
+            assert!(!attributes.decorations);
+            assert!(attributes.parent_window().is_none());
+            assert_eq!(attributes.active, focus == PopupFocus::Keyboard);
+        }
     }
 }

@@ -13,6 +13,8 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowAttributes};
 
+use super::PopupFocus;
+
 pub fn configure_event_loop(_builder: &mut EventLoopBuilder<Event>) {}
 
 pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes {
@@ -45,83 +47,59 @@ pub fn focus_chrome_input(window: &Window) {
     }
 }
 
-pub fn settings_menu_window_attributes(
+pub fn popup_window_attributes(
     chrome: &Window,
     attributes: WindowAttributes,
+    focus: PopupFocus,
 ) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
-    // SAFETY: the shell retains the chrome until after its menu child is destroyed.
+    // SAFETY: the shell retains the chrome until after its popup children are destroyed.
     Ok(Some(unsafe {
         attributes
             .with_parent_window(Some(chrome.window_handle()?.as_raw()))
             .with_decorations(false)
-            .with_active(false)
+            .with_active(focus == PopupFocus::Keyboard)
     }))
 }
 
-pub fn rename_editor_window_attributes(
-    chrome: &Window,
-    attributes: WindowAttributes,
-) -> Result<Option<WindowAttributes>, Box<dyn Error>> {
-    // SAFETY: the shell retains the chrome until after its editor child is destroyed.
-    Ok(Some(unsafe {
-        attributes
-            .with_parent_window(Some(chrome.window_handle()?.as_raw()))
-            .with_decorations(false)
-            .with_active(true)
-    }))
-}
-
-pub fn position_settings_menu(
+pub fn position_popup(
     _chrome: &Window,
-    menu: &Window,
+    popup: &Window,
     position: winit::dpi::PhysicalPosition<i32>,
+    focus: PopupFocus,
 ) {
-    let Ok(menu_handle) = menu.window_handle() else {
+    let Ok(popup_handle) = popup.window_handle() else {
         return;
     };
-    let Some(menu) = hwnd(menu_handle.as_raw()) else {
+    let Some(popup) = hwnd(popup_handle.as_raw()) else {
         return;
     };
-    // SAFETY: the menu HWND is a live child of the chrome HWND.
+    // A null insertion handle is HWND_TOP, keeping a focusable popup above sibling terminal panes
+    // while it owns the keyboard. A focus-free popup keeps its z-order and never activates, so
+    // showing it cannot make the chrome resign focus and dismiss it again.
+    let flags = match focus {
+        PopupFocus::Keyboard => SWP_NOSIZE,
+        PopupFocus::None => SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+    };
+    // SAFETY: the popup HWND is a live child of the chrome HWND.
     unsafe {
         SetWindowPos(
-            menu,
+            popup,
             std::ptr::null_mut(),
             position.x,
             position.y,
             0,
             0,
-            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            flags,
         );
+        if focus == PopupFocus::Keyboard {
+            SetActiveWindow(popup);
+            SetFocus(popup);
+        }
     }
 }
 
-pub fn position_rename_editor(
-    _chrome: &Window,
-    editor: &Window,
-    position: winit::dpi::PhysicalPosition<i32>,
-) {
-    let Ok(editor_handle) = editor.window_handle() else {
-        return;
-    };
-    let Some(editor) = hwnd(editor_handle.as_raw()) else {
-        return;
-    };
-    // SAFETY: the editor HWND is a live child of the chrome HWND. A null insertion handle is
-    // HWND_TOP, keeping the editor above sibling terminal panes while it owns keyboard focus.
-    unsafe {
-        SetWindowPos(
-            editor,
-            std::ptr::null_mut(),
-            position.x,
-            position.y,
-            0,
-            0,
-            SWP_NOSIZE,
-        );
-        SetActiveWindow(editor);
-        SetFocus(editor);
-    }
+pub fn set_popup_visible(window: &Window, visible: bool) {
+    window.set_visible(visible);
 }
 
 fn hwnd(raw: RawWindowHandle) -> Option<HWND> {

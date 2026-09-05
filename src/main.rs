@@ -10,6 +10,7 @@ mod layout;
 mod model;
 mod platform;
 mod session;
+mod shortcuts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -19,8 +20,11 @@ use std::time::{Duration, Instant};
 
 use chrome::{
     ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, ContextMenuRenderState,
-    RenameEditorRenderState, RenameEditorRenderer, SettingsMenuRenderer, SidebarMode,
-    compute_chrome_layout, rename_editor_logical_size, settings_menu_logical_size,
+    RenameEditorRenderState, RenameEditorRenderer, SettingsMenuItem, SettingsMenuRenderer,
+    ShortcutsRenderState, ShortcutsRenderer, SidebarMode, compute_chrome_layout,
+    rename_editor_logical_size, settings_menu_item_at, settings_menu_logical_size,
+    shortcuts_close_rect, shortcuts_content_height, shortcuts_header_height,
+    shortcuts_logical_size, shortcuts_row_height,
 };
 use clap::{Args, Parser, Subcommand};
 use layout::{Axis, PhysicalRect, compute_rects, resize_pane};
@@ -29,14 +33,15 @@ use model::{
     remove_owned_pane, unique_name, workspace_label,
 };
 use platform::{
-    NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
-    finalize_chrome_window, focus_chrome_input, position_rename_editor, position_settings_menu,
-    rename_editor_window_attributes, settings_menu_window_attributes,
+    NativePaneHost, PaneHost, PopupFocus, RESIZE_EDGE_LOGICAL, configure_chrome_window,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
 };
 use vivido::config::UiConfig;
+use vivido::config::ui_config::Program;
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
@@ -46,7 +51,9 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
 use winit::event::TouchPhase;
-use winit::event::{ElementState, Event as WinitEvent, Ime, MouseButton, StartCause, WindowEvent};
+use winit::event::{
+    ElementState, Event as WinitEvent, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
@@ -471,6 +478,16 @@ struct Shell {
     settings_menu_renderer: Option<SettingsMenuRenderer>,
     settings_menu_id: Option<WindowId>,
     settings_menu_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
+    settings_menu_hover: Option<SettingsMenuItem>,
+    last_gear_click: Option<Instant>,
+    shortcuts_window: Option<Arc<Window>>,
+    shortcuts_renderer: Option<ShortcutsRenderer>,
+    shortcuts_id: Option<WindowId>,
+    shortcuts_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
+    shortcuts_open: bool,
+    shortcuts_scroll: f64,
+    shortcuts_cursor: Option<PhysicalPosition<f64>>,
+    shortcuts_hover_close: bool,
     rename_editor_window: Option<Arc<Window>>,
     rename_editor_renderer: Option<RenameEditorRenderer>,
     rename_editor_id: Option<WindowId>,
@@ -576,6 +593,16 @@ impl Shell {
             settings_menu_renderer: None,
             settings_menu_id: None,
             settings_menu_embedded_size: None,
+            settings_menu_hover: None,
+            last_gear_click: None,
+            shortcuts_window: None,
+            shortcuts_renderer: None,
+            shortcuts_id: None,
+            shortcuts_embedded_size: None,
+            shortcuts_open: false,
+            shortcuts_scroll: 0.0,
+            shortcuts_cursor: None,
+            shortcuts_hover_close: false,
             rename_editor_window: None,
             rename_editor_renderer: None,
             rename_editor_id: None,
@@ -648,6 +675,7 @@ impl Shell {
         }
 
         self.initialize_settings_menu(event_loop)?;
+        self.initialize_shortcuts_window(event_loop)?;
         self.initialize_rename_editor(event_loop)?;
 
         if let Some(chrome) = &self.chrome_window {
@@ -1030,9 +1058,28 @@ impl Shell {
     }
 
     fn create_tab(&mut self, event_loop: &ActiveEventLoop) {
-        let cwd = self.active_pane_cwd();
-        let Ok(window_id) = self.create_pane_window(event_loop, &cwd) else {
-            return;
+        self.create_tab_with_options(event_loop, None);
+    }
+
+    /// Add a tab to the active workspace, optionally running something other than the shell.
+    fn create_tab_with_options(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        options: Option<WindowOptions>,
+    ) {
+        let window = match options {
+            Some(options) => self.create_pane_window_with_options(event_loop, options),
+            None => {
+                let cwd = self.active_pane_cwd();
+                self.create_pane_window(event_loop, &cwd)
+            }
+        };
+        let window_id = match window {
+            Ok(window_id) => window_id,
+            Err(error) => {
+                eprintln!("failed to create tab: {error}");
+                return;
+            }
         };
         let Some(workspace) = self.active_workspace_mut() else {
             return;
@@ -2143,9 +2190,23 @@ impl Shell {
                 &mut self.settings_menu_renderer,
                 self.settings_menu_embedded_size,
             )
-            && let Err(error) = renderer.render(size)
+            && let Err(error) = renderer.render(size, self.settings_menu_hover)
         {
             eprintln!("failed to render embedded settings menu: {error}");
+        }
+        if self.shortcuts_open
+            && self.shortcuts_window.is_none()
+            && let (Some(renderer), Some(size)) =
+                (&mut self.shortcuts_renderer, self.shortcuts_embedded_size)
+            && let Err(error) = renderer.render(
+                size,
+                ShortcutsRenderState {
+                    scroll: self.shortcuts_scroll,
+                    hovered_close: self.shortcuts_hover_close,
+                },
+            )
+        {
+            eprintln!("failed to render embedded shortcuts: {error}");
         }
         let mut embedded_frames = self
             .pane_rects
@@ -2180,6 +2241,22 @@ impl Shell {
                     )
                     .unwrap_or_default(),
                     u32::try_from(self.chrome_hits.gear.bottom()).unwrap_or_default(),
+                ),
+            });
+        }
+        if self.shortcuts_open
+            && self.shortcuts_window.is_none()
+            && let Some(frame) = self
+                .shortcuts_renderer
+                .as_ref()
+                .and_then(ShortcutsRenderer::embedded_frame)
+        {
+            let panel = self.chrome_hits.shortcuts;
+            embedded_frames.push(EmbeddedFramePlacement {
+                frame,
+                origin: PhysicalPosition::new(
+                    u32::try_from(panel.x).unwrap_or_default(),
+                    u32::try_from(panel.y).unwrap_or_default(),
                 ),
             });
         }
@@ -2238,6 +2315,13 @@ impl Shell {
                 hovered_workspace: self.hovered_workspace,
                 fullscreen: chrome.fullscreen().is_some(),
                 settings_menu_open: self.settings_menu_open && self.settings_menu_window.is_none(),
+                settings_menu_hover: self.settings_menu_hover,
+                shortcuts: (self.shortcuts_open && self.shortcuts_window.is_none()).then_some(
+                    ShortcutsRenderState {
+                        scroll: self.shortcuts_scroll,
+                        hovered_close: self.shortcuts_hover_close,
+                    },
+                ),
                 context_menu,
                 rename_editor,
                 embedded_frames: &embedded_frames,
@@ -2280,7 +2364,8 @@ impl Shell {
             .with_inner_size(LogicalSize::new(width, height))
             .with_resizable(false)
             .with_visible(false);
-        let Some(attributes) = settings_menu_window_attributes(chrome, attributes)? else {
+        let Some(attributes) = popup_window_attributes(chrome, attributes, PopupFocus::None)?
+        else {
             let size = LogicalSize::new(width, height).to_physical(chrome.scale_factor());
             self.settings_menu_renderer = Some(SettingsMenuRenderer::new_embedded(
                 size,
@@ -2299,6 +2384,214 @@ impl Shell {
         Ok(())
     }
 
+    fn initialize_shortcuts_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(chrome) = &self.chrome_window else {
+            return Ok(());
+        };
+        let (width, height) = shortcuts_logical_size();
+        let attributes = Window::default_attributes()
+            .with_title("vivida shortcuts")
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_resizable(false)
+            .with_visible(false);
+        let Some(attributes) = popup_window_attributes(chrome, attributes, PopupFocus::Keyboard)?
+        else {
+            let size = LogicalSize::new(width, height).to_physical(chrome.scale_factor());
+            self.shortcuts_renderer = Some(ShortcutsRenderer::new_embedded(
+                size,
+                &self.config,
+                chrome.scale_factor(),
+            )?);
+            self.shortcuts_embedded_size = Some(size);
+            return Ok(());
+        };
+        let window = Arc::new(event_loop.create_window(attributes)?);
+        let renderer =
+            ShortcutsRenderer::new(Arc::clone(&window), &self.config, window.scale_factor())?;
+        self.shortcuts_id = Some(window.id());
+        self.shortcuts_window = Some(window);
+        self.shortcuts_renderer = Some(renderer);
+        Ok(())
+    }
+
+    fn set_shortcuts_open(&mut self, open: bool) {
+        if self.shortcuts_open == open {
+            if open {
+                // Picking Shortcuts again raises and re-focuses the panel rather than doing
+                // nothing, which would look like the menu had failed.
+                self.sync_shortcuts_window();
+            }
+            return;
+        }
+        self.shortcuts_open = open;
+        self.shortcuts_scroll = 0.0;
+        self.shortcuts_cursor = None;
+        self.shortcuts_hover_close = false;
+        self.sync_shortcuts_window();
+        if !open {
+            self.focus_active_pane();
+        }
+        self.request_chrome_redraw();
+    }
+
+    fn sync_shortcuts_window(&self) {
+        let (Some(chrome), Some(window)) = (&self.chrome_window, &self.shortcuts_window) else {
+            return;
+        };
+        if self.shortcuts_open {
+            // Show before positioning, as the rename editor does: `position_popup` hands over the
+            // keyboard, which a window that is not on screen yet cannot accept.
+            set_popup_visible(window, true);
+            position_popup(
+                chrome,
+                window,
+                centered_popup_origin(chrome.inner_size(), window.inner_size()),
+                PopupFocus::Keyboard,
+            );
+            window.request_redraw();
+        } else {
+            set_popup_visible(window, false);
+        }
+    }
+
+    fn render_shortcuts(&mut self) {
+        let state = ShortcutsRenderState {
+            scroll: self.shortcuts_scroll,
+            hovered_close: self.shortcuts_hover_close,
+        };
+        let (Some(window), Some(renderer)) = (&self.shortcuts_window, &mut self.shortcuts_renderer)
+        else {
+            return;
+        };
+        match renderer.render(window.inner_size(), state) {
+            Ok(true) => (),
+            Ok(false) => window.request_redraw(),
+            Err(error) => eprintln!("failed to render shortcuts: {error}"),
+        }
+    }
+
+    /// Height of the shortcuts list actually on screen, which the scroll offset is clamped to.
+    fn shortcuts_viewport(&self) -> (f64, f64) {
+        let (size, scale) = match &self.shortcuts_window {
+            Some(window) => (window.inner_size(), window.scale_factor()),
+            None => {
+                let scale = self
+                    .chrome_window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor());
+                match self.shortcuts_embedded_size {
+                    Some(size) => (size, scale),
+                    None => return (0.0, 0.0),
+                }
+            }
+        };
+        let header = shortcuts_header_height(scale);
+        let viewport = f64::from(size.height) - header;
+        (shortcuts_content_height(scale), viewport.max(0.0))
+    }
+
+    /// Whether an in-chrome shortcuts panel is open under the pointer.
+    fn shortcuts_over_chrome(&self) -> bool {
+        self.shortcuts_open
+            && self.shortcuts_window.is_none()
+            && self
+                .cursor_position
+                .is_some_and(|cursor| self.chrome_hits.shortcuts.contains(cursor.x, cursor.y))
+    }
+
+    /// Panel rect the shortcuts pointer is hit-tested against, in that surface's own coordinates.
+    fn shortcuts_panel(&self) -> Option<(PhysicalRect, f64)> {
+        match &self.shortcuts_window {
+            Some(window) => {
+                let size = window.inner_size();
+                Some((
+                    PhysicalRect {
+                        x: 0,
+                        y: 0,
+                        width: size.width,
+                        height: size.height,
+                    },
+                    window.scale_factor(),
+                ))
+            }
+            // The in-chrome fallback is hit-tested against the chrome's own map instead.
+            None => (self.chrome_hits.shortcuts.height > 0).then(|| {
+                (
+                    self.chrome_hits.shortcuts,
+                    self.chrome_window
+                        .as_ref()
+                        .map_or(1.0, |window| window.scale_factor()),
+                )
+            }),
+        }
+    }
+
+    fn hover_shortcuts_close(&mut self) {
+        let hovered = match (self.shortcuts_cursor, self.shortcuts_panel()) {
+            (Some(cursor), Some((panel, scale))) => {
+                shortcuts_close_rect(panel, scale).contains(cursor.x, cursor.y)
+            }
+            _ => false,
+        };
+        if self.shortcuts_hover_close == hovered {
+            return;
+        }
+        self.shortcuts_hover_close = hovered;
+        match &self.shortcuts_window {
+            Some(window) => window.request_redraw(),
+            None => self.request_chrome_redraw(),
+        }
+    }
+
+    /// One wheel notch or arrow press moves the list by a row.
+    fn shortcuts_scroll_step(&self) -> f64 {
+        let scale = self
+            .shortcuts_window
+            .as_ref()
+            .or(self.chrome_window.as_ref())
+            .map_or(1.0, |window| window.scale_factor());
+        shortcuts_row_height(scale)
+    }
+
+    /// Drive an open shortcuts panel from the keyboard, reporting whether the key was consumed.
+    ///
+    /// An in-chrome panel shares the chrome's keyboard with the terminal panes underneath it, so
+    /// anything the panel does not use has to keep travelling to the focused pane.
+    fn handle_shortcuts_key(&mut self, key: PhysicalKey) -> bool {
+        if !self.shortcuts_open {
+            return false;
+        }
+        let (content, viewport) = self.shortcuts_viewport();
+        let step = self.shortcuts_scroll_step();
+        match key {
+            PhysicalKey::Code(KeyCode::Escape) => self.set_shortcuts_open(false),
+            PhysicalKey::Code(KeyCode::ArrowDown) => self.scroll_shortcuts(step),
+            PhysicalKey::Code(KeyCode::ArrowUp) => self.scroll_shortcuts(-step),
+            PhysicalKey::Code(KeyCode::PageDown) => self.scroll_shortcuts(viewport),
+            PhysicalKey::Code(KeyCode::PageUp) => self.scroll_shortcuts(-viewport),
+            PhysicalKey::Code(KeyCode::Home) => self.scroll_shortcuts(-content),
+            PhysicalKey::Code(KeyCode::End) => self.scroll_shortcuts(content),
+            _ => return false,
+        }
+        true
+    }
+
+    fn scroll_shortcuts(&mut self, delta: f64) {
+        let (content, viewport) = self.shortcuts_viewport();
+        let scroll = clamp_scroll(self.shortcuts_scroll + delta, content, viewport);
+        if (scroll - self.shortcuts_scroll).abs() < f64::EPSILON {
+            return;
+        }
+        self.shortcuts_scroll = scroll;
+        match &self.shortcuts_window {
+            Some(window) => window.request_redraw(),
+            None => self.request_chrome_redraw(),
+        }
+    }
+
     fn initialize_rename_editor(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -2312,7 +2605,8 @@ impl Shell {
             .with_inner_size(LogicalSize::new(width, height))
             .with_resizable(false)
             .with_visible(false);
-        let Some(attributes) = rename_editor_window_attributes(chrome, attributes)? else {
+        let Some(attributes) = popup_window_attributes(chrome, attributes, PopupFocus::Keyboard)?
+        else {
             return Ok(());
         };
         let window = Arc::new(event_loop.create_window(attributes)?);
@@ -2329,6 +2623,9 @@ impl Shell {
             return;
         }
         self.settings_menu_open = open;
+        if !open {
+            self.settings_menu_hover = None;
+        }
         self.sync_settings_menu_window();
         self.request_chrome_redraw();
     }
@@ -2447,21 +2744,14 @@ impl Shell {
         self.clear_embedded_focus();
         if let (Some(chrome), Some(editor)) = (&self.chrome_window, &self.rename_editor_window) {
             editor.set_ime_allowed(true);
-            editor.set_visible(true);
-            let chrome_size = chrome.inner_size();
-            let editor_size = editor.inner_size();
-            let x = chrome_size.width.saturating_sub(editor_size.width) / 2;
-            let y = chrome_size.height.saturating_sub(editor_size.height) / 3;
-            position_rename_editor(
+            set_popup_visible(editor, true);
+            position_popup(
                 chrome,
                 editor,
-                PhysicalPosition::new(
-                    i32::try_from(x).unwrap_or_default(),
-                    i32::try_from(y).unwrap_or_default(),
-                ),
+                centered_popup_origin(chrome.inner_size(), editor.inner_size()),
+                PopupFocus::Keyboard,
             );
             editor.request_redraw();
-            editor.focus_window();
         } else if let Some(chrome) = &self.chrome_window {
             chrome.set_ime_allowed(true);
             focus_chrome_input(chrome);
@@ -2475,7 +2765,7 @@ impl Shell {
         }
         if let Some(editor) = &self.rename_editor_window {
             editor.set_ime_allowed(false);
-            editor.set_visible(false);
+            set_popup_visible(editor, false);
         }
         if let Some(chrome) = &self.chrome_window {
             chrome.set_ime_allowed(false);
@@ -2662,25 +2952,74 @@ impl Shell {
                 .right()
                 .saturating_sub(i32::try_from(menu_width).unwrap_or(i32::MAX))
                 .max(0);
-            position_settings_menu(
+            position_popup(
                 chrome,
                 menu,
                 PhysicalPosition::new(x, self.chrome_hits.gear.bottom()),
+                PopupFocus::None,
             );
-            menu.set_visible(true);
+            set_popup_visible(menu, true);
             menu.request_redraw();
         } else {
-            menu.set_visible(false);
+            set_popup_visible(menu, false);
         }
     }
 
+    fn hover_settings_menu(&mut self, position: Option<PhysicalPosition<f64>>) {
+        let Some(window) = &self.settings_menu_window else {
+            return;
+        };
+        let hovered = position.and_then(|position| {
+            settings_menu_item_at(window.inner_size(), window.scale_factor(), position)
+        });
+        if self.settings_menu_hover != hovered {
+            self.settings_menu_hover = hovered;
+            window.request_redraw();
+        }
+    }
+
+    fn activate_settings_item(&mut self, event_loop: &ActiveEventLoop, item: SettingsMenuItem) {
+        match item {
+            SettingsMenuItem::Settings => self.open_config_in_editor(event_loop),
+            SettingsMenuItem::Shortcuts => self.set_shortcuts_open(true),
+            SettingsMenuItem::Documentation => platform::open_url(DOCUMENTATION_URL),
+        }
+    }
+
+    /// Open the Vivido configuration in the user's editor, in a tab of this window.
+    fn open_config_in_editor(&mut self, event_loop: &ActiveEventLoop) {
+        let path = self
+            .config
+            .config_paths
+            .first()
+            .cloned()
+            .or_else(vivido::config::installed_config)
+            .or_else(default_config_path);
+        let Some(path) = path else {
+            eprintln!("cannot locate a vivido.toml to edit");
+            return;
+        };
+        if let Err(error) = ensure_config_file(&path) {
+            eprintln!("failed to create {}: {error}", path.display());
+            return;
+        }
+        let mut options = WindowOptions::default();
+        options.terminal_options = self.terminal_options.clone();
+        options.terminal_options.working_directory = path.parent().map(Path::to_owned);
+        options
+            .terminal_options
+            .set_command(&editor_program(configured_editor().as_deref(), &path));
+        self.create_tab_with_options(event_loop, Some(options));
+    }
+
     fn render_settings_menu(&mut self) {
+        let hovered = self.settings_menu_hover;
         let (Some(window), Some(renderer)) =
             (&self.settings_menu_window, &mut self.settings_menu_renderer)
         else {
             return;
         };
-        match renderer.render(window.inner_size()) {
+        match renderer.render(window.inner_size(), hovered) {
             Ok(true) => (),
             Ok(false) => window.request_redraw(),
             Err(error) => eprintln!("failed to render settings menu: {error}"),
@@ -2950,6 +3289,15 @@ impl Shell {
         let Some(cursor) = self.cursor_position else {
             return false;
         };
+        if self.shortcuts_open && self.shortcuts_window.is_none() {
+            if self.shortcuts_hover_close {
+                self.set_shortcuts_open(false);
+                return true;
+            }
+            if self.chrome_hits.shortcuts.contains(cursor.x, cursor.y) {
+                return true;
+            }
+        }
         if self.name_editor.is_some() {
             if !self.chrome_hits.rename_editor.contains(cursor.x, cursor.y) {
                 self.close_name_editor();
@@ -3024,7 +3372,14 @@ impl Shell {
         }
         if self.settings_menu_open {
             match settings_menu_click(&self.chrome_hits, cursor) {
-                SettingsMenuClick::Item(_) | SettingsMenuClick::Outside => {
+                SettingsMenuClick::Item(index) => {
+                    self.set_settings_menu_open(false);
+                    if let Some(item) = SettingsMenuItem::from_index(index) {
+                        self.activate_settings_item(event_loop, item);
+                    }
+                    return true;
+                }
+                SettingsMenuClick::Outside => {
                     self.set_settings_menu_open(false);
                     return true;
                 }
@@ -3049,7 +3404,12 @@ impl Shell {
             return true;
         }
         if self.chrome_hits.gear.contains(cursor.x, cursor.y) {
-            self.set_settings_menu_open(!self.settings_menu_open);
+            let now = Instant::now();
+            let toggle = gear_toggle_allowed(self.last_gear_click, now);
+            self.last_gear_click = Some(now);
+            if toggle {
+                self.set_settings_menu_open(!self.settings_menu_open);
+            }
             return true;
         }
         if let Some(action) = window_frame_action(&self.chrome_hits, cursor) {
@@ -3214,7 +3574,12 @@ impl Shell {
             WindowEvent::Focused(false) => {
                 #[cfg(target_os = "linux")]
                 self.clear_embedded_focus();
-                self.set_settings_menu_open(false);
+                // A detached settings menu is its own window, so showing it can itself cost the
+                // chrome its focus. Let that popup dismiss on its own focus loss instead; only an
+                // in-chrome menu is bound to the chrome's focus.
+                if self.settings_menu_window.is_none() {
+                    self.set_settings_menu_open(false);
+                }
                 self.name_context_menu = None;
                 if self.recovery_menu.take().is_some() {
                     self.sync_pane_visibility();
@@ -3236,6 +3601,10 @@ impl Shell {
                 self.cursor_position = Some(position);
                 self.update_hovered_workspace(position);
                 self.update_chrome_cursor(position);
+                if self.shortcuts_open && self.shortcuts_window.is_none() {
+                    self.shortcuts_cursor = Some(position);
+                    self.hover_shortcuts_close();
+                }
                 #[cfg(target_os = "linux")]
                 {
                     let target = self
@@ -3354,6 +3723,15 @@ impl Shell {
                 device_id,
                 delta,
                 phase,
+            } if self.shortcuts_over_chrome() => {
+                let _ = (device_id, phase);
+                let step = self.shortcuts_scroll_step();
+                self.scroll_shortcuts(wheel_scroll_delta(delta, step));
+            }
+            WindowEvent::MouseWheel {
+                device_id,
+                delta,
+                phase,
             } => {
                 #[cfg(not(target_os = "linux"))]
                 let _ = (device_id, delta, phase);
@@ -3426,6 +3804,12 @@ impl Shell {
             {
                 self.set_settings_menu_open(false);
             }
+            // An in-chrome shortcuts panel has no window of its own to route keys and wheel
+            // events to, so the chrome drives it while it is open.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && self.shortcuts_window.is_none()
+                    && self.handle_shortcuts_key(event.physical_key) => {}
             WindowEvent::KeyboardInput {
                 device_id,
                 event,
@@ -3604,6 +3988,105 @@ fn translated_pane_position(
     )
 }
 
+const DOCUMENTATION_URL: &str = "https://vivido.dev/docs";
+
+/// Written into a Vivido configuration the shell had to create, so the editor never opens on an
+/// empty buffer with no hint of what belongs there.
+const CONFIG_STUB: &str = "# Vivido configuration.\n# Reference: https://vivido.dev/docs\n";
+
+/// Where a Vivido configuration belongs when the user has none yet.
+fn default_config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config"));
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        });
+    Some(base?.join("vivido").join("vivido.toml"))
+}
+
+fn ensure_config_file(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, CONFIG_STUB)
+}
+
+fn configured_editor() -> Option<String> {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|editor| !editor.trim().is_empty())
+}
+
+/// Editor command for `path`.
+///
+/// `editor` is split on whitespace rather than handed to a shell, so `EDITOR="code -w"` works
+/// without inheriting a shell's quoting rules.
+fn editor_program(editor: Option<&str>, path: &Path) -> Program {
+    let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+    let mut words = editor
+        .unwrap_or(fallback)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let program = if words.is_empty() {
+        fallback.to_owned()
+    } else {
+        words.remove(0)
+    };
+    words.push(path.to_string_lossy().into_owned());
+    Program::WithArgs {
+        program,
+        args: words,
+    }
+}
+
+/// Scroll distance a wheel event asks for. Winit reports upward scrolling as positive, while the
+/// list offset grows downward.
+fn wheel_scroll_delta(delta: MouseScrollDelta, step: f64) -> f64 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, lines) => -f64::from(lines) * step,
+        MouseScrollDelta::PixelDelta(position) => -position.y,
+    }
+}
+
+/// Keep a scroll offset inside a list, allowing none at all when the content already fits.
+fn clamp_scroll(offset: f64, content: f64, viewport: f64) -> f64 {
+    offset.clamp(0.0, (content - viewport).max(0.0))
+}
+
+/// A double-click on the gear must leave the menu open, so the repeat click is swallowed rather
+/// than toggling the menu shut again. A later, deliberate click still closes it.
+const GEAR_REPEAT_CLICK: Duration = Duration::from_millis(400);
+
+fn gear_toggle_allowed(last: Option<Instant>, now: Instant) -> bool {
+    !last.is_some_and(|last| now.duration_since(last) < GEAR_REPEAT_CLICK)
+}
+
+/// Origin, relative to the chrome's client area, that centres a popup horizontally and sets it a
+/// third of the way down. Shared by the rename editor and the shortcuts window.
+fn centered_popup_origin(
+    chrome: winit::dpi::PhysicalSize<u32>,
+    popup: winit::dpi::PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let x = chrome.width.saturating_sub(popup.width) / 2;
+    let y = chrome.height.saturating_sub(popup.height) / 3;
+    PhysicalPosition::new(
+        i32::try_from(x).unwrap_or_default(),
+        i32::try_from(y).unwrap_or_default(),
+    )
+}
+
 fn window_frame_action(
     hit_map: &ChromeHitMap,
     position: PhysicalPosition<f64>,
@@ -3742,6 +4225,56 @@ impl ApplicationHandler<Event> for Shell {
             }
             return;
         }
+        if Some(window_id) == self.shortcuts_id {
+            match event {
+                WindowEvent::CloseRequested => self.set_shortcuts_open(false),
+                WindowEvent::RedrawRequested => self.render_shortcuts(),
+                WindowEvent::Resized(size) => {
+                    if let Some(renderer) = &mut self.shortcuts_renderer {
+                        let scale = self
+                            .shortcuts_window
+                            .as_ref()
+                            .map_or(1.0, |window| window.scale_factor());
+                        renderer.resize(size, scale, &self.config);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    if let (Some(renderer), Some(window)) =
+                        (&mut self.shortcuts_renderer, &self.shortcuts_window)
+                    {
+                        renderer.resize(window.inner_size(), scale_factor, &self.config);
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.shortcuts_cursor = Some(position);
+                    self.hover_shortcuts_close();
+                }
+                WindowEvent::CursorLeft { .. } => {
+                    self.shortcuts_cursor = None;
+                    self.hover_shortcuts_close();
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let step = self.shortcuts_scroll_step();
+                    self.scroll_shortcuts(wheel_scroll_delta(delta, step));
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    if self.shortcuts_hover_close {
+                        self.set_shortcuts_open(false);
+                    }
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed =>
+                {
+                    let _ = self.handle_shortcuts_key(event.physical_key);
+                }
+                _ => (),
+            }
+            return;
+        }
         if Some(window_id) == self.settings_menu_id {
             match event {
                 WindowEvent::CloseRequested => self.set_settings_menu_open(false),
@@ -3762,11 +4295,21 @@ impl ApplicationHandler<Event> for Shell {
                         renderer.resize(window.inner_size(), scale_factor, &self.config);
                     }
                 }
+                WindowEvent::Focused(false) => self.set_settings_menu_open(false),
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.hover_settings_menu(Some(position));
+                }
+                WindowEvent::CursorLeft { .. } => self.hover_settings_menu(None),
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } => self.set_settings_menu_open(false),
+                } => {
+                    if let Some(item) = self.settings_menu_hover {
+                        self.set_settings_menu_open(false);
+                        self.activate_settings_item(event_loop, item);
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed
                         && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
@@ -4359,6 +4902,95 @@ mod tests {
         assert_eq!(
             settings_menu_click(&hit_map, PhysicalPosition::new(20.0, 200.0)),
             SettingsMenuClick::Outside
+        );
+
+        // The hit map's row order is what maps a click onto an action.
+        assert_eq!(
+            SettingsMenuItem::from_index(0),
+            Some(SettingsMenuItem::Settings)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(1),
+            Some(SettingsMenuItem::Shortcuts)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(2),
+            Some(SettingsMenuItem::Documentation)
+        );
+        assert_eq!(SettingsMenuItem::from_index(3), None);
+    }
+
+    #[test]
+    fn a_repeat_gear_click_leaves_the_menu_open() {
+        let first = Instant::now();
+        assert!(gear_toggle_allowed(None, first));
+        // The second half of a double-click must not toggle the menu back shut.
+        assert!(!gear_toggle_allowed(
+            Some(first),
+            first + Duration::from_millis(120)
+        ));
+        // A later, deliberate click still closes it.
+        assert!(gear_toggle_allowed(
+            Some(first),
+            first + GEAR_REPEAT_CLICK + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn editor_program_falls_back_and_keeps_editor_arguments() {
+        let path = Path::new("/tmp/vivido.toml");
+        let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+
+        let Program::WithArgs { program, args } = editor_program(None, path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, fallback);
+        assert_eq!(args, vec![path.display().to_string()]);
+
+        let Program::WithArgs { program, args } = editor_program(Some("vim"), path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, "vim");
+        assert_eq!(args, vec![path.display().to_string()]);
+
+        // A configured editor may carry flags, and they must precede the path.
+        let Program::WithArgs { program, args } = editor_program(Some("code -w"), path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, "code");
+        assert_eq!(args, vec!["-w".to_owned(), path.display().to_string()]);
+
+        let Program::WithArgs { program, .. } = editor_program(Some("   "), path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, fallback);
+    }
+
+    #[test]
+    fn scroll_stays_inside_the_list_and_stalls_when_it_fits() {
+        assert_eq!(clamp_scroll(-40.0, 600.0, 200.0), 0.0);
+        assert_eq!(clamp_scroll(120.0, 600.0, 200.0), 120.0);
+        assert_eq!(clamp_scroll(900.0, 600.0, 200.0), 400.0);
+        // Content shorter than the viewport must never scroll.
+        assert_eq!(clamp_scroll(50.0, 120.0, 400.0), 0.0);
+    }
+
+    #[test]
+    fn wheel_and_pixel_scrolling_move_the_list_the_same_way() {
+        assert_eq!(
+            wheel_scroll_delta(MouseScrollDelta::LineDelta(0.0, -2.0), 26.0),
+            52.0
+        );
+        assert_eq!(
+            wheel_scroll_delta(MouseScrollDelta::LineDelta(0.0, 1.0), 26.0),
+            -26.0
+        );
+        assert_eq!(
+            wheel_scroll_delta(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -18.0)),
+                26.0
+            ),
+            18.0
         );
     }
 

@@ -45,6 +45,24 @@ spot the error in the log, open the right pane, and fix it — while you watch o
 You get a workspace that feels great to drive. Your agents get eyes and hands. Vivida is where
 both of you get more done.
 
+## Keyboard shortcuts
+
+`Mod` is `Cmd` on macOS and `Ctrl` elsewhere. The gear in the tab bar opens the same list in a
+scrollable window, alongside the Vivido terminal bindings that reach a pane.
+
+| Shortcut | Action |
+| --- | --- |
+| `Mod T` | New tab |
+| `Mod D` | Split the pane left and right |
+| `Mod Shift D` | Split the pane top and bottom |
+| `Mod W` | Close the focused pane |
+| `Mod Shift N` | New workspace |
+| `Mod Shift W` | Close the workspace |
+| `Mod Shift B` | Expand, shrink, or hide the sidebar |
+| `Mod Shift ]` / `Mod Shift [` | Next or previous tab |
+| `Mod 1` – `Mod 9` | Switch to workspace 1 through 9 |
+| `Ctrl Shift F12` | Recover a stuck terminal |
+
 ## Learn more
 
 - [Agent automation](docs/automation.md) — the full control loop: screenshots, input, layouts, and
