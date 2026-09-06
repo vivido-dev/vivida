@@ -9,19 +9,23 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
 };
 use winit::event_loop::EventLoopBuilder;
-use winit::platform::windows::WindowAttributesExtWindows;
+use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowAttributes};
+use winit::window::{Icon, Window, WindowAttributes};
 
 use super::PopupFocus;
 
 pub fn configure_event_loop(_builder: &mut EventLoopBuilder<Event>) {}
 
 pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes {
+    // The same embedded icon brands the executable and the native window/taskbar.
+    let icon = Icon::from_resource(101, None).expect("Vivida Windows icon resource is missing");
     // Chrome is presented through DirectComposition. An HWND redirection bitmap would retain an
     // opaque copy of the initial client area underneath that visual, making transparency appear
     // only in regions exposed by a later resize.
     attributes
+        .with_window_icon(Some(icon.clone()))
+        .with_taskbar_icon(Some(icon))
         .with_decorations(false)
         .with_no_redirection_bitmap(true)
         .with_clip_children(true)
