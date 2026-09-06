@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleExecutable</key>
     <string>vivida</string>
+    <key>CFBundleIconFile</key>
+    <string>vivida.icns</string>
     <key>CFBundleIdentifier</key>
     <string>dev.vivido.vivida</string>
     <key>CFBundleName</key>
