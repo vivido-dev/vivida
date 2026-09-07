@@ -659,7 +659,7 @@ impl Shell {
                 .with_min_inner_size(LogicalSize::new(640.0, 160.0))
                 // A transparent pane must composite through the host's content region to the desktop.
                 // The chrome renderer still paints the sidebar and tab strip as opaque rectangles.
-                .with_transparent(self.config.window_opacity() < 1.0)
+                .with_transparent(chrome::chrome_requires_transparency(&self.config))
                 // Pane and renderer initialization can take several seconds on a cold GPU cache.
                 // Keep the unpainted native window off screen until its children are ready.
                 .with_visible(false),

@@ -26,6 +26,13 @@ pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
 pub const TAB_BAR_LOGICAL: f64 = 35.0;
 pub const MIN_PANE_WIDTH_LOGICAL: f64 = 160.0;
 pub const MIN_PANE_HEIGHT_LOGICAL: f64 = 80.0;
+
+pub fn chrome_requires_transparency(config: &UiConfig) -> bool {
+    // DirectComposition places the chrome above its native child panes. Its unpainted
+    // content area must stay clear even when the terminals themselves are fully opaque.
+    cfg!(windows) || config.window_opacity() < 1.0
+}
+
 const CHROME_CONTROL_LOGICAL: f64 = 34.0;
 const NEW_TAB_LOGICAL: f64 = 36.0;
 const MACOS_TRAFFIC_LIGHTS_LOGICAL: f64 = 64.0;
@@ -661,7 +668,7 @@ impl ChromeRenderer {
         scale_factor: f64,
     ) -> Result<Self, vivido::display::renderer::Error> {
         let size = window.inner_size();
-        let transparent_content = config.window_opacity() < 1.0;
+        let transparent_content = chrome_requires_transparency(config);
         let renderer =
             SceneRenderer::new(RenderSource::Surface(window), size, transparent_content)?;
         let text = text_system(config, scale_factor);
@@ -1641,6 +1648,14 @@ mod tests {
     use vello::kurbo::{PathEl, Point};
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn opaque_terminal_does_not_make_the_host_cover_its_child_panes() {
+        let config = UiConfig::default();
+        assert_eq!(config.window_opacity(), 1.0);
+        assert!(chrome_requires_transparency(&config));
+    }
 
     #[test]
     fn sidebar_modes_allocate_expected_widths() {
