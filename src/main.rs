@@ -4276,7 +4276,7 @@ fn clamp_scroll(offset: f64, content: f64, viewport: f64) -> f64 {
 const GEAR_REPEAT_CLICK: Duration = Duration::from_millis(400);
 
 fn gear_toggle_allowed(last: Option<Instant>, now: Instant) -> bool {
-    !last.is_some_and(|last| now.duration_since(last) < GEAR_REPEAT_CLICK)
+    last.is_none_or(|last| now.duration_since(last) >= GEAR_REPEAT_CLICK)
 }
 
 /// Origin, relative to the chrome's client area, that centres a popup horizontally and sets it a
@@ -4467,11 +4467,7 @@ impl ApplicationHandler<Event> for Shell {
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } => {
-                    if self.shortcuts_hover_close {
-                        self.set_shortcuts_open(false);
-                    }
-                }
+                } if self.shortcuts_hover_close => self.set_shortcuts_open(false),
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed =>
                 {
