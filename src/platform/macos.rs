@@ -136,8 +136,14 @@ pub fn position_popup(
         ns_window(chrome_handle.as_raw()),
         ns_window(popup_handle.as_raw()),
     ) {
+        // Re-adding an existing child does not refresh its position among terminal siblings.
+        // Detach first so a reopened popup is attached above panes created since its last use.
+        if let Some(parent) = child.parentWindow() {
+            parent.removeChildWindow(&child);
+        }
         // SAFETY: both windows are live on the main event-loop thread.
         unsafe { chrome.addChildWindow_ordered(&child, NSWindowOrderingMode::Above) };
+        child.orderFrontRegardless();
     }
     if focus == PopupFocus::Keyboard {
         popup.focus_window();
@@ -162,6 +168,11 @@ pub fn set_popup_visible(window: &Window, visible: bool) {
         // `orderFront:` does not.
         popup.orderFrontRegardless();
     } else {
+        // A hidden auxiliary window must not retain its old sibling order, or reappear when
+        // AppKit orders the parent and its terminal children together.
+        if let Some(parent) = popup.parentWindow() {
+            parent.removeChildWindow(&popup);
+        }
         popup.orderOut(None);
     }
 }

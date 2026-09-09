@@ -2454,11 +2454,17 @@ impl Shell {
             return;
         }
         self.shortcuts_open = open;
+        // Closing after a focus transfer must not pull focus back from another pane or app.
+        let restore_focus = !open
+            && self
+                .shortcuts_window
+                .as_ref()
+                .is_none_or(|window| window.has_focus());
         self.shortcuts_scroll = 0.0;
         self.shortcuts_cursor = None;
         self.shortcuts_hover_close = false;
         self.sync_shortcuts_window();
-        if !open {
+        if restore_focus {
             self.focus_active_pane();
         }
         self.request_chrome_redraw();
@@ -3714,7 +3720,9 @@ impl Shell {
             // remembered terminal child so activation, task switching, and startup all type into
             // the pane rather than the chrome surface.
             WindowEvent::Focused(true)
-                if self.name_editor.is_none() && self.launch_menu.is_none() =>
+                if self.name_editor.is_none()
+                    && self.launch_menu.is_none()
+                    && !self.shortcuts_open =>
             {
                 self.focus_active_pane();
             }
@@ -4438,7 +4446,9 @@ impl ApplicationHandler<Event> for Shell {
         }
         if Some(window_id) == self.shortcuts_id {
             match event {
-                WindowEvent::CloseRequested => self.set_shortcuts_open(false),
+                WindowEvent::CloseRequested | WindowEvent::Focused(false) => {
+                    self.set_shortcuts_open(false);
+                }
                 WindowEvent::RedrawRequested => self.render_shortcuts(),
                 WindowEvent::Resized(size) => {
                     if let Some(renderer) = &mut self.shortcuts_renderer {
