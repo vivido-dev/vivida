@@ -200,6 +200,7 @@ pub struct ChromeRenderer {
 }
 
 pub struct ChromeRenderState<'a> {
+    pub split_highlight: Option<PhysicalRect>,
     pub sidebar_mode: SidebarMode,
     pub workspaces: &'a [Workspace],
     pub active_workspace: Option<WorkspaceId>,
@@ -824,6 +825,22 @@ impl ChromeRenderer {
             );
         }
 
+        // Fully transparent pixels do not receive mouse input on macOS. Draw the idle
+        // handles as well as the active one so a translucent window can start a drag.
+        if let Some(tab) = state
+            .workspaces
+            .iter()
+            .find(|workspace| Some(workspace.id) == state.active_workspace)
+            .and_then(Workspace::active_tab)
+        {
+            paint_rects(
+                &mut scene,
+                split_handle_rects(&tab.root, layout.content, scale),
+            );
+        }
+        if let Some(divider) = state.split_highlight {
+            paint_rects(&mut scene, [rect(divider, ACCENT)]);
+        }
         if state.settings_menu_open {
             self.paint_settings_menu(&mut scene, size, state.settings_menu_hover, &mut hit_map);
         }
@@ -1632,6 +1649,18 @@ fn resize_gutter_rects(size: PhysicalSize<u32>, layout: ChromeLayout) -> Vec<Phy
     gutters
 }
 
+fn split_handle_rects(
+    root: &crate::layout::Node,
+    area: PhysicalRect,
+    scale: f64,
+) -> Vec<RenderRect> {
+    crate::layout::compute_split_layout(root, area, scale)
+        .dividers
+        .into_iter()
+        .map(|divider| rect(divider.rect, BORDER))
+        .collect()
+}
+
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(
         rect.x as f32,
@@ -1648,6 +1677,35 @@ mod tests {
     use vello::kurbo::{PathEl, Point};
 
     use super::*;
+
+    #[test]
+    fn idle_split_handles_are_opaque_mouse_targets_in_translucent_windows() {
+        use crate::layout::{Axis, Node};
+        use crate::model::PaneId;
+        let mut root = Node::Leaf(PaneId(1));
+        root.split(PaneId(1), PaneId(2), Axis::Horizontal);
+        root.split(PaneId(2), PaneId(3), Axis::Vertical);
+        for scale in [1.0, 1.5, 2.0] {
+            let area = PhysicalRect {
+                x: 100,
+                y: 35,
+                width: 900,
+                height: 600,
+            };
+            let hits = crate::layout::compute_split_layout(&root, area, scale).dividers;
+            let painted = split_handle_rects(&root, area, scale);
+            assert_eq!(painted.len(), hits.len());
+            for (paint, hit) in painted.iter().zip(hits) {
+                assert_eq!(paint.alpha, 1.0);
+                assert_eq!((paint.x, paint.y), (hit.rect.x as f32, hit.rect.y as f32));
+                assert_eq!(
+                    (paint.width, paint.height),
+                    (hit.rect.width as f32, hit.rect.height as f32)
+                );
+                assert!(paint.width > 0.0 && paint.height > 0.0);
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[test]

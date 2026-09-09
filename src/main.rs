@@ -11,6 +11,9 @@ mod model;
 mod platform;
 mod session;
 mod shortcuts;
+mod split_resize;
+
+use split_resize::{DragEvent, SplitDrag, divider_contains, divider_cursor, drag_event};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -499,6 +502,9 @@ struct Shell {
     rename_editor_id: Option<WindowId>,
     chrome_layout: ChromeLayout,
     chrome_hits: ChromeHitMap,
+    split_drag: Option<SplitDrag<(WorkspaceId, TabId)>>,
+    split_pointer_down: bool,
+    split_hovered_pane: Option<WindowId>,
     cursor_position: Option<PhysicalPosition<f64>>,
     modifiers: ModifiersState,
     sidebar_mode: SidebarMode,
@@ -616,6 +622,9 @@ impl Shell {
             rename_editor_id: None,
             chrome_layout: ChromeLayout::default(),
             chrome_hits: ChromeHitMap::default(),
+            split_drag: None,
+            split_pointer_down: false,
+            split_hovered_pane: None,
             cursor_position: None,
             modifiers: ModifiersState::empty(),
             sidebar_mode: SidebarMode::default(),
@@ -1003,6 +1012,7 @@ impl Shell {
         event_loop: &ActiveEventLoop,
         cwd: PathBuf,
     ) -> Result<WorkspaceId, Box<dyn Error>> {
+        self.end_split_drag();
         let pane_window_id = self.create_pane_window(event_loop, &cwd)?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id += 1;
@@ -1052,6 +1062,7 @@ impl Shell {
     }
 
     fn switch_workspace(&mut self, workspace_id: WorkspaceId) {
+        self.end_split_drag();
         if self.active_workspace == Some(workspace_id)
             || !self
                 .workspaces
@@ -1077,6 +1088,7 @@ impl Shell {
         event_loop: &ActiveEventLoop,
         options: Option<WindowOptions>,
     ) {
+        self.end_split_drag();
         let window = match options {
             Some(options) => self.create_pane_window_with_options(event_loop, options),
             None => {
@@ -1111,6 +1123,7 @@ impl Shell {
     }
 
     fn switch_tab(&mut self, tab_id: TabId) {
+        self.end_split_drag();
         if self
             .active_workspace_mut()
             .is_some_and(|workspace| workspace.switch_tab(tab_id))
@@ -1122,6 +1135,7 @@ impl Shell {
     }
 
     fn close_active_pane(&mut self) {
+        self.end_split_drag();
         let window_id = self
             .active_workspace()
             .and_then(Workspace::active_tab)
@@ -1134,6 +1148,7 @@ impl Shell {
     }
 
     fn close_workspace(&mut self, workspace_id: WorkspaceId) {
+        self.end_split_drag();
         let Some(index) = self
             .workspaces
             .iter()
@@ -1174,6 +1189,7 @@ impl Shell {
     }
 
     fn split_active_pane(&mut self, event_loop: &ActiveEventLoop, axis: Axis) {
+        self.end_split_drag();
         let Some(workspace) = self.active_workspace() else {
             return;
         };
@@ -1266,6 +1282,7 @@ impl Shell {
         event_loop: &ActiveEventLoop,
         params: CreateWorkspaceOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let CreateWorkspaceOptions { name, mut options } = params;
         let cwd = options
             .terminal_options
@@ -1311,6 +1328,7 @@ impl Shell {
         event_loop: &ActiveEventLoop,
         params: CreateTabOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let CreateTabOptions {
             workspace_id,
             workspace_name,
@@ -1373,6 +1391,7 @@ impl Shell {
         event_loop: &ActiveEventLoop,
         params: SplitPaneOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let target = self.platform_window_id(params.window_id).ok_or_else(|| {
             vivido::host::IpcError::new("window_not_found", "target pane not found")
         })?;
@@ -1428,6 +1447,7 @@ impl Shell {
     }
 
     fn request_close_panes(&mut self, panes: &[WindowId]) -> Result<(), vivido::host::IpcError> {
+        self.end_split_drag();
         for window_id in panes {
             let pane = self.processor.window_mut(*window_id).ok_or_else(|| {
                 vivido::host::IpcError::new("window_not_found", "target pane not found")
@@ -1459,6 +1479,7 @@ impl Shell {
         &mut self,
         target: TabTarget,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let caller = self.caller_key(target.from_window_id)?;
         let workspace_id = self.resolve_workspace_id(
             target.workspace_id,
@@ -1876,6 +1897,7 @@ impl Shell {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        self.end_split_drag();
         if self.sidebar_mode == mode {
             return;
         }
@@ -1918,6 +1940,194 @@ impl Shell {
         NativePaneHost::new(chrome).reveal(&mut self.processor, window_id, visible);
     }
 
+    fn end_split_drag(&mut self) {
+        if self.split_drag.take().is_some() {
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn split_context(&self) -> Option<((WorkspaceId, TabId), &layout::Node)> {
+        let workspace = self.active_workspace()?;
+        let tab = workspace.active_tab()?;
+        Some(((workspace.id, tab.id), &tab.root))
+    }
+
+    fn split_context_mut(&mut self) -> Option<((WorkspaceId, TabId), &mut layout::Node)> {
+        let workspace = self.active_workspace_mut()?;
+        let workspace_id = workspace.id;
+        let tab = workspace.active_tab_mut()?;
+        Some(((workspace_id, tab.id), &mut tab.root))
+    }
+
+    fn split_cursor(&self, position: PhysicalPosition<f64>) -> Option<CursorIcon> {
+        if let Some(drag) = &self.split_drag {
+            return Some(divider_cursor(drag.axis()));
+        }
+        if self.settings_menu_open
+            || self.shortcuts_open
+            || self.name_editor.is_some()
+            || self.name_context_menu.is_some()
+            || self.launch_menu.is_some()
+            || self.recovery_menu.is_some()
+        {
+            return None;
+        }
+        let (_, root) = self.split_context()?;
+        let scale = self.chrome_window.as_ref()?.scale_factor();
+        layout::compute_split_layout(root, self.chrome_layout.content, scale)
+            .dividers
+            .iter()
+            .find(|divider| divider_contains(divider, position, scale))
+            .map(|divider| divider_cursor(divider.axis))
+    }
+
+    fn move_split_drag(&mut self, position: PhysicalPosition<f64>, restore: bool) {
+        let Some(mut drag) = self.split_drag.take() else {
+            return;
+        };
+        let area = self.chrome_layout.content;
+        let Some(scale) = self
+            .chrome_window
+            .as_ref()
+            .map(|window| window.scale_factor())
+        else {
+            return;
+        };
+        let valid = if let Some((owner, root)) = self.split_context_mut() {
+            if restore {
+                drag.restore(&owner, root, area, scale)
+            } else {
+                drag.update(&owner, root, area, scale, position)
+            }
+        } else {
+            false
+        };
+        if valid && !restore {
+            self.split_drag = Some(drag);
+        }
+        self.sync_pane_geometry();
+        self.request_chrome_redraw();
+    }
+
+    /// Consume a divider's complete pointer sequence before routing any input into terminals.
+    fn handle_split_event(&mut self, window_id: WindowId, event: &WindowEvent) -> bool {
+        let chrome_event = Some(window_id) == self.chrome_id;
+        if let WindowEvent::CursorMoved { position, .. } = event
+            && !self.split_pointer_down
+        {
+            let point = if chrome_event {
+                Some(*position)
+            } else {
+                self.pane_rects.get(&window_id).map(|rect| {
+                    PhysicalPosition::new(
+                        position.x + f64::from(rect.x),
+                        position.y + f64::from(rect.y),
+                    )
+                })
+            };
+            if let Some(point) = point {
+                self.cursor_position = Some(point);
+                let cursor = self.split_cursor(point);
+                if let Some(previous) = self.split_hovered_pane.take()
+                    && let Some(pane) = self.processor.window_mut(previous)
+                {
+                    pane.display.window.set_mouse_cursor(CursorIcon::Text);
+                }
+                if !chrome_event && let Some(cursor) = cursor {
+                    if let Some(pane) = self.processor.window_mut(window_id) {
+                        pane.display.window.set_mouse_cursor(cursor);
+                        self.split_hovered_pane = Some(window_id);
+                    }
+                    return true;
+                }
+            }
+        }
+        match drag_event(event, chrome_event, self.split_pointer_down) {
+            DragEvent::End => {
+                self.split_drag = None;
+                self.request_chrome_redraw();
+                false
+            }
+            DragEvent::Restore => {
+                self.move_split_drag(PhysicalPosition::new(0.0, 0.0), true);
+                true
+            }
+            DragEvent::Move(position) => {
+                let point = if chrome_event {
+                    Some(position)
+                } else {
+                    self.pane_rects.get(&window_id).map(|rect| {
+                        PhysicalPosition::new(
+                            position.x + f64::from(rect.x),
+                            position.y + f64::from(rect.y),
+                        )
+                    })
+                };
+                if let Some(point) = point {
+                    self.cursor_position = Some(point);
+                    self.move_split_drag(point, false);
+                }
+                true
+            }
+            DragEvent::Release => {
+                self.split_drag = None;
+                self.split_pointer_down = false;
+                self.request_chrome_redraw();
+                if let Some(position) = self.cursor_position {
+                    self.update_chrome_cursor(position);
+                }
+                if self
+                    .chrome_window
+                    .as_ref()
+                    .is_some_and(|window| window.has_focus())
+                {
+                    self.focus_active_pane();
+                }
+                true
+            }
+            DragEvent::Start => {
+                // A fresh press also clears a capture whose release happened outside this app.
+                self.split_pointer_down = false;
+                self.split_drag = None;
+                if (!chrome_event && !self.pane_rects.contains_key(&window_id))
+                    || self.settings_menu_open
+                    || self.shortcuts_open
+                    || self.name_editor.is_some()
+                    || self.name_context_menu.is_some()
+                    || self.launch_menu.is_some()
+                    || self.recovery_menu.is_some()
+                {
+                    return false;
+                }
+                let (Some(position), Some(chrome)) =
+                    (self.cursor_position, self.chrome_window.as_ref())
+                else {
+                    return false;
+                };
+                let Some((owner, root)) = self.split_context() else {
+                    return false;
+                };
+                self.split_drag = SplitDrag::begin(
+                    owner,
+                    root,
+                    self.chrome_layout.content,
+                    chrome.scale_factor(),
+                    position,
+                );
+                if self.split_drag.is_none() {
+                    return false;
+                }
+                self.split_pointer_down = true;
+                chrome.focus_window();
+                self.update_chrome_cursor(position);
+                self.request_chrome_redraw();
+                true
+            }
+            DragEvent::Swallow => true,
+            DragEvent::Pass => false,
+        }
+    }
+
     fn sync_pane_geometry(&mut self) {
         let Some(chrome) = &self.chrome_window else {
             return;
@@ -1925,6 +2135,13 @@ impl Shell {
         let size = chrome.inner_size();
         let scale = chrome.scale_factor();
         self.chrome_layout = compute_chrome_layout(size, scale, self.sidebar_mode);
+        if self.split_drag.as_ref().is_some_and(|drag| {
+            self.split_context().is_none_or(|(owner, root)| {
+                !drag.valid(&owner, root, self.chrome_layout.content, scale)
+            })
+        }) {
+            self.split_drag = None;
+        }
         let Some(workspace) = self.active_workspace() else {
             return;
         };
@@ -1952,6 +2169,7 @@ impl Shell {
         width: u32,
         height: u32,
     ) -> Option<PhysicalRect> {
+        self.end_split_drag();
         let key = self.pane_index.get(&window_id).copied()?;
         let scale = self.chrome_window.as_ref()?.scale_factor();
         let content = self.chrome_layout.content;
@@ -1966,6 +2184,9 @@ impl Shell {
     }
 
     fn focus_active_pane(&mut self) {
+        if self.split_drag.is_some() {
+            return;
+        }
         let window_id = self
             .active_workspace()
             .and_then(Workspace::active_tab)
@@ -2020,6 +2241,7 @@ impl Shell {
     }
 
     fn activate_pane(&mut self, window_id: WindowId) -> bool {
+        self.end_split_drag();
         if !self.select_pane(window_id) {
             return false;
         }
@@ -2140,6 +2362,7 @@ impl Shell {
             return;
         }
 
+        self.end_split_drag();
         for window_id in closed {
             self.pane_rects.remove(&window_id);
             let Some(key) = self.pane_index.remove(&window_id) else {
@@ -2336,6 +2559,7 @@ impl Shell {
         match renderer.render(
             chrome.inner_size(),
             ChromeRenderState {
+                split_highlight: self.split_drag.as_ref().and_then(SplitDrag::highlight),
                 sidebar_mode: self.sidebar_mode,
                 workspaces: &self.workspaces,
                 active_workspace: self.active_workspace,
@@ -3644,8 +3868,9 @@ impl Shell {
         let Some(chrome) = &self.chrome_window else {
             return;
         };
-        let icon = chrome_resize_direction(chrome, position)
-            .map(resize_cursor)
+        let icon = self
+            .split_cursor(position)
+            .or_else(|| chrome_resize_direction(chrome, position).map(resize_cursor))
             .unwrap_or(CursorIcon::Default);
         chrome.set_cursor(icon);
     }
@@ -4411,6 +4636,9 @@ impl ApplicationHandler<Event> for Shell {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.handle_split_event(window_id, &event) {
+            return;
+        }
         if Some(window_id) == self.rename_editor_id {
             match event {
                 WindowEvent::CloseRequested | WindowEvent::Focused(false) => {

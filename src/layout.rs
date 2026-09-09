@@ -146,14 +146,33 @@ fn normalize_sizes(sizes: &mut [f32]) {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitDivider {
+    pub path: Vec<usize>,
+    pub before: usize,
+    pub axis: Axis,
+    pub rect: PhysicalRect,
+    pub available: u32,
+}
+
+#[derive(Default)]
+pub struct SplitLayout {
+    pub panes: HashMap<PaneId, PhysicalRect>,
+    pub dividers: Vec<SplitDivider>,
+}
+
+pub fn compute_split_layout(node: &Node, area: PhysicalRect, scale_factor: f64) -> SplitLayout {
+    let mut layout = SplitLayout::default();
+    compute_node_rects(node, area, scale_factor, &mut layout, &mut Vec::new());
+    layout
+}
+
 pub fn compute_rects(
     node: &Node,
     area: PhysicalRect,
     scale_factor: f64,
 ) -> HashMap<PaneId, PhysicalRect> {
-    let mut rects = HashMap::new();
-    compute_node_rects(node, area, scale_factor, &mut rects);
-    rects
+    compute_split_layout(node, area, scale_factor).panes
 }
 
 /// Adjust split weights so `pane_id` approaches the requested physical size without moving
@@ -290,11 +309,12 @@ fn compute_node_rects(
     node: &Node,
     area: PhysicalRect,
     scale_factor: f64,
-    rects: &mut HashMap<PaneId, PhysicalRect>,
+    layout: &mut SplitLayout,
+    path: &mut Vec<usize>,
 ) {
     match node {
         Node::Leaf(pane_id) => {
-            rects.insert(*pane_id, area);
+            layout.panes.insert(*pane_id, area);
         }
         Node::Split {
             axis,
@@ -310,15 +330,21 @@ fn compute_node_rects(
             let available = extent.saturating_sub(handle_total);
             let mut cursor = 0u32;
             let mut remaining = available;
+            let mut cumulative_weight = 0.0;
             let total_weight = sizes.iter().copied().sum::<f32>().max(f32::EPSILON);
 
             for (index, child) in children.iter().enumerate() {
+                cumulative_weight += sizes[index];
                 let child_extent = if index + 1 == children.len() {
                     remaining
                 } else {
-                    let weighted =
-                        ((available as f32) * sizes[index] / total_weight).round() as u32;
-                    weighted.min(remaining)
+                    // Round boundaries, not individual widths: the far edge of an adjacent
+                    // pair must not drift when its internal divider moves.
+                    let boundary =
+                        ((available as f32) * cumulative_weight / total_weight).round() as u32;
+                    boundary
+                        .saturating_sub(available - remaining)
+                        .min(remaining)
                 };
                 let child_area = match axis {
                     Axis::Horizontal => PhysicalRect {
@@ -334,10 +360,34 @@ fn compute_node_rects(
                         height: child_extent,
                     },
                 };
-                compute_node_rects(child, child_area, scale_factor, rects);
+                path.push(index);
+                compute_node_rects(child, child_area, scale_factor, layout, path);
+                path.pop();
                 remaining = remaining.saturating_sub(child_extent);
                 cursor = cursor.saturating_add(child_extent);
                 if index + 1 < children.len() {
+                    let offset = i32::try_from(cursor).unwrap_or(i32::MAX);
+                    let rect = match axis {
+                        Axis::Horizontal => PhysicalRect {
+                            x: area.x.saturating_add(offset),
+                            y: area.y,
+                            width: handle.min(extent.saturating_sub(cursor)),
+                            height: area.height,
+                        },
+                        Axis::Vertical => PhysicalRect {
+                            x: area.x,
+                            y: area.y.saturating_add(offset),
+                            width: area.width,
+                            height: handle.min(extent.saturating_sub(cursor)),
+                        },
+                    };
+                    layout.dividers.push(SplitDivider {
+                        path: path.clone(),
+                        before: index,
+                        axis: *axis,
+                        rect,
+                        available,
+                    });
                     cursor = cursor.saturating_add(handle);
                 }
             }

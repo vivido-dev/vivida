@@ -45,6 +45,12 @@ spot the error in the log, open the right pane, and fix it — while you watch o
 You get a workspace that feels great to drive. Your agents get eyes and hands. Vivida is where
 both of you get more done.
 
+## Resizing split panes
+
+Drag the gap between panes to resize the two neighboring sections. The panes resize live; other
+sections keep their boundaries. Press Escape during the drag to restore the original sizes.
+Resizing stops when you release the mouse, switch tabs or workspaces, or leave the window's focus.
+
 ## Keyboard shortcuts
 
 `Mod` is `Cmd` on macOS and `Ctrl` elsewhere. The gear in the tab bar opens the same list in a
