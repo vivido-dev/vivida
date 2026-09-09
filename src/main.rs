@@ -2719,7 +2719,7 @@ impl Shell {
     }
 
     fn open_launch_menu(&mut self, event_loop: &ActiveEventLoop) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.close_recovery_menu();
             self.set_settings_menu_open(false);
@@ -2738,7 +2738,7 @@ impl Shell {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = event_loop;
             if self.launch_menu.is_some() {
@@ -2786,8 +2786,14 @@ impl Shell {
             .and_then(|entries| entries.get(index))
             .map(|entry| entry.action.clone());
         self.close_launch_menu();
+        if let Some(action) = action {
+            self.activate_launch_action(event_loop, action);
+        }
+    }
+
+    fn activate_launch_action(&mut self, event_loop: &ActiveEventLoop, action: LaunchAction) {
         match action {
-            Some(LaunchAction::NewTab(program)) => {
+            LaunchAction::NewTab(program) => {
                 let mut options = WindowOptions::default();
                 options.terminal_options = self.terminal_options.clone();
                 options.terminal_options.working_directory = Some(self.active_pane_cwd());
@@ -2796,8 +2802,7 @@ impl Shell {
                 }
                 self.create_tab_with_options(event_loop, Some(options));
             }
-            Some(LaunchAction::NewWindow) => self.spawn_new_instance(),
-            None => {}
+            LaunchAction::NewWindow => self.spawn_new_instance(),
         }
     }
 
@@ -4551,6 +4556,11 @@ impl ApplicationHandler<Event> for Shell {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        #[cfg(target_os = "macos")]
+        if let Some(action) = macos_launch_action(&event) {
+            self.activate_launch_action(event_loop, action);
+            return;
+        }
         self.processor
             .handle_winit_event(event_loop, WinitEvent::UserEvent(event));
         if self.processor.has_pending_embedded_redraw() {
@@ -4753,6 +4763,18 @@ fn workspace_shortcut_index(key_code: KeyCode) -> Option<usize> {
     }
 }
 
+/// Creation belongs to the workspace shell even when chrome, rather than a pane, holds focus.
+#[cfg(target_os = "macos")]
+fn macos_launch_action(event: &Event) -> Option<LaunchAction> {
+    use vivido::{EventType, MacOsMenuCommand};
+
+    match event.payload() {
+        EventType::MacOsMenu(MacOsMenuCommand::NewWindow) => Some(LaunchAction::NewWindow),
+        EventType::MacOsMenu(MacOsMenuCommand::NewTab) => Some(LaunchAction::NewTab(None)),
+        _ => None,
+    }
+}
+
 fn shell_modifier_pressed(modifiers: ModifiersState) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -4869,6 +4891,33 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_file_menu_creation_routes_to_the_shell_without_a_focused_terminal() {
+        use vivido::{EventType, MacOsMenuCommand};
+
+        for (command, expected) in [
+            (MacOsMenuCommand::NewWindow, LaunchAction::NewWindow),
+            (MacOsMenuCommand::NewTab, LaunchAction::NewTab(None)),
+        ] {
+            let event = Event::new(EventType::MacOsMenu(command), None);
+            assert_eq!(macos_launch_action(&event), Some(expected));
+        }
+        for command in [
+            MacOsMenuCommand::Copy,
+            MacOsMenuCommand::Paste,
+            MacOsMenuCommand::Find,
+            MacOsMenuCommand::Clear,
+        ] {
+            let event = Event::new(EventType::MacOsMenu(command), None);
+            assert_eq!(macos_launch_action(&event), None);
+        }
+        assert_eq!(
+            macos_launch_action(&Event::new(EventType::HostWakeup, None)),
+            None
+        );
+    }
 
     #[test]
     fn every_command_has_unambiguous_arguments() {

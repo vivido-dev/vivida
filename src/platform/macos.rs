@@ -19,6 +19,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use super::{PaneHost, PopupFocus};
 use crate::layout::PhysicalRect;
 
+mod launch_menu;
+pub use launch_menu::show_launch_menu;
+
 pub fn configure_event_loop(builder: &mut EventLoopBuilder<Event>) {
     builder
         .with_activation_policy(ActivationPolicy::Regular)
