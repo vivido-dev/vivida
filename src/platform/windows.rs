@@ -5,9 +5,7 @@ use std::error::Error;
 use vivido::Event;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos};
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -77,12 +75,12 @@ pub fn position_popup(
     let Some(popup) = hwnd(popup_handle.as_raw()) else {
         return;
     };
-    // A null insertion handle is HWND_TOP, keeping a focusable popup above sibling terminal panes
-    // while it owns the keyboard. A focus-free popup keeps its z-order and never activates, so
-    // showing it cannot make the chrome resign focus and dismiss it again.
+    // A null insertion handle is HWND_TOP. Every popup must rise above terminal siblings,
+    // including the initial pane created before the settings menu. SWP_NOACTIVATE keeps a
+    // focus-free menu from taking the keyboard while still allowing its z-order to change.
     let flags = match focus {
         PopupFocus::Keyboard => SWP_NOSIZE,
-        PopupFocus::None => SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+        PopupFocus::None => SWP_NOACTIVATE | SWP_NOSIZE,
     };
     // SAFETY: the popup HWND is a live child of the chrome HWND.
     unsafe {
@@ -172,5 +170,85 @@ pub fn show_launch_menu(
         })();
         DestroyMenu(menu);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetTopWindow, SWP_NOMOVE};
+    use winit::application::ApplicationHandler;
+    use winit::event::WindowEvent;
+    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    use winit::window::WindowId;
+
+    #[test]
+    fn settings_popup_rises_above_initial_pane_without_taking_focus() {
+        struct PopupTest;
+
+        impl ApplicationHandler for PopupTest {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let chrome = event_loop
+                    .create_window(Window::default_attributes().with_visible(false))
+                    .unwrap();
+                let child_attributes = || {
+                    popup_window_attributes(
+                        &chrome,
+                        Window::default_attributes().with_visible(false),
+                        PopupFocus::None,
+                    )
+                    .unwrap()
+                    .unwrap()
+                };
+                let pane = event_loop.create_window(child_attributes()).unwrap();
+                let menu = event_loop.create_window(child_attributes()).unwrap();
+                let parent = hwnd(chrome.window_handle().unwrap().as_raw()).unwrap();
+                let pane_handle = hwnd(pane.window_handle().unwrap().as_raw()).unwrap();
+                let menu_handle = hwnd(menu.window_handle().unwrap().as_raw()).unwrap();
+                // SAFETY: all three HWNDs are retained on their owning event-loop thread.
+                let previous_focus = unsafe {
+                    SetWindowPos(
+                        pane_handle,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                    assert_eq!(GetTopWindow(parent), pane_handle);
+                    GetFocus()
+                };
+                position_popup(
+                    &chrome,
+                    &menu,
+                    winit::dpi::PhysicalPosition::new(20, 40),
+                    PopupFocus::None,
+                );
+                // SAFETY: the windows remain live on this thread.
+                unsafe {
+                    assert_eq!(GetTopWindow(parent), menu_handle);
+                    assert_eq!(GetFocus(), previous_focus);
+                }
+                event_loop.exit();
+            }
+
+            fn window_event(
+                &mut self,
+                _event_loop: &ActiveEventLoop,
+                _window_id: WindowId,
+                _event: WindowEvent,
+            ) {
+            }
+        }
+
+        EventLoop::builder()
+            .with_any_thread(true)
+            .build()
+            .unwrap()
+            .run_app(&mut PopupTest)
+            .unwrap();
     }
 }

@@ -2519,8 +2519,6 @@ impl Shell {
             .launch_menu
             .map(|menu| ContextMenuRenderState {
                 anchor: menu.anchor,
-                automatic_title_action: false,
-                terminal_actions: false,
                 recovery_actions: false,
                 launch_entries: self.launch_entries.as_deref(),
                 selected: menu.selected,
@@ -2529,8 +2527,6 @@ impl Shell {
                 self.recovery_menu
                     .map(|menu| ContextMenuRenderState {
                         anchor: menu.anchor,
-                        automatic_title_action: false,
-                        terminal_actions: false,
                         recovery_actions: true,
                         launch_entries: None,
                         selected: None,
@@ -2538,21 +2534,6 @@ impl Shell {
                     .or_else(|| {
                         self.name_context_menu.map(|menu| ContextMenuRenderState {
                             anchor: menu.anchor,
-                            automatic_title_action: match menu.target {
-                                NameTarget::Workspace(_) => false,
-                                NameTarget::Tab {
-                                    workspace_id,
-                                    tab_id,
-                                } => self
-                                    .workspaces
-                                    .iter()
-                                    .find(|workspace| workspace.id == workspace_id)
-                                    .and_then(|workspace| {
-                                        workspace.tabs.iter().find(|tab| tab.id == tab_id)
-                                    })
-                                    .is_some_and(model::Tab::is_title_custom),
-                            },
-                            terminal_actions: matches!(menu.target, NameTarget::Tab { .. }),
                             recovery_actions: false,
                             launch_entries: None,
                             selected: None,
@@ -3089,14 +3070,6 @@ impl Shell {
         self.close_recovery_menu();
     }
 
-    fn focused_pane_in_tab(&self, workspace_id: WorkspaceId, tab_id: TabId) -> Option<WindowId> {
-        self.workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
-            .and_then(|tab| tab.window_id(tab.focused_pane))
-    }
-
     fn start_name_editor(&mut self, target: NameTarget) {
         let current = match target {
             NameTarget::Workspace(workspace_id) => self
@@ -3197,19 +3170,6 @@ impl Shell {
                 self.request_chrome_redraw();
             }
         }
-    }
-
-    fn reset_context_tab_title(&mut self, workspace_id: WorkspaceId, tab_id: TabId) {
-        let _ = self.host_reset_tab_title(TabTarget {
-            workspace_id: Some(workspace_id.0),
-            workspace_name: None,
-            tab_id: Some(tab_id.0),
-            tab_name: None,
-            from_window_id: None,
-        });
-        self.name_context_menu = None;
-        self.focus_active_pane();
-        self.request_chrome_redraw();
     }
 
     fn handle_name_editor_key(&mut self, event: &winit::event::KeyEvent) -> bool {
@@ -3716,46 +3676,8 @@ impl Shell {
                 .context_items
                 .iter()
                 .position(|rect| rect.contains(cursor.x, cursor.y));
-            let automatic_title_action = match menu.target {
-                NameTarget::Workspace(_) => false,
-                NameTarget::Tab {
-                    workspace_id,
-                    tab_id,
-                } => self
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)
-                    .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
-                    .is_some_and(model::Tab::is_title_custom),
-            };
             match (menu.target, item) {
                 (target, Some(0)) => self.start_name_editor(target),
-                (
-                    NameTarget::Tab {
-                        workspace_id,
-                        tab_id,
-                    },
-                    Some(1),
-                ) if automatic_title_action => {
-                    self.reset_context_tab_title(workspace_id, tab_id);
-                }
-                (
-                    NameTarget::Tab {
-                        workspace_id,
-                        tab_id,
-                    },
-                    Some(index),
-                ) => {
-                    let reset_index = 1 + usize::from(automatic_title_action);
-                    if let Some(pane) = self.focused_pane_in_tab(workspace_id, tab_id) {
-                        if index == reset_index {
-                            self.recover_pane(pane, false);
-                        } else if index == reset_index + 1 {
-                            self.recover_pane(pane, true);
-                        }
-                    }
-                    self.name_context_menu = None;
-                }
                 _ => {
                     self.name_context_menu = None;
                     self.request_chrome_redraw();
@@ -4261,10 +4183,15 @@ impl Shell {
     }
 
     fn handle_shell_shortcut(&mut self, event_loop: &ActiveEventLoop, event: &WindowEvent) -> bool {
-        let WindowEvent::KeyboardInput { event, .. } = event else {
+        let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+        else {
             return false;
         };
-        if event.state != ElementState::Pressed {
+        if !shell_shortcut_press(event.state, *is_synthetic) {
             return false;
         }
         if event.physical_key == PhysicalKey::Code(KeyCode::F12)
@@ -5007,6 +4934,12 @@ fn layout_node_json(
     }
 }
 
+// Focus changes synthesize presses for held keys on Windows. Creating a pane moves focus, so
+// replaying those presses would run the shortcut again in the newly created pane.
+fn shell_shortcut_press(state: ElementState, is_synthetic: bool) -> bool {
+    state == ElementState::Pressed && !is_synthetic
+}
+
 fn workspace_shortcut_index(key_code: KeyCode) -> Option<usize> {
     match key_code {
         KeyCode::Digit1 => Some(0),
@@ -5247,6 +5180,24 @@ mod tests {
     fn windows_shell_shortcuts_use_control() {
         assert!(shell_modifier_pressed(ModifiersState::CONTROL));
         assert!(!shell_modifier_pressed(ModifiersState::SUPER));
+    }
+
+    #[test]
+    fn shortcut_runs_once_across_pane_focus_changes() {
+        let events = [
+            (ElementState::Pressed, false),
+            (ElementState::Released, true),
+            (ElementState::Pressed, true),
+            (ElementState::Released, false),
+        ];
+        assert_eq!(
+            events
+                .into_iter()
+                .filter(|&(state, synthetic)| shell_shortcut_press(state, synthetic))
+                .count(),
+            1
+        );
+        assert!(shell_shortcut_press(ElementState::Pressed, false));
     }
 
     #[cfg(target_os = "macos")]

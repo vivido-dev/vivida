@@ -217,8 +217,6 @@ pub struct ChromeRenderState<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct ContextMenuRenderState<'a> {
     pub anchor: PhysicalPosition<f64>,
-    pub automatic_title_action: bool,
-    pub terminal_actions: bool,
     pub recovery_actions: bool,
     pub launch_entries: Option<&'a [LaunchEntry]>,
     pub selected: Option<usize>,
@@ -1296,7 +1294,7 @@ impl ChromeRenderer {
         } else if state.recovery_actions {
             3
         } else {
-            1 + u32::from(state.automatic_title_action) + 2 * u32::from(state.terminal_actions)
+            1
         };
         let height = row_height.saturating_mul(rows);
         let max_x = size.width.saturating_sub(width);
@@ -1312,17 +1310,6 @@ impl ChromeRenderer {
             entries.iter().map(|entry| entry.label.as_str()).collect()
         } else if state.recovery_actions {
             vec!["Reset Terminal", "Restart Terminal", "Cancel"]
-        } else if state.automatic_title_action && state.terminal_actions {
-            vec![
-                "Rename",
-                "Use Automatic Title",
-                "Reset Terminal",
-                "Restart Terminal",
-            ]
-        } else if state.automatic_title_action {
-            vec!["Rename", "Use Automatic Title"]
-        } else if state.terminal_actions {
-            vec!["Rename", "Reset Terminal", "Restart Terminal"]
         } else {
             vec!["Rename"]
         };
