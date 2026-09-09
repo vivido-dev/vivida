@@ -13,7 +13,7 @@ mod session;
 mod shortcuts;
 mod split_resize;
 
-use split_resize::{DragEvent, SplitDrag, divider_contains, divider_cursor, drag_event};
+use split_resize::{DragEvent, SplitDrag, divider_at, divider_cursor, drag_event};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -1959,10 +1959,7 @@ impl Shell {
         Some(((workspace_id, tab.id), &mut tab.root))
     }
 
-    fn split_cursor(&self, position: PhysicalPosition<f64>) -> Option<CursorIcon> {
-        if let Some(drag) = &self.split_drag {
-            return Some(divider_cursor(drag.axis()));
-        }
+    fn hovered_split(&self, position: PhysicalPosition<f64>) -> Option<layout::SplitDivider> {
         if self.settings_menu_open
             || self.shortcuts_open
             || self.name_editor.is_some()
@@ -1974,11 +1971,29 @@ impl Shell {
         }
         let (_, root) = self.split_context()?;
         let scale = self.chrome_window.as_ref()?.scale_factor();
-        layout::compute_split_layout(root, self.chrome_layout.content, scale)
-            .dividers
-            .iter()
-            .find(|divider| divider_contains(divider, position, scale))
-            .map(|divider| divider_cursor(divider.axis))
+        let layout = layout::compute_split_layout(root, self.chrome_layout.content, scale);
+        divider_at(&layout.dividers, position, scale).cloned()
+    }
+
+    fn split_cursor(&self, position: PhysicalPosition<f64>) -> Option<CursorIcon> {
+        self.split_drag
+            .as_ref()
+            .map(|drag| divider_cursor(drag.axis()))
+            .or_else(|| {
+                self.hovered_split(position)
+                    .map(|divider| divider_cursor(divider.axis))
+            })
+    }
+
+    fn split_highlight(&self) -> Option<PhysicalRect> {
+        self.split_drag
+            .as_ref()
+            .and_then(SplitDrag::highlight)
+            .or_else(|| {
+                self.cursor_position
+                    .and_then(|position| self.hovered_split(position))
+                    .map(|divider| divider.rect)
+            })
     }
 
     fn move_split_drag(&mut self, position: PhysicalPosition<f64>, restore: bool) {
@@ -2026,9 +2041,14 @@ impl Shell {
                 })
             };
             if let Some(point) = point {
+                let previous_highlight = self.split_highlight();
                 self.cursor_position = Some(point);
+                if previous_highlight != self.split_highlight() {
+                    self.request_chrome_redraw();
+                }
                 let cursor = self.split_cursor(point);
-                if let Some(previous) = self.split_hovered_pane.take()
+                if (chrome_event || cursor.is_none() || self.split_hovered_pane != Some(window_id))
+                    && let Some(previous) = self.split_hovered_pane.take()
                     && let Some(pane) = self.processor.window_mut(previous)
                 {
                     pane.display.window.set_mouse_cursor(CursorIcon::Text);
@@ -2553,13 +2573,14 @@ impl Shell {
                 display_value,
                 error: editor.error.as_deref(),
             });
+        let split_highlight = self.split_highlight();
         let Some(renderer) = &mut self.chrome_renderer else {
             return;
         };
         match renderer.render(
             chrome.inner_size(),
             ChromeRenderState {
-                split_highlight: self.split_drag.as_ref().and_then(SplitDrag::highlight),
+                split_highlight,
                 sidebar_mode: self.sidebar_mode,
                 workspaces: &self.workspaces,
                 active_workspace: self.active_workspace,

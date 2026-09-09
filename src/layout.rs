@@ -5,7 +5,8 @@ pub use vivido::shell::PhysicalRect;
 
 use crate::model::PaneId;
 
-pub const SPLIT_HANDLE_LOGICAL: f64 = 4.0;
+// Keep the painted gap thin; pointer hit testing adds an invisible margin separately.
+pub const SPLIT_HANDLE_LOGICAL: f64 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Axis {
@@ -451,7 +452,7 @@ mod tests {
             PhysicalRect {
                 x: 10,
                 y: 20,
-                width: 204,
+                width: 202,
                 height: 80,
             },
             1.0,
@@ -468,7 +469,7 @@ mod tests {
         assert_eq!(
             rects[&PaneId(2)],
             PhysicalRect {
-                x: 114,
+                x: 112,
                 y: 20,
                 width: 100,
                 height: 80

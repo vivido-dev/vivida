@@ -71,10 +71,10 @@ fn drag_key(
     }
 }
 
-/// Include two logical points of the adjoining pane edges. Native child windows can own
+/// Include nine logical points of the adjoining pane edges. Native child windows can own
 /// the event at a divider boundary, so they must offer the same hit target as the chrome.
 pub fn divider_contains(divider: &SplitDivider, point: PhysicalPosition<f64>, scale: f64) -> bool {
-    let slop = 2.0 * scale;
+    let slop = 9.0 * scale;
     let rect = divider.rect;
     match divider.axis {
         Axis::Horizontal => {
@@ -90,6 +90,38 @@ pub fn divider_contains(divider: &SplitDivider, point: PhysicalPosition<f64>, sc
                 && point.x < f64::from(rect.right())
         }
     }
+}
+
+/// Prefer the actual painted bar over an overlapping grab margin, then the nearest bar.
+/// Both hover and press must use this picker; traversal order is not a UI priority.
+pub fn divider_at(
+    dividers: &[SplitDivider],
+    point: PhysicalPosition<f64>,
+    scale: f64,
+) -> Option<&SplitDivider> {
+    dividers
+        .iter()
+        .filter(|divider| divider_contains(divider, point, scale))
+        .min_by(|a, b| {
+            let inside = |divider: &SplitDivider| divider.rect.contains(point.x, point.y);
+            let distance = |divider: &SplitDivider| {
+                let rect = divider.rect;
+                match divider.axis {
+                    Axis::Horizontal => {
+                        (point.x - (f64::from(rect.x) + f64::from(rect.width) / 2.0)).abs()
+                    }
+                    Axis::Vertical => {
+                        (point.y - (f64::from(rect.y) + f64::from(rect.height) / 2.0)).abs()
+                    }
+                }
+            };
+            inside(b)
+                .cmp(&inside(a))
+                .then_with(|| distance(a).total_cmp(&distance(b)))
+                .then_with(|| a.path.len().cmp(&b.path.len()))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.before.cmp(&b.before))
+        })
 }
 
 pub fn divider_cursor(axis: Axis) -> CursorIcon {
@@ -163,10 +195,7 @@ impl<Owner: PartialEq> SplitDrag<Owner> {
             return None;
         }
         let layout = compute_split_layout(root, area, scale);
-        let divider = layout
-            .dividers
-            .into_iter()
-            .find(|divider| divider_contains(divider, position, scale))?;
+        let divider = divider_at(&layout.dividers, position, scale)?.clone();
         if divider.available == 0 {
             return None;
         }
@@ -444,20 +473,115 @@ mod tests {
             let divider = compute_split_layout(&root, area(), 2.0).dividers.remove(0);
             let point = match axis {
                 Axis::Horizontal => {
-                    PhysicalPosition::new(f64::from(divider.rect.right()) + 1.0, 100.0)
+                    PhysicalPosition::new(f64::from(divider.rect.right()) + 10.0, 100.0)
                 }
                 Axis::Vertical => {
-                    PhysicalPosition::new(200.0, f64::from(divider.rect.bottom()) + 1.0)
+                    PhysicalPosition::new(200.0, f64::from(divider.rect.bottom()) + 10.0)
                 }
             };
             assert!(divider_contains(&divider, point, 2.0));
             assert!(SplitDrag::begin(1, &root, area(), 2.0, point).is_some());
             let interior = match axis {
-                Axis::Horizontal => PhysicalPosition::new(point.x + 5.0, point.y),
-                Axis::Vertical => PhysicalPosition::new(point.x, point.y + 5.0),
+                Axis::Horizontal => PhysicalPosition::new(point.x + 13.0, point.y),
+                Axis::Vertical => PhysicalPosition::new(point.x, point.y + 13.0),
             };
             assert!(!divider_contains(&divider, interior, 2.0));
             assert!(SplitDrag::begin(1, &root, area(), 2.0, interior).is_none());
+        }
+    }
+
+    #[test]
+    fn nested_bars_are_selected_by_geometry_not_tree_traversal_order() {
+        for scale in [1.0, 1.5, 2.0] {
+            let mut root = Node::Leaf(PaneId(1));
+            root.split(PaneId(1), PaneId(2), Axis::Horizontal);
+            root.split(PaneId(2), PaneId(3), Axis::Vertical);
+            let layout = compute_split_layout(&root, area(), scale);
+            let outer = layout
+                .dividers
+                .iter()
+                .find(|divider| divider.path.is_empty())
+                .unwrap();
+            let nested = layout
+                .dividers
+                .iter()
+                .find(|divider| !divider.path.is_empty())
+                .unwrap();
+            // Each painted bar wins even where the other bar's enlarged margin overlaps it.
+            for (expected, point) in [
+                (
+                    outer,
+                    PhysicalPosition::new(
+                        f64::from(outer.rect.right()) - 1.0,
+                        f64::from(nested.rect.y) - 1.0,
+                    ),
+                ),
+                (
+                    nested,
+                    PhysicalPosition::new(
+                        f64::from(nested.rect.x) + 1.0,
+                        f64::from(nested.rect.y) + 1.0,
+                    ),
+                ),
+                (outer, center(outer.rect)),
+                (nested, center(nested.rect)),
+            ] {
+                assert_eq!(divider_at(&layout.dividers, point, scale), Some(expected));
+                let mut reversed = layout.dividers.clone();
+                reversed.reverse();
+                assert_eq!(divider_at(&reversed, point, scale), Some(expected));
+                assert_eq!(
+                    SplitDrag::begin(1, &root, area(), scale, point)
+                        .unwrap()
+                        .axis(),
+                    expected.axis
+                );
+            }
+            // Outside the painted rectangles, choose the closest centerline rather than
+            // letting the nested bar monopolize the overlap near the T junction.
+            let point = PhysicalPosition::new(
+                f64::from(outer.rect.right()) + scale,
+                f64::from(nested.rect.y) - 5.0 * scale,
+            );
+            assert_eq!(divider_at(&layout.dividers, point, scale), Some(outer));
+        }
+    }
+
+    #[test]
+    fn nested_then_outer_dividers_can_be_dragged_in_succession() {
+        let mut root = Node::Leaf(PaneId(1));
+        root.split(PaneId(1), PaneId(2), Axis::Horizontal);
+        root.split(PaneId(2), PaneId(3), Axis::Vertical);
+        for axis in [
+            Axis::Vertical,
+            Axis::Horizontal,
+            Axis::Vertical,
+            Axis::Horizontal,
+        ] {
+            let layout = compute_split_layout(&root, area(), 1.0);
+            let divider = layout
+                .dividers
+                .iter()
+                .find(|divider| divider.axis == axis)
+                .unwrap();
+            let point = center(divider.rect);
+            let mut drag = SplitDrag::begin(1, &root, area(), 1.0, point).unwrap();
+            assert_eq!(drag.axis(), axis);
+            let target = match axis {
+                Axis::Horizontal => PhysicalPosition::new(point.x + 30.0, point.y),
+                Axis::Vertical => PhysicalPosition::new(point.x, point.y + 30.0),
+            };
+            assert!(drag.update(&1, &mut root, area(), 1.0, target));
+            let after = compute_split_layout(&root, area(), 1.0);
+            let moved = after
+                .dividers
+                .iter()
+                .find(|candidate| candidate.path == divider.path)
+                .unwrap();
+            assert_eq!(
+                coordinate(axis, center(moved.rect)),
+                coordinate(axis, point) + 30.0
+            );
         }
     }
 
