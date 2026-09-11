@@ -2561,6 +2561,7 @@ impl Shell {
         match renderer.render(
             chrome.inner_size(),
             ChromeRenderState {
+                cursor: self.cursor_position,
                 split_highlight,
                 sidebar_mode: self.sidebar_mode,
                 workspaces: &self.workspaces,
@@ -2960,8 +2961,8 @@ impl Shell {
             let entries = self.launch_entries.get_or_insert_with(launch_entries);
             if let Some(chrome) = &self.chrome_window {
                 let anchor = PhysicalPosition::new(
-                    self.chrome_hits.new_tab.x,
-                    self.chrome_hits.new_tab.bottom(),
+                    self.chrome_hits.new_tab_menu.x,
+                    self.chrome_hits.new_tab_menu.bottom(),
                 );
                 match platform::show_launch_menu(chrome, entries, anchor) {
                     Ok(Some(index)) => self.activate_launch_entry(event_loop, index),
@@ -2982,12 +2983,12 @@ impl Shell {
             self.name_context_menu = None;
             self.name_editor = None;
             let entries = self.launch_entries.get_or_insert_with(launch_entries);
-            if entries.is_empty() || self.chrome_hits.new_tab.width == 0 {
+            if entries.is_empty() || self.chrome_hits.new_tab_menu.width == 0 {
                 return;
             }
             let anchor = PhysicalPosition::new(
-                f64::from(self.chrome_hits.new_tab.x),
-                f64::from(self.chrome_hits.new_tab.bottom()),
+                f64::from(self.chrome_hits.new_tab_menu.x),
+                f64::from(self.chrome_hits.new_tab_menu.bottom()),
             );
             self.launch_menu = Some(LaunchMenu {
                 anchor,
@@ -3743,6 +3744,10 @@ impl Shell {
             }
             return true;
         }
+        if self.chrome_hits.new_tab_menu.contains(cursor.x, cursor.y) {
+            self.open_launch_menu(event_loop);
+            return true;
+        }
         if self.chrome_hits.new_tab.contains(cursor.x, cursor.y) {
             self.create_tab(event_loop);
             return true;
@@ -3925,6 +3930,11 @@ impl Shell {
             } => {
                 #[cfg(not(target_os = "linux"))]
                 let _ = device_id;
+                if self.chrome_hits.hovered_tab_action(self.cursor_position)
+                    != self.chrome_hits.hovered_tab_action(Some(position))
+                {
+                    self.request_chrome_redraw();
+                }
                 self.cursor_position = Some(position);
                 self.update_hovered_workspace(position);
                 self.update_chrome_cursor(position);
@@ -3997,12 +4007,6 @@ impl Shell {
                 #[cfg(not(target_os = "linux"))]
                 let _ = device_id;
                 if state == ElementState::Pressed && button == MouseButton::Right {
-                    if self.cursor_position.is_some_and(|position| {
-                        self.chrome_hits.new_tab.contains(position.x, position.y)
-                    }) {
-                        self.open_launch_menu(event_loop);
-                        return;
-                    }
                     if let Some(position) = self.cursor_position
                         && let Some(target) = self.name_target_at(position)
                     {

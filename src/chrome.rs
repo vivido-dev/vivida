@@ -122,6 +122,7 @@ pub struct ChromeHitMap {
     pub close_buttons: Vec<(WorkspaceId, PhysicalRect)>,
     pub tab_rows: Vec<(TabId, PhysicalRect)>,
     pub new_tab: PhysicalRect,
+    pub new_tab_menu: PhysicalRect,
     pub split_horizontal: PhysicalRect,
     pub split_vertical: PhysicalRect,
     pub gear: PhysicalRect,
@@ -135,6 +136,15 @@ pub struct ChromeHitMap {
     pub context_menu: PhysicalRect,
     pub context_items: Vec<PhysicalRect>,
     pub rename_editor: PhysicalRect,
+}
+
+impl ChromeHitMap {
+    pub fn hovered_tab_action(&self, cursor: Option<PhysicalPosition<f64>>) -> Option<usize> {
+        let cursor = cursor?;
+        [self.new_tab, self.new_tab_menu]
+            .iter()
+            .position(|bounds| bounds.contains(cursor.x, cursor.y))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -200,6 +210,7 @@ pub struct ChromeRenderer {
 }
 
 pub struct ChromeRenderState<'a> {
+    pub cursor: Option<PhysicalPosition<f64>>,
     pub split_highlight: Option<PhysicalRect>,
     pub sidebar_mode: SidebarMode,
     pub workspaces: &'a [Workspace],
@@ -756,7 +767,9 @@ impl ChromeRenderer {
             if let Some(workspace) = workspace {
                 let tab_width = (150.0 * scale).round() as u32;
                 let new_tab_width = (NEW_TAB_LOGICAL * scale).round() as u32;
-                let tabs_width = tabs_area.width.saturating_sub(new_tab_width);
+                let tabs_width = tabs_area
+                    .width
+                    .saturating_sub(new_tab_width.saturating_mul(2));
                 for (index, tab) in workspace.tabs.iter().enumerate() {
                     let tab_rect = PhysicalRect {
                         x: tabs_area.x + (index as u32 * tab_width) as i32,
@@ -800,13 +813,16 @@ impl ChromeRenderer {
                     ),
                     height: layout.tab_bar.height,
                 };
-                self.text.paint_text(
-                    &mut scene,
-                    "+",
-                    (x as f32 + (10.0 * scale) as f32, (8.0 * scale) as f32),
-                    ACCENT,
-                    true,
-                );
+                let x = hit_map.new_tab.right();
+                hit_map.new_tab_menu = PhysicalRect {
+                    x,
+                    y: 0,
+                    width: new_tab_width.min(
+                        u32::try_from(tabs_area.right().saturating_sub(x)).unwrap_or_default(),
+                    ),
+                    height: layout.tab_bar.height,
+                };
+                paint_tab_actions(&mut scene, &hit_map, state.cursor, scale);
             }
         }
 
@@ -1657,6 +1673,68 @@ fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
         color,
         1.0,
     )
+}
+
+/// Draw both tab actions around the same visual center, independent of font metrics.
+fn paint_tab_actions(
+    scene: &mut Scene,
+    hits: &ChromeHitMap,
+    cursor: Option<PhysicalPosition<f64>>,
+    scale: f64,
+) {
+    let hovered = hits.hovered_tab_action(cursor);
+    for (index, bounds) in [hits.new_tab, hits.new_tab_menu].into_iter().enumerate() {
+        if bounds.width == 0 || bounds.height == 0 {
+            continue;
+        }
+        let clip = Rect::new(
+            f64::from(bounds.x),
+            f64::from(bounds.y),
+            f64::from(bounds.right()),
+            f64::from(bounds.bottom()),
+        );
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+        if hovered == Some(index) {
+            paint_rects(scene, [rect(bounds, ACTIVE)]);
+        }
+        let cx = f64::from(bounds.x) + f64::from(bounds.width) / 2.0;
+        let cy = f64::from(bounds.y) + f64::from(bounds.height) / 2.0;
+        let half = 4.0 * scale;
+        let mut icon = BezPath::new();
+        if index == 0 {
+            icon.move_to((cx - half, cy));
+            icon.line_to((cx + half, cy));
+            icon.move_to((cx, cy - half));
+            icon.line_to((cx, cy + half));
+        } else {
+            icon.move_to((cx - half, cy - half / 2.0));
+            icon.line_to((cx, cy + half / 2.0));
+            icon.line_to((cx + half, cy - half / 2.0));
+        }
+        scene.stroke(
+            &Stroke::new(1.5 * scale),
+            Affine::IDENTITY,
+            Color::from_rgb8(ACCENT.r, ACCENT.g, ACCENT.b),
+            None,
+            &icon,
+        );
+        scene.pop_layer();
+    }
+    if hits.new_tab.width > 0 && hits.new_tab_menu.width > 0 {
+        let bounds = hits.new_tab_menu;
+        let inset = (9.0 * scale).min(f64::from(bounds.height) / 2.0);
+        paint_rects(
+            scene,
+            [RenderRect::new(
+                bounds.x as f32,
+                bounds.y as f32 + inset as f32,
+                scale.max(1.0) as f32,
+                (f64::from(bounds.height) - 2.0 * inset) as f32,
+                BORDER,
+                1.0,
+            )],
+        );
+    }
 }
 
 #[cfg(test)]
