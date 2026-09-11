@@ -4584,6 +4584,17 @@ impl ApplicationHandler<Event> for Shell {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(windows)]
+        if (Some(window_id) == self.chrome_id
+            || Some(window_id) == self.settings_menu_id
+            || Some(window_id) == self.shortcuts_id)
+            && let Some(events) = vivido::shell::touch_click_events(&event)
+        {
+            for event in events {
+                self.window_event(event_loop, window_id, event);
+            }
+            return;
+        }
         if self.handle_split_event(window_id, &event) {
             return;
         }
