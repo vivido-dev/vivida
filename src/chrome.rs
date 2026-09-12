@@ -30,8 +30,14 @@ pub const MIN_PANE_HEIGHT_LOGICAL: f64 = 80.0;
 pub fn chrome_requires_transparency(config: &UiConfig) -> bool {
     // DirectComposition places the chrome above its native child panes. Its unpainted
     // content area must stay clear even when the terminals themselves are fully opaque.
-    cfg!(windows) || config.window_opacity() < 1.0
+    // Linux draws its own rounded corners (see `CORNER_RADIUS_LOGICAL`); the mask leaves the
+    // outer pixels unpainted, which needs the same clear-through-to-desktop content area.
+    cfg!(windows) || cfg!(target_os = "linux") || config.window_opacity() < 1.0
 }
+
+/// Wayland gets no desktop-drawn window frame, so Vivida rounds its own corners the way
+/// standalone Vivido does. macOS and Windows already round undecorated windows themselves.
+const CORNER_RADIUS_LOGICAL: f64 = 12.0;
 
 const CHROME_CONTROL_LOGICAL: f64 = 34.0;
 const NEW_TAB_LOGICAL: f64 = 36.0;
@@ -217,6 +223,7 @@ pub struct ChromeRenderState<'a> {
     pub active_workspace: Option<WorkspaceId>,
     pub hovered_workspace: Option<WorkspaceId>,
     pub fullscreen: bool,
+    pub maximized: bool,
     pub settings_menu_open: bool,
     pub settings_menu_hover: Option<SettingsMenuItem>,
     pub shortcuts: Option<ShortcutsRenderState>,
@@ -708,6 +715,15 @@ impl ChromeRenderer {
         state: ChromeRenderState<'_>,
     ) -> Result<(ChromeLayout, ChromeHitMap, bool), vivido::display::renderer::Error> {
         let scale = self.scale_factor;
+        // A maximized or fullscreen window fills its output edge to edge, where a rounded
+        // corner would only cut a notch out of the desktop behind it.
+        #[cfg(target_os = "linux")]
+        self.renderer
+            .set_corner_radius(if state.maximized || state.fullscreen {
+                0.0
+            } else {
+                (CORNER_RADIUS_LOGICAL * scale) as f32
+            });
         let layout = compute_chrome_layout(size, scale, state.sidebar_mode);
         let mut scene = Scene::new();
         let mut hit_map = ChromeHitMap::default();
@@ -1772,7 +1788,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn opaque_terminal_does_not_make_the_host_cover_its_child_panes() {
         let config = UiConfig::default();

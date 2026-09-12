@@ -25,7 +25,11 @@ pub const RESIZE_EDGE_LOGICAL: f64 = 10.0;
 pub const RESIZE_EDGE_LOGICAL: f64 = 6.0;
 
 pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
-    if cfg!(any(target_os = "windows", target_os = "macos")) {
+    if cfg!(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux"
+    )) {
         (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
     } else {
         0
@@ -37,9 +41,12 @@ pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
 /// On macOS a pane is a child NSWindow floating above the chrome, so it would otherwise cover
 /// the chrome's native resize border along its trailing edge (and its leading edge when the
 /// sidebar is hidden). Windows performs side resizing through client-area hit testing, which
-/// the shell already owns, so it needs no side gutter.
+/// the shell already owns, so it needs no side gutter. On Linux a pane is composited into the
+/// chrome surface and dispatched to only through the same position lookup the resize border
+/// uses (see `Shell::embedded_pane_at`), so without a gutter a pane flush against an edge would
+/// claim every pointer event there before the resize check ever runs.
 pub fn pane_side_resize_gutter(scale_factor: f64) -> u32 {
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
         (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
     } else {
         0
@@ -150,3 +157,17 @@ pub use linux::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
     position_popup, set_popup_visible,
 };
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_panes_leave_a_reachable_resize_border() {
+        // Linux dispatches to a pane only by looking up its rect at the pointer position (see
+        // `Shell::embedded_pane_at`), so a pane flush against an edge would swallow every click
+        // and hover there before the chrome's own resize check ever runs.
+        assert!(pane_bottom_resize_gutter(1.0) > 0);
+        assert!(pane_side_resize_gutter(1.0) > 0);
+    }
+}

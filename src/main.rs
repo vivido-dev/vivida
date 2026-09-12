@@ -2568,6 +2568,7 @@ impl Shell {
                 active_workspace: self.active_workspace,
                 hovered_workspace: self.hovered_workspace,
                 fullscreen: chrome.fullscreen().is_some(),
+                maximized: chrome.is_maximized(),
                 settings_menu_open: self.settings_menu_open && self.settings_menu_window.is_none(),
                 settings_menu_hover: self.settings_menu_hover,
                 shortcuts: (self.shortcuts_open && self.shortcuts_window.is_none()).then_some(
