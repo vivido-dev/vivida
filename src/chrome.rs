@@ -37,6 +37,7 @@ pub fn chrome_requires_transparency(config: &UiConfig) -> bool {
 
 /// Wayland gets no desktop-drawn window frame, so Vivida rounds its own corners the way
 /// standalone Vivido does. macOS and Windows already round undecorated windows themselves.
+#[cfg(target_os = "linux")]
 const CORNER_RADIUS_LOGICAL: f64 = 12.0;
 
 const CHROME_CONTROL_LOGICAL: f64 = 34.0;
@@ -223,6 +224,7 @@ pub struct ChromeRenderState<'a> {
     pub active_workspace: Option<WorkspaceId>,
     pub hovered_workspace: Option<WorkspaceId>,
     pub fullscreen: bool,
+    #[cfg(target_os = "linux")]
     pub maximized: bool,
     pub settings_menu_open: bool,
     pub settings_menu_hover: Option<SettingsMenuItem>,
