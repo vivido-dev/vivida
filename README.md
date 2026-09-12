@@ -2,6 +2,14 @@
 
 **The terminal workspace where you and your AI agents finally work in the same window.**
 
+> [!WARNING]
+> **On Windows, do not install WezTerm alongside Vivida.** Older builds of Vivida's embedded
+> Vivido terminal can load WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped
+> key-release events with that DLL, causing controls in apps such as vvdoom to stop responding
+> after the first movement. Builds containing the Vivido fix use Windows' built-in ConPTY instead.
+> If WezTerm is already installed, remove its directory from `PATH` or uninstall it, then restart
+> Vivida completely.
+
 <!-- Screenshot goes here — replace the placeholder below, e.g.:
 ![Vivida](docs/screenshot.png)
 -->
