@@ -2357,8 +2357,18 @@ impl Shell {
         ) else {
             return;
         };
-        chrome.set_cursor(state.cursor);
-        chrome.set_cursor_visible(state.cursor_visible);
+        // Only the pane the pointer is actually over (or one it captured) owns the chrome's
+        // cursor icon. Applying the focused pane's cursor unconditionally on every redraw would
+        // stomp the resize-border arrow the instant a terminal blink or other redraw fires while
+        // the pointer sits in the chrome's own resize gutter or tab strip.
+        let pointer_owns_cursor = self.embedded_pointer_capture == Some(window_id)
+            || self
+                .cursor_position
+                .is_some_and(|position| rect.contains(position.x, position.y));
+        if pointer_owns_cursor {
+            chrome.set_cursor(state.cursor);
+            chrome.set_cursor_visible(state.cursor_visible);
+        }
         chrome.set_ime_allowed(state.ime_allowed);
         if let Some((position, size)) = state.ime_cursor_area {
             chrome.set_ime_cursor_area(
