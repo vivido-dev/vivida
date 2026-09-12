@@ -1851,12 +1851,20 @@ mod tests {
         assert_eq!(layout.content.bottom(), 590);
         assert_eq!(
             resize_gutter_rects(size, layout),
-            vec![PhysicalRect {
-                x: 220,
-                y: 590,
-                width: 780,
-                height: 10,
-            }]
+            vec![
+                PhysicalRect {
+                    x: 220,
+                    y: 590,
+                    width: 780,
+                    height: 10,
+                },
+                PhysicalRect {
+                    x: 990,
+                    y: 35,
+                    width: 10,
+                    height: 555,
+                }
+            ]
         );
 
         let short_layout =

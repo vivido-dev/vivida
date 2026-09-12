@@ -40,13 +40,17 @@ pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
 ///
 /// On macOS a pane is a child NSWindow floating above the chrome, so it would otherwise cover
 /// the chrome's native resize border along its trailing edge (and its leading edge when the
-/// sidebar is hidden). Windows performs side resizing through client-area hit testing, which
-/// the shell already owns, so it needs no side gutter. On Linux a pane is composited into the
-/// chrome surface and dispatched to only through the same position lookup the resize border
-/// uses (see `Shell::embedded_pane_at`), so without a gutter a pane flush against an edge would
+/// sidebar is hidden). Windows child HWNDs likewise intercept mouse events before the shell's
+/// client-area resize hit testing, so they must leave the side border exposed. On Linux a pane is
+/// composited into the chrome surface and dispatched to only through the same position lookup
+/// the resize border uses (see `Shell::embedded_pane_at`), so a pane flush against an edge would
 /// claim every pointer event there before the resize check ever runs.
 pub fn pane_side_resize_gutter(scale_factor: f64) -> u32 {
-    if cfg!(any(target_os = "macos", target_os = "linux")) {
+    if cfg!(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux"
+    )) {
         (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
     } else {
         0

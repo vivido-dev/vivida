@@ -5312,6 +5312,29 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_side_resize_targets_stay_outside_terminal_panes() {
+        let size = winit::dpi::PhysicalSize::new(1200, 800);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for sidebar in [
+                SidebarMode::Expanded,
+                SidebarMode::Compact,
+                SidebarMode::Hidden,
+            ] {
+                let layout = chrome::compute_chrome_layout(size, scale, sidebar);
+                for (x, direction) in [
+                    (5.0 * scale, ResizeDirection::West),
+                    (f64::from(size.width) - 5.0 * scale, ResizeDirection::East),
+                ] {
+                    let position = PhysicalPosition::new(x, 400.0);
+                    assert!(!layout.content.contains(position.x, position.y));
+                    assert_eq!(resize_direction_at(size, scale, position), Some(direction));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn resize_hit_regions_overlap_the_windows_padded_frame() {
         let size = winit::dpi::PhysicalSize::new(640, 480);
         assert_eq!(
