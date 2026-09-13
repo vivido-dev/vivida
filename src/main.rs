@@ -45,6 +45,7 @@ use vivido::cli::{
 };
 use vivido::config::UiConfig;
 use vivido::config::ui_config::Program;
+#[cfg(test)]
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
@@ -4812,14 +4813,14 @@ impl ApplicationHandler<Event> for Shell {
 }
 
 fn load_shell_config(options: &mut vivido::cli::Options) -> UiConfig {
-    let mut config = vivido::config::load(options);
-
-    // Pane windows are embedded in vivida's own chrome, so only these two window-management
-    // settings are shell-owned. All visual settings, including opacity, come from the user's
-    // Vivido configuration.
-    config.window.decorations = Decorations::None;
-    config.window.resize_increments = false;
-    config
+    // Keep shell-owned window settings in the persistent overrides so config reloads also
+    // apply them to future tabs and splits. Visual settings still come from the user's config.
+    let overrides = vivido::cli::ParsedOptions::from_options(&[
+        "window.decorations = \"None\"".into(),
+        "window.resize_increments = false".into(),
+    ]);
+    options.config_options.extend_from_slice(&overrides);
+    vivido::config::load(options)
 }
 
 fn ordinal_index(ordinal: u64) -> Option<usize> {
@@ -5180,6 +5181,27 @@ mod tests {
             Some(500),
             "--new-window-id names the pane the split creates"
         );
+    }
+
+    #[test]
+    fn shell_panes_stay_frameless_after_config_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vivido.toml");
+        fs::write(&path, "[window]\nopacity = 0.42\n").unwrap();
+        let mut options = vivido::cli::Options::default();
+        options.config_file = Some(path.clone());
+        load_shell_config(&mut options);
+
+        fs::write(
+            &path,
+            "[window]\ndecorations = \"Full\"\nresize_increments = true\nopacity = 0.75\n",
+        )
+        .unwrap();
+        let config = vivido::config::reload(&path, &mut options).unwrap();
+
+        assert_eq!(config.window.decorations, Decorations::None);
+        assert!(!config.window.resize_increments);
+        assert!((config.window_opacity() - 0.75).abs() < f32::EPSILON);
     }
 
     #[test]
