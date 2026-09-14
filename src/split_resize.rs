@@ -21,6 +21,10 @@ pub enum DragEvent {
 pub fn drag_event(event: &winit::event::WindowEvent, chrome: bool, captured: bool) -> DragEvent {
     use winit::event::{ElementState, MouseButton, WindowEvent};
     match event {
+        // Keep keyboard focus with the divider until release (or Escape). The chrome's
+        // ordinary activation handler restores terminal focus, which makes a macOS child
+        // NSWindow key and immediately cancels this drag through the chrome's focus loss.
+        WindowEvent::Focused(true) if chrome && captured => DragEvent::Swallow,
         WindowEvent::Focused(false)
         | WindowEvent::Resized(_)
         | WindowEvent::ScaleFactorChanged { .. }
@@ -642,6 +646,45 @@ mod event_tests {
     use super::*;
     use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
     use winit::keyboard::{KeyCode, PhysicalKey};
+
+    #[test]
+    fn divider_capture_keeps_chrome_focus_until_release() {
+        // A macOS pane is a separate key window. Starting in its enlarged grab margin
+        // focuses the chrome, whose normal activation handler would focus the pane again
+        // and generate a chrome focus loss that cancels the drag.
+        assert_eq!(
+            drag_event(&WindowEvent::Focused(false), false, true),
+            DragEvent::Pass
+        );
+        assert_eq!(
+            drag_event(&WindowEvent::Focused(true), true, true),
+            DragEvent::Swallow
+        );
+        let motion = WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(200.0, 300.0),
+        };
+        assert_eq!(
+            drag_event(&motion, false, true),
+            DragEvent::Move(PhysicalPosition::new(200.0, 300.0))
+        );
+        let release = WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Released,
+            button: MouseButton::Left,
+        };
+        assert_eq!(drag_event(&release, false, true), DragEvent::Release);
+        // Normal activation still returns input to the terminal after capture ends.
+        assert_eq!(
+            drag_event(&WindowEvent::Focused(true), true, false),
+            DragEvent::Pass
+        );
+        // Switching away from the app must still cancel the gesture.
+        assert_eq!(
+            drag_event(&WindowEvent::Focused(false), true, true),
+            DragEvent::End
+        );
+    }
 
     #[test]
     fn captured_release_and_escape_do_not_reach_a_terminal_after_cancellation() {
