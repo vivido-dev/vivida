@@ -1621,8 +1621,12 @@ impl Shell {
             .find(|tab| tab.id == tab_id)
             .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab not found"))?;
         tab.reset_title();
-        workspace.refresh_tab_display_titles();
-        let title = workspace
+        self.refresh_tab_titles();
+        let title = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("the reset workspace exists")
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
@@ -2531,6 +2535,7 @@ impl Shell {
             .map(|menu| ContextMenuRenderState {
                 anchor: menu.anchor,
                 recovery_actions: false,
+                reset_title: false,
                 launch_entries: self.launch_entries.as_deref(),
                 selected: menu.selected,
             })
@@ -2539,6 +2544,7 @@ impl Shell {
                     .map(|menu| ContextMenuRenderState {
                         anchor: menu.anchor,
                         recovery_actions: true,
+                        reset_title: false,
                         launch_entries: None,
                         selected: None,
                     })
@@ -2546,6 +2552,7 @@ impl Shell {
                         self.name_context_menu.map(|menu| ContextMenuRenderState {
                             anchor: menu.anchor,
                             recovery_actions: false,
+                            reset_title: matches!(menu.target, NameTarget::Tab { .. }),
                             launch_entries: None,
                             selected: None,
                         })
@@ -2930,8 +2937,8 @@ impl Shell {
         self.close_recovery_menu();
         self.set_settings_menu_open(false);
         self.name_editor = None;
-        // Native terminal children sit above the chrome content surface. Keep a tab's primary
-        // Rename row wholly inside the tab strip so its click always reaches the chrome, including
+        // Native terminal children sit above the chrome content surface. Keep both tab actions
+        // wholly inside the tab strip so their clicks always reach the chrome, including
         // when the target tab is inactive.
         let anchor = name_context_anchor(target, anchor);
         self.name_context_menu = Some(NameContextMenu { target, anchor });
@@ -3692,6 +3699,25 @@ impl Shell {
                 .position(|rect| rect.contains(cursor.x, cursor.y));
             match (menu.target, item) {
                 (target, Some(0)) => self.start_name_editor(target),
+                (
+                    NameTarget::Tab {
+                        workspace_id,
+                        tab_id,
+                    },
+                    Some(1),
+                ) => {
+                    self.name_context_menu = None;
+                    if let Err(error) = self.host_reset_tab_title(TabTarget {
+                        workspace_id: Some(workspace_id.0),
+                        workspace_name: None,
+                        tab_id: Some(tab_id.0),
+                        tab_name: None,
+                        from_window_id: None,
+                    }) {
+                        eprintln!("failed to reset tab title: {}", error.message);
+                    }
+                    self.request_chrome_redraw();
+                }
                 _ => {
                     self.name_context_menu = None;
                     self.request_chrome_redraw();
@@ -4343,8 +4369,13 @@ impl Shell {
                     if tab.is_title_custom() {
                         return None;
                     }
-                    let window = tab.window_id(tab.root.first_pane())?;
-                    let title = self.processor.window(window)?.title().to_owned();
+                    let window = tab.focused_window_id()?;
+                    let cwd = self
+                        .processor
+                        .window(window)?
+                        .display_directory()
+                        .unwrap_or_else(|| self.launch_cwd.clone());
+                    let title = directory_tab_title(&cwd);
                     Some((workspace.id, tab.id, title))
                 })
             })
@@ -4374,6 +4405,54 @@ enum WindowFrameAction {
     Minimize,
     ToggleMaximize,
     Close,
+}
+
+fn directory_tab_title(directory: &std::path::Path) -> String {
+    let path = directory.to_string_lossy();
+    // Handle both native Windows and WSL paths, including trailing separators.
+    let name = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    model::automatic_name(name, "root")
+}
+
+#[test]
+fn automatic_tab_labels_use_only_the_current_folder() {
+    for (path, expected) in [
+        (r"C:\Users\dev\project", "project"),
+        ("/home/dev/project/", "project"),
+        (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
+        ("/", "root"),
+        (r"C:\", "C:"),
+    ] {
+        assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
+    }
+}
+
+#[test]
+fn automatic_tab_label_follows_directory_changes_after_reset() {
+    let mut workspace = Workspace::new(
+        WorkspaceId(1),
+        "test".into(),
+        "/home/dev".into(),
+        WindowId::from(10),
+    );
+    for path in ["/home/dev/project", "/home/dev/another"] {
+        workspace.tabs[0].set_context_title(&directory_tab_title(Path::new(path)));
+        workspace.refresh_tab_display_titles();
+        assert_eq!(workspace.tabs[0].title, path.rsplit('/').next().unwrap());
+    }
+    workspace.tabs[0].set_custom_title("Pinned".into());
+    let changed = directory_tab_title(Path::new("/home/dev/third"));
+    workspace.tabs[0].set_context_title(&changed);
+    workspace.refresh_tab_display_titles();
+    assert_eq!(workspace.tabs[0].title, "Pinned");
+    workspace.tabs[0].reset_title();
+    workspace.tabs[0].set_context_title(&changed);
+    workspace.refresh_tab_display_titles();
+    assert_eq!(workspace.tabs[0].title, "third");
 }
 
 fn name_context_anchor(
@@ -4775,8 +4854,20 @@ impl ApplicationHandler<Event> for Shell {
             self.activate_launch_action(event_loop, action);
             return;
         }
+        let directory_may_have_changed = matches!(
+            event.payload(),
+            vivido::EventType::Terminal(
+                vivido::terminal::event::Event::WorkingDirectory(_)
+                    | vivido::terminal::event::Event::Wakeup
+            )
+        );
         self.processor
             .handle_winit_event(event_loop, WinitEvent::UserEvent(event));
+        // Windows can keep dispatching PTY messages without reaching AboutToWait. Update
+        // labels on the report/wakeup itself so a cd does not wait for another UI action.
+        if directory_may_have_changed {
+            self.refresh_tab_titles();
+        }
         if self.processor.has_pending_embedded_redraw() {
             self.request_chrome_redraw();
         }

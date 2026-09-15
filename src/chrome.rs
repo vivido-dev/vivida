@@ -238,6 +238,7 @@ pub struct ChromeRenderState<'a> {
 pub struct ContextMenuRenderState<'a> {
     pub anchor: PhysicalPosition<f64>,
     pub recovery_actions: bool,
+    pub reset_title: bool,
     pub launch_entries: Option<&'a [LaunchEntry]>,
     pub selected: Option<usize>,
 }
@@ -1344,11 +1345,13 @@ impl ChromeRenderer {
             entries.iter().map(|entry| entry.label.as_str()).collect()
         } else if state.recovery_actions {
             vec!["Reset Terminal", "Restart Terminal", "Cancel"]
+        } else if state.reset_title {
+            vec!["Rename", "Reset"]
         } else {
             vec!["Rename"]
         };
         for (index, label) in labels.iter().enumerate() {
-            let row = PhysicalRect {
+            let mut row = PhysicalRect {
                 x: hit_map.context_menu.x,
                 y: hit_map.context_menu.y
                     + i32::try_from(index as u32 * row_height).unwrap_or_default(),
@@ -1360,6 +1363,17 @@ impl ChromeRenderer {
                         .saturating_sub(index as u32 * row_height),
                 ),
             };
+            if state.reset_title {
+                let half = hit_map.context_menu.width / 2;
+                row.x = hit_map.context_menu.x + if index == 0 { 0 } else { half as i32 };
+                row.y = hit_map.context_menu.y;
+                row.width = if index == 0 {
+                    half
+                } else {
+                    hit_map.context_menu.width - half
+                };
+                row.height = hit_map.context_menu.height;
+            }
             hit_map.context_items.push(row);
             if state.selected == Some(index) {
                 paint_rects(scene, [rect(row, ACTIVE)]);
