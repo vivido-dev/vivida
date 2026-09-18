@@ -174,6 +174,25 @@ vivida msg signal INT --window-id 42
 `--report` on `typing`, `key`, and `paste` prints the resolved window, encoded byte count, input
 sequence, and PTY-write completion, and states that application consumption was **not** observed.
 
+### Hand a file to the remote shell
+
+In a window whose shell reached another host through `vvssh`, `drop-file` copies a local file to
+that host exactly as dragging it onto the window would, and waits for the result:
+
+```sh
+vivida msg drop-file ./firmware.bin --window-id 42
+# {"result":"committed","basename":"firmware.bin","bytes":1048576,"sha256":"…",
+#  "remote_path":"/home/u/firmware.bin"}
+```
+
+- Nothing is typed unless `--type-path` asks. Typing lands in whatever has focus, and in a remote
+  `vvmux` that may be another agent's prompt. To give another *agent* a file, drop it without
+  `--type-path` and send that agent `remote_path` through the agent mesh.
+- With no receiver bound it fails `no_file_drop_binding`. It never falls back to typing a local
+  path the way an unbound drag does.
+- `--at COLUMN,ROW` drops onto the surface under that cell, for a remote desktop's own binding.
+- The file lands in the remote login shell's working directory, and `remote_path` says where.
+
 `--route application` (the default) bypasses Vivido's bindings, search, hints, selection, and
 clipboard actions while honouring the terminal's cursor, keypad, bracketed-paste, Kitty keyboard,
 and mouse modes. `--route ui` runs through the normal input processor for Vivido's own bindings and
