@@ -475,6 +475,18 @@ impl NameEditor {
     }
 }
 
+/// Proof that the panes of the active tab have just been placed under the chrome.
+///
+/// Revealing a pane re-attaches it to the chrome at whatever position the pane already holds, and
+/// a hidden pane is detached from the chrome, so it keeps the absolute position it had when it
+/// was last on screen and nothing moves it while it stays hidden. Once the chrome has moved
+/// without it — the system relocating windows for a display change across a sleep/wake is the
+/// case that bites — revealing that pane before placing it attaches it at the stale offset, and
+/// it floats outside the chrome until some later reveal happens to find it in the right place.
+/// Requiring this token keeps placement-before-reveal a property the compiler checks.
+#[derive(Clone, Copy)]
+struct PanePlacement;
+
 struct Shell {
     config: UiConfig,
     _terminfo: vivido::tty::TerminfoGuard,
@@ -1912,11 +1924,11 @@ impl Shell {
     }
 
     fn sync_visibility_and_geometry(&mut self) {
-        self.sync_pane_visibility();
-        self.sync_pane_geometry();
+        let placed = self.sync_pane_geometry();
+        self.sync_pane_visibility(placed);
     }
 
-    fn sync_pane_visibility(&mut self) {
+    fn sync_pane_visibility(&mut self, _placed: PanePlacement) {
         let active = self.active_workspace;
         let closing = &self.closing_workspaces;
         let visibility = self
@@ -2153,9 +2165,9 @@ impl Shell {
         }
     }
 
-    fn sync_pane_geometry(&mut self) {
+    fn sync_pane_geometry(&mut self) -> PanePlacement {
         let Some(chrome) = &self.chrome_window else {
-            return;
+            return PanePlacement;
         };
         let size = chrome.inner_size();
         let scale = chrome.scale_factor();
@@ -2168,10 +2180,10 @@ impl Shell {
             self.split_drag = None;
         }
         let Some(workspace) = self.active_workspace() else {
-            return;
+            return PanePlacement;
         };
         let Some(tab) = workspace.active_tab() else {
-            return;
+            return PanePlacement;
         };
         let rects = compute_rects(&tab.root, self.chrome_layout.content, scale);
         let placements = tab
@@ -2186,6 +2198,7 @@ impl Shell {
             host.move_pane(&mut self.processor, window_id, rect);
             self.pane_rects.insert(window_id, rect);
         }
+        PanePlacement
     }
 
     fn resize_active_pane_layout(
@@ -2965,7 +2978,7 @@ impl Shell {
 
     fn close_recovery_menu(&mut self) {
         if self.recovery_menu.take().is_some() {
-            self.sync_pane_visibility();
+            self.sync_visibility_and_geometry();
             self.focus_active_pane();
             self.request_chrome_redraw();
         }
@@ -3019,14 +3032,14 @@ impl Shell {
             if let Some(chrome) = &self.chrome_window {
                 focus_chrome_input(chrome);
             }
-            self.sync_pane_visibility();
+            self.sync_visibility_and_geometry();
             self.request_chrome_redraw();
         }
     }
 
     fn close_launch_menu(&mut self) {
         if self.launch_menu.take().is_some() {
-            self.sync_pane_visibility();
+            self.sync_visibility_and_geometry();
             self.focus_active_pane();
             self.request_chrome_redraw();
         }
@@ -3949,11 +3962,11 @@ impl Shell {
                 }
                 self.name_context_menu = None;
                 if self.launch_menu.take().is_some() {
-                    self.sync_pane_visibility();
+                    self.sync_visibility_and_geometry();
                     self.request_chrome_redraw();
                 }
                 if self.recovery_menu.take().is_some() {
-                    self.sync_pane_visibility();
+                    self.sync_visibility_and_geometry();
                 }
                 if self.rename_editor_window.is_none() && self.name_editor.take().is_some() {
                     if let Some(chrome) = &self.chrome_window {
