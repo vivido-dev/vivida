@@ -164,6 +164,11 @@ Vivida starts the mesh watcher itself when `vvagent` is on PATH. The pane only e
 window (`w<id>`); the watcher re-derives the full `s<space>t<tab>w<window>` from `vivida msg layout`,
 because a pane's inherited environment cannot be edited after a drag or a tab reorder.
 
+The complete mesh surface — binding and authenticating as an endpoint, cross-host peers and trust,
+handing files with `--attach`, groups, and policy — is the **vvagent** skill
+([vivido-dev/vvagent · skills/vvagent](https://github.com/vivido-dev/vvagent/tree/master/skills/vvagent));
+load it for anything past a simple send and wait. The essentials for a Vivida pane are below.
+
 ```sh
 vvagent whoami                                    # where am I, and am I bound
 vvagent bind --alias builder                      # claim a mailbox at this position
@@ -216,6 +221,9 @@ transport.
   result shapes, and limits.
 - [references/agent-mesh.md](references/agent-mesh.md) — identity, addressing, policy, groups, what
   wakes an idle agent, and the Linux binding defect.
+- The **vvagent** skill — the complete agent-mesh surface: selectors across runtimes and hosts,
+  `--attach` file handoff, peer trust, and the SSH bridge.
+  [github.com/vivido-dev/vvagent/tree/master/skills/vvagent](https://github.com/vivido-dev/vvagent/tree/master/skills/vvagent).
 - [scripts/panes.py](scripts/panes.py) — one line per pane from a `layout`, with derived mesh
   addresses.
 - [scripts/geometry.py](scripts/geometry.py) — cell↔pixel conversion and crop boxes from `capture`
