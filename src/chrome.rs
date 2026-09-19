@@ -65,16 +65,23 @@ const RENAME_EDITOR_HEIGHT_LOGICAL: f64 = 112.0;
 pub enum SettingsMenuItem {
     Settings,
     Shortcuts,
+    CheckForUpdates,
     Documentation,
 }
 
 impl SettingsMenuItem {
-    pub const ALL: [Self; 3] = [Self::Settings, Self::Shortcuts, Self::Documentation];
+    pub const ALL: [Self; 4] = [
+        Self::Settings,
+        Self::Shortcuts,
+        Self::CheckForUpdates,
+        Self::Documentation,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
             Self::Shortcuts => "Shortcuts",
+            Self::CheckForUpdates => "Check for Updates…",
             Self::Documentation => "Documentation",
         }
     }
@@ -228,6 +235,7 @@ pub struct ChromeRenderState<'a> {
     pub maximized: bool,
     pub settings_menu_open: bool,
     pub settings_menu_hover: Option<SettingsMenuItem>,
+    pub update_available: bool,
     pub shortcuts: Option<ShortcutsRenderState>,
     pub context_menu: Option<ContextMenuRenderState<'a>>,
     pub rename_editor: Option<RenameEditorRenderState<'a>>,
@@ -776,8 +784,13 @@ impl ChromeRenderer {
         }
 
         if layout.tab_bar.height > 0 {
-            let (tabs_area, label_x) =
-                self.paint_top_controls(&mut scene, layout, state.fullscreen, &mut hit_map);
+            let (tabs_area, label_x) = self.paint_top_controls(
+                &mut scene,
+                layout,
+                state.fullscreen,
+                state.update_available,
+                &mut hit_map,
+            );
             sidebar_label_x = label_x;
             let workspace = state
                 .workspaces
@@ -920,6 +933,7 @@ impl ChromeRenderer {
         scene: &mut Scene,
         layout: ChromeLayout,
         fullscreen: bool,
+        update_available: bool,
         hit_map: &mut ChromeHitMap,
     ) -> (PhysicalRect, i32) {
         let scale = self.scale_factor;
@@ -1021,6 +1035,20 @@ impl ChromeRenderer {
             );
         }
         self.paint_gear(scene, hit_map.gear);
+        if update_available {
+            let radius = 3.0 * scale;
+            let center = (
+                f64::from(hit_map.gear.right()) - 5.0 * scale,
+                f64::from(hit_map.gear.y) + 6.0 * scale,
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::from_rgb8(ACCENT.r, ACCENT.g, ACCENT.b),
+                None,
+                &Circle::new(center, radius),
+            );
+        }
 
         if system_width > 0 {
             self.paint_window_controls(scene, hit_map);
@@ -2045,7 +2073,7 @@ mod tests {
                 x: 404,
                 y: 35,
                 width: 190,
-                height: 102
+                height: 136
             }
         );
     }
@@ -2110,7 +2138,7 @@ mod tests {
 
     #[test]
     fn settings_menu_rows_map_to_items_and_reject_the_margins() {
-        let size = PhysicalSize::new(190, 102);
+        let size = PhysicalSize::new(190, 136);
         assert_eq!(
             settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 5.0)),
             Some(SettingsMenuItem::Settings)
@@ -2120,11 +2148,15 @@ mod tests {
             Some(SettingsMenuItem::Shortcuts)
         );
         assert_eq!(
-            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 101.0)),
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 75.0)),
+            Some(SettingsMenuItem::CheckForUpdates)
+        );
+        assert_eq!(
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 110.0)),
             Some(SettingsMenuItem::Documentation)
         );
         assert_eq!(
-            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 102.0)),
+            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 136.0)),
             None
         );
         assert_eq!(

@@ -50,7 +50,8 @@ use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
 use vivido::shell::{LaunchAction, LaunchEntry, ShellAction, launch_entries};
-use vivido::{Event, Processor};
+use vivido::update::UpdateEvent;
+use vivido::{Event, EventSink, EventType, Processor};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
@@ -492,6 +493,7 @@ struct Shell {
     _terminfo: vivido::tty::TerminfoGuard,
     terminal_options: TerminalOptions,
     processor: Processor,
+    event_sink: EventSink,
     _automation_registry: RegistryGuard,
     chrome_window: Option<Arc<Window>>,
     chrome_renderer: Option<ChromeRenderer>,
@@ -523,6 +525,7 @@ struct Shell {
     sidebar_mode: SidebarMode,
     hovered_workspace: Option<WorkspaceId>,
     settings_menu_open: bool,
+    update_available: bool,
     name_context_menu: Option<NameContextMenu>,
     recovery_menu: Option<RecoveryMenu>,
     launch_menu: Option<LaunchMenu>,
@@ -573,11 +576,8 @@ impl Shell {
         options.socket = Some(automation_paths.socket.clone());
 
         let terminfo = vivido::tty::setup_env();
-        let _listener = IoListener::spawn(
-            &config,
-            &options,
-            vivido::EventSink::Winit(event_loop.create_proxy()),
-        )?;
+        let event_sink = EventSink::Winit(event_loop.create_proxy());
+        let _listener = IoListener::spawn(&config, &options, event_sink.clone())?;
         let automation_registry = automation_paths.register(&automation_name, (1, 1), false)?;
         let mut processor = Processor::new(config.clone(), options, event_loop);
         processor.claim_ipc_method_capabilities(&[
@@ -612,6 +612,7 @@ impl Shell {
             _terminfo: terminfo,
             terminal_options,
             processor,
+            event_sink,
             _automation_registry: automation_registry,
             chrome_window: None,
             chrome_renderer: None,
@@ -643,6 +644,7 @@ impl Shell {
             sidebar_mode: SidebarMode::default(),
             hovered_workspace: None,
             settings_menu_open: false,
+            update_available: false,
             name_context_menu: None,
             recovery_menu: None,
             launch_menu: None,
@@ -709,6 +711,7 @@ impl Shell {
         self.initialize_settings_menu(event_loop)?;
         self.initialize_shortcuts_window(event_loop)?;
         self.initialize_rename_editor(event_loop)?;
+        self.processor.start_quiet_update_check();
 
         if let Some(chrome) = &self.chrome_window {
             chrome.set_visible(true);
@@ -2603,6 +2606,7 @@ impl Shell {
                 maximized: chrome.is_maximized(),
                 settings_menu_open: self.settings_menu_open && self.settings_menu_window.is_none(),
                 settings_menu_hover: self.settings_menu_hover,
+                update_available: self.update_available,
                 shortcuts: (self.shortcuts_open && self.shortcuts_window.is_none()).then_some(
                     ShortcutsRenderState {
                         scroll: self.shortcuts_scroll,
@@ -3356,6 +3360,7 @@ impl Shell {
         match item {
             SettingsMenuItem::Settings => self.open_config_in_editor(event_loop),
             SettingsMenuItem::Shortcuts => self.set_shortcuts_open(true),
+            SettingsMenuItem::CheckForUpdates => request_update_check(&self.event_sink),
             SettingsMenuItem::Documentation => platform::open_url(DOCUMENTATION_URL),
         }
     }
@@ -4672,6 +4677,21 @@ fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
     }
 }
 
+fn request_update_check(event_sink: &EventSink) {
+    let _ = event_sink.send_event(Event::new(
+        EventType::Update(UpdateEvent::CheckRequested),
+        None,
+    ));
+}
+
+fn update_availability(event: &EventType) -> Option<bool> {
+    match event {
+        EventType::Update(UpdateEvent::Available { .. }) => Some(true),
+        EventType::Update(UpdateEvent::UpToDate { .. } | UpdateEvent::Failed { .. }) => Some(false),
+        _ => None,
+    }
+}
+
 impl ApplicationHandler<Event> for Shell {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
@@ -4867,6 +4887,10 @@ impl ApplicationHandler<Event> for Shell {
             self.activate_launch_action(event_loop, action);
             return;
         }
+        let update_available = update_availability(event.payload());
+        if matches!(event.payload(), EventType::Shutdown) {
+            event_loop.exit();
+        }
         let directory_may_have_changed = matches!(
             event.payload(),
             vivido::EventType::Terminal(
@@ -4876,6 +4900,12 @@ impl ApplicationHandler<Event> for Shell {
         );
         self.processor
             .handle_winit_event(event_loop, WinitEvent::UserEvent(event));
+        if let Some(update_available) = update_available
+            && self.update_available != update_available
+        {
+            self.update_available = update_available;
+            self.request_chrome_redraw();
+        }
         // Windows can keep dispatching PTY messages without reaching AboutToWait. Update
         // labels on the report/wakeup itself so a cd does not wait for another UI action.
         if directory_may_have_changed {
@@ -5496,7 +5526,7 @@ mod tests {
                 x: 144,
                 y: 35,
                 width: 190,
-                height: 102,
+                height: 136,
             },
             settings_items: vec![
                 PhysicalRect {
@@ -5517,6 +5547,12 @@ mod tests {
                     width: 190,
                     height: 34,
                 },
+                PhysicalRect {
+                    x: 144,
+                    y: 137,
+                    width: 190,
+                    height: 34,
+                },
             ],
             ..ChromeHitMap::default()
         };
@@ -5531,6 +5567,10 @@ mod tests {
         assert_eq!(
             settings_menu_click(&hit_map, PhysicalPosition::new(150.0, 110.0)),
             SettingsMenuClick::Item(2)
+        );
+        assert_eq!(
+            settings_menu_click(&hit_map, PhysicalPosition::new(150.0, 145.0)),
+            SettingsMenuClick::Item(3)
         );
         assert_eq!(
             settings_menu_click(&hit_map, PhysicalPosition::new(310.0, 10.0)),
@@ -5552,9 +5592,65 @@ mod tests {
         );
         assert_eq!(
             SettingsMenuItem::from_index(2),
+            Some(SettingsMenuItem::CheckForUpdates)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(3),
             Some(SettingsMenuItem::Documentation)
         );
-        assert_eq!(SettingsMenuItem::from_index(3), None);
+        assert_eq!(SettingsMenuItem::from_index(4), None);
+    }
+
+    #[test]
+    fn check_for_updates_settings_item_emits_a_manual_request() {
+        let (event_sink, receiver) = EventSink::headless();
+
+        request_update_check(&event_sink);
+
+        assert!(matches!(
+            receiver.recv().unwrap().payload(),
+            EventType::Update(UpdateEvent::CheckRequested)
+        ));
+    }
+
+    #[test]
+    fn update_results_drive_the_available_badge() {
+        let manifest: vivido::update::UpdateManifest = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "product": "vivido",
+            "version": "1.0.0",
+            "publishedUtc": "2026-09-18T00:00:00Z",
+            "notesUrl": null,
+            "asset": {
+                "name": "vivido.msi",
+                "url": "https://example.com/vivido.msi",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "bytes": 1,
+                "kind": "msi",
+                "publisher": "Vivido",
+                "teamId": null
+            }
+        }))
+        .unwrap();
+        let available = EventType::Update(UpdateEvent::Available {
+            version: manifest.version.clone(),
+            bytes: manifest.asset.bytes,
+            notes_url: None,
+            manifest: Box::new(manifest),
+            manual: false,
+        });
+        let current = EventType::Update(UpdateEvent::UpToDate {
+            current: vivido::update::current_version(),
+        });
+        let failed = EventType::Update(UpdateEvent::Failed {
+            message: "offline".into(),
+            manual: false,
+        });
+
+        assert_eq!(update_availability(&available), Some(true));
+        assert_eq!(update_availability(&current), Some(false));
+        assert_eq!(update_availability(&failed), Some(false));
+        assert_eq!(update_availability(&EventType::HostWakeup), None);
     }
 
     #[test]
