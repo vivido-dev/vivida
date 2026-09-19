@@ -5226,6 +5226,15 @@ fn list_instances(options: ListOptions) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Linked with the windows subsystem, so a `msg` or `list` invocation from an existing
+    // console would otherwise print to nowhere. Attach first, mirroring vivido.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+
     let options = VividaOptions::parse();
     match options.command {
         Some(VividaCommand::Msg(options)) => return send_vivida_message(*options),
