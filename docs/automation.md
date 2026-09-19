@@ -130,3 +130,35 @@ deterministic suffixes such as `project (2)`. Renaming a tab pins its title;
 
 The endpoint accepts connections only from the same operating-system user. Capability material
 used by Vivid presentation is never included in layout, inspection, or diagnostic replies.
+
+## Headless operation
+
+`vivida --headless --session <name>` runs the same split-tree host offscreen with no window
+system: it owns a virtual 1920x1080 display, blocks the foreground process until quit, and
+prints its automation endpoint first so callers can target the exact session:
+
+```sh
+vivida --headless --session ci-smoke
+# {"session":"ci-smoke","socket":"\\\\.\\pipe\\vivido-session-..."}
+```
+
+Every `vivida msg -t ci-smoke` command below works against that endpoint, including the full
+terminal surface: `list-windows`, `layout`, `get-text`, `get-grid`, `find-text`, `typing`
+with `--report`, `key`, `exec`, `split-pane`, and `quit`. Target panes by explicit
+`--window-id` taken from `layout`; `typing` takes literal text as a positional argument and
+`key` sends the submit stroke separately:
+
+```sh
+vivida msg -t ci-smoke get-text --window-id 1
+vivida msg -t ci-smoke typing --window-id 1 --report "echo hello-headless"
+vivida msg -t ci-smoke key --window-id 1 Enter
+vivida msg -t ci-smoke get-text --window-id 1
+vivida msg -t ci-smoke find-text --window-id 1 --pattern hello-headless
+vivida msg -t ci-smoke exec --window-id 1 --command "echo exec-ok"
+vivida msg -t ci-smoke split-pane --window-id 1 --axis horizontal
+vivida msg -t ci-smoke quit
+```
+
+`quit` is silent by design and the server exits 0. The hermetic CI job
+(`vivida-headless-e2e`) runs `tests/e2e/vivida_headless_smoke.py` against an ephemeral
+session on software Vulkan and asserts each of these replies.

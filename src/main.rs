@@ -51,7 +51,7 @@ use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
 use vivido::shell::{LaunchAction, LaunchEntry, ShellAction, launch_entries};
 use vivido::update::UpdateEvent;
-use vivido::{Event, EventSink, EventType, Processor};
+use vivido::{Event, EventSink, EventType, HeadlessLoop, LoopHandle, Processor};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
@@ -76,6 +76,17 @@ const INITIAL_HEIGHT: f64 = 700.0;
 struct VividaOptions {
     #[command(subcommand)]
     command: Option<VividaCommand>,
+
+    /// Run without any OS window: an offscreen split-tree host for hermetic automation.
+    ///
+    /// Blocks until quit; panes are real headless Vivido terminals on a 1920x1080@1.0x
+    /// virtual display, and every layout/host IPC method works as headed.
+    #[arg(long)]
+    headless: bool,
+
+    /// Registered session name for `--headless`, so clients can target it exactly.
+    #[arg(long, value_name = "NAME", requires = "headless")]
+    session: Option<String>,
 
     /// Terminal process and arguments used for every pane.
     #[command(flatten)]
@@ -488,6 +499,74 @@ impl NameEditor {
 #[derive(Clone, Copy)]
 struct PanePlacement;
 
+/// Virtual display for `--headless`: standard geometry at unit scale, per the automation plan.
+const HEADLESS_WIDTH: u32 = 1920;
+const HEADLESS_HEIGHT: u32 = 1080;
+const HEADLESS_SCALE: f64 = 1.0;
+
+/// Whichever loop drives the shell: a visible winit event loop or the offscreen headless loop.
+///
+/// Threaded through topology changes exactly like `&ActiveEventLoop` was, so headed callers
+/// pass `ShellLoop::Winit(event_loop)` and headless code passes `ShellLoop::Headless(headless)`.
+#[derive(Clone, Copy)]
+enum ShellLoop<'a> {
+    Winit(&'a ActiveEventLoop),
+    Headless(&'a HeadlessLoop),
+}
+
+impl ShellLoop<'_> {
+    fn exit(self) {
+        match self {
+            Self::Winit(event_loop) => event_loop.exit(),
+            Self::Headless(headless) => LoopHandle::Headless(headless).exit(),
+        }
+    }
+}
+
+/// Pane host for `--headless`: Vivido windows with no native parent, sized explicitly.
+///
+/// Position is meaningless offscreen; size drives each pane's grid and PTY through the same
+/// automation-geometry handshake headed resizes use.
+struct HeadlessPaneHost;
+
+impl HeadlessPaneHost {
+    fn create_pane(
+        &self,
+        processor: &mut Processor,
+        headless: &HeadlessLoop,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let mut options = options;
+        options.parent_window = None;
+        options.no_activate = true;
+        processor.create_hosted_pane(LoopHandle::Headless(headless), options)
+    }
+
+    fn move_pane(
+        &self,
+        processor: &mut Processor,
+        headless: &HeadlessLoop,
+        pane_id: WindowId,
+        rect: PhysicalRect,
+    ) {
+        let _ = processor.resize_headless_window(
+            LoopHandle::Headless(headless),
+            pane_id,
+            winit::dpi::PhysicalSize::new(rect.width.max(1), rect.height.max(1)),
+        );
+    }
+
+    fn reveal(&self, processor: &mut Processor, pane_id: WindowId, visible: bool) {
+        if let Some(pane) = processor.window_mut(pane_id) {
+            pane.set_automation_visible(visible);
+        }
+    }
+
+    fn is_attached(&self, processor: &Processor, pane_id: WindowId) -> bool {
+        processor.window(pane_id).is_some()
+    }
+}
+
 struct Shell {
     config: UiConfig,
     _terminfo: vivido::tty::TerminfoGuard,
@@ -607,7 +686,100 @@ impl Shell {
                 }
             })
             .unwrap_or(current_dir);
-        Ok(Self {
+        Ok(Self::base_shell(
+            config,
+            terminfo,
+            terminal_options,
+            processor,
+            event_sink,
+            automation_registry,
+            launch_cwd,
+        ))
+    }
+
+    /// Build an offscreen shell: headless processor, registered endpoint, no windows.
+    ///
+    /// The caller owns the headless loop and event channel (mirroring how `new` leaves the
+    /// winit event loop outside `Shell`): create the initial workspace with
+    /// `initialize_headless`, then drive everything with the pump loop in `main`.
+    fn new_headless(
+        terminal_options: TerminalOptions,
+        session: String,
+        event_sink: EventSink,
+    ) -> Result<Self, Box<dyn Error>> {
+        // The shell owns creation and lifetime for every terminal pane.
+        let mut options = vivido::cli::Options::default();
+        options.daemon = true;
+        let mut config = load_shell_config(&mut options);
+        config.ipc_socket = Some(true);
+
+        let automation_name = session;
+        let automation_paths = SessionPaths::for_session(&automation_name)?;
+        automation_paths.prepare_endpoint(&automation_name)?;
+        options.automation_name = Some(automation_name.clone());
+        // A pane here is a hosted Vivido window, but its space and tab belong to Vivida — so
+        // Vivida, not Vivido, is the runtime the agent mesh addresses it through. Two strings;
+        // Vivida links no mesh crate and opens no store.
+        // SAFETY: no thread has been started yet; the IPC listener is spawned below.
+        unsafe { vivido::binary::session::scrub_inherited_mesh_environment() };
+        vivido::binary::session::publish_runtime_kind("vivida");
+        vivido::binary::session::publish_instance_name(&automation_name);
+        vivido::binary::session::start_mesh_watcher();
+        options.socket = Some(automation_paths.socket.clone());
+
+        let terminfo = vivido::tty::setup_env();
+        let _listener = IoListener::spawn(&config, &options, event_sink.clone())?;
+        let automation_registry = automation_paths.register(&automation_name, (1, 1), true)?;
+        let mut processor = Processor::new_headless(config.clone(), options, event_sink.clone());
+        processor.claim_ipc_method_capabilities(&[
+            MethodCapability::host("create_window", MethodClass::Window, true),
+            MethodCapability::host("vivida_layout", MethodClass::Observe, false),
+            MethodCapability::host("vivida_resolve_pane", MethodClass::Observe, false),
+            MethodCapability::host("vivida_activate_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_create_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_create_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_split_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_rename_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_rename_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_reset_tab_title", MethodClass::Window, true),
+        ]);
+        let current_dir = std::env::current_dir()?;
+        let launch_cwd = terminal_options
+            .working_directory
+            .as_ref()
+            .map(|cwd| {
+                if cwd.is_absolute() {
+                    cwd.clone()
+                } else {
+                    current_dir.join(cwd)
+                }
+            })
+            .unwrap_or(current_dir);
+        Ok(Self::base_shell(
+            config,
+            terminfo,
+            terminal_options,
+            processor,
+            event_sink,
+            automation_registry,
+            launch_cwd,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn base_shell(
+        config: UiConfig,
+        terminfo: vivido::tty::TerminfoGuard,
+        terminal_options: TerminalOptions,
+        processor: Processor,
+        event_sink: EventSink,
+        automation_registry: RegistryGuard,
+        launch_cwd: PathBuf,
+    ) -> Self {
+        Self {
             config,
             _terminfo: terminfo,
             terminal_options,
@@ -667,7 +839,7 @@ impl Shell {
             embedded_touch_capture: HashMap::new(),
             #[cfg(target_os = "linux")]
             embedded_focused_pane: None,
-        })
+        }
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
@@ -700,7 +872,7 @@ impl Shell {
         self.chrome_renderer = Some(chrome_renderer);
         if !self.restore_session(event_loop) {
             let launch_cwd = self.launch_cwd.clone();
-            self.create_workspace(event_loop, launch_cwd)?;
+            self.create_workspace(ShellLoop::Winit(event_loop), launch_cwd)?;
         }
         self.sync_visibility_and_geometry();
 
@@ -721,6 +893,28 @@ impl Shell {
         Ok(())
     }
 
+    /// Start the offscreen shell with one workspace, mirroring headed startup without chrome.
+    ///
+    /// Session restore stays headed-only: a headless instance is fresh hermetic state, and no
+    /// update checks run from CI.
+    fn initialize_headless(&mut self, headless: &HeadlessLoop) -> Result<(), Box<dyn Error>> {
+        let handle = ShellLoop::Headless(headless);
+        let launch_cwd = self.launch_cwd.clone();
+        self.create_workspace(handle, launch_cwd)?;
+        self.after_topology_change(handle);
+        if !self.active_panes_have_headless_host() {
+            return Err("a Vivido pane was not attached to the headless host".into());
+        }
+        Ok(())
+    }
+
+    fn active_panes_have_headless_host(&self) -> bool {
+        let host = HeadlessPaneHost;
+        self.pane_index
+            .keys()
+            .all(|pane| host.is_attached(&self.processor, *pane))
+    }
+
     fn restore_session(&mut self, event_loop: &ActiveEventLoop) -> bool {
         let Some(path) = &self.session_path else {
             return false;
@@ -734,7 +928,8 @@ impl Shell {
             for saved_tab in saved_workspace.tabs {
                 let mut panes = BTreeMap::new();
                 for (pane_id, cwd) in saved_tab.pane_cwds {
-                    let Ok(window_id) = self.create_pane_window(event_loop, &cwd) else {
+                    let Ok(window_id) = self.create_pane_window(ShellLoop::Winit(event_loop), &cwd)
+                    else {
                         continue;
                     };
                     self.pane_index.insert(
@@ -805,37 +1000,66 @@ impl Shell {
 
     fn create_pane_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         cwd: &Path,
     ) -> Result<WindowId, Box<dyn Error>> {
-        let chrome = Arc::clone(
-            self.chrome_window
-                .as_ref()
-                .ok_or("chrome window is not initialized")?,
-        );
-        NativePaneHost::new(chrome).create_pane(
-            &mut self.processor,
-            event_loop,
-            cwd,
-            &self.terminal_options,
-        )
+        match handle {
+            ShellLoop::Winit(event_loop) => {
+                let chrome = Arc::clone(
+                    self.chrome_window
+                        .as_ref()
+                        .ok_or("chrome window is not initialized")?,
+                );
+                NativePaneHost::new(chrome).create_pane(
+                    &mut self.processor,
+                    event_loop,
+                    cwd,
+                    &self.terminal_options,
+                )
+            }
+            ShellLoop::Headless(headless) => {
+                let mut options = WindowOptions::default();
+                options.terminal_options = self.terminal_options.clone();
+                options.terminal_options.working_directory = Some(cwd.to_owned());
+                HeadlessPaneHost.create_pane(&mut self.processor, headless, options)
+            }
+        }
     }
 
     fn create_pane_window_with_options(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         options: WindowOptions,
     ) -> Result<WindowId, Box<dyn Error>> {
-        let chrome = Arc::clone(
-            self.chrome_window
-                .as_ref()
-                .ok_or("chrome window is not initialized")?,
-        );
-        NativePaneHost::new(chrome).create_pane_with_options(
-            &mut self.processor,
-            event_loop,
-            options,
-        )
+        match handle {
+            ShellLoop::Winit(event_loop) => {
+                let chrome = Arc::clone(
+                    self.chrome_window
+                        .as_ref()
+                        .ok_or("chrome window is not initialized")?,
+                );
+                NativePaneHost::new(chrome).create_pane_with_options(
+                    &mut self.processor,
+                    event_loop,
+                    options,
+                )
+            }
+            ShellLoop::Headless(headless) => {
+                HeadlessPaneHost.create_pane(&mut self.processor, headless, options)
+            }
+        }
+    }
+
+    /// Re-sync geometry and visibility after a topology change, then refresh focus affordances.
+    ///
+    /// Chrome calls are no-ops without a chrome window, so headed and headless share this tail.
+    fn after_topology_change(&mut self, handle: ShellLoop<'_>) {
+        match handle {
+            ShellLoop::Winit(_) => self.sync_visibility_and_geometry(),
+            ShellLoop::Headless(headless) => self.sync_headless_visibility_and_geometry(headless),
+        }
+        self.focus_active_pane();
+        self.request_chrome_redraw();
     }
 
     fn platform_window_id(&self, ipc_window_id: u64) -> Option<WindowId> {
@@ -1025,11 +1249,11 @@ impl Shell {
 
     fn create_workspace(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         cwd: PathBuf,
     ) -> Result<WorkspaceId, Box<dyn Error>> {
         self.end_split_drag();
-        let pane_window_id = self.create_pane_window(event_loop, &cwd)?;
+        let pane_window_id = self.create_pane_window(handle, &cwd)?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id += 1;
         let label = unique_name(
@@ -1050,9 +1274,7 @@ impl Shell {
         self.workspaces.push(workspace);
         self.active_workspace = Some(workspace_id);
         self.closing_workspaces.remove(&workspace_id);
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         Ok(workspace_id)
     }
 
@@ -1094,22 +1316,18 @@ impl Shell {
         self.request_chrome_redraw();
     }
 
-    fn create_tab(&mut self, event_loop: &ActiveEventLoop) {
-        self.create_tab_with_options(event_loop, None);
+    fn create_tab(&mut self, handle: ShellLoop<'_>) {
+        self.create_tab_with_options(handle, None);
     }
 
     /// Add a tab to the active workspace, optionally running something other than the shell.
-    fn create_tab_with_options(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        options: Option<WindowOptions>,
-    ) {
+    fn create_tab_with_options(&mut self, handle: ShellLoop<'_>, options: Option<WindowOptions>) {
         self.end_split_drag();
         let window = match options {
-            Some(options) => self.create_pane_window_with_options(event_loop, options),
+            Some(options) => self.create_pane_window_with_options(handle, options),
             None => {
                 let cwd = self.active_pane_cwd();
-                self.create_pane_window(event_loop, &cwd)
+                self.create_pane_window(handle, &cwd)
             }
         };
         let window_id = match window {
@@ -1133,20 +1351,16 @@ impl Shell {
                 pane_id: PaneId(1),
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
-    fn switch_tab(&mut self, tab_id: TabId) {
+    fn switch_tab(&mut self, handle: ShellLoop<'_>, tab_id: TabId) {
         self.end_split_drag();
         if self
             .active_workspace_mut()
             .is_some_and(|workspace| workspace.switch_tab(tab_id))
         {
-            self.sync_visibility_and_geometry();
-            self.focus_active_pane();
-            self.request_chrome_redraw();
+            self.after_topology_change(handle);
         }
     }
 
@@ -1163,7 +1377,7 @@ impl Shell {
         }
     }
 
-    fn close_workspace(&mut self, workspace_id: WorkspaceId) {
+    fn close_workspace(&mut self, handle: ShellLoop<'_>, workspace_id: WorkspaceId) {
         self.end_split_drag();
         let Some(index) = self
             .workspaces
@@ -1199,12 +1413,10 @@ impl Shell {
                 }
             }
         }
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
-    fn split_active_pane(&mut self, event_loop: &ActiveEventLoop, axis: Axis) {
+    fn split_active_pane(&mut self, handle: ShellLoop<'_>, axis: Axis) {
         self.end_split_drag();
         let Some(workspace) = self.active_workspace() else {
             return;
@@ -1219,10 +1431,13 @@ impl Shell {
         let Some(rect) = self.pane_rects.get(&focused_window).copied() else {
             return;
         };
-        let scale = self
-            .chrome_window
-            .as_ref()
-            .map_or(1.0, |window| window.scale_factor());
+        let scale = match handle {
+            ShellLoop::Winit(_) => self
+                .chrome_window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor()),
+            ShellLoop::Headless(_) => HEADLESS_SCALE,
+        };
         let enough_room = match axis {
             Axis::Horizontal => {
                 rect.width >= (chrome::MIN_PANE_WIDTH_LOGICAL * 2.0 * scale).round() as u32
@@ -1240,7 +1455,7 @@ impl Shell {
             .window(focused_window)
             .and_then(|pane| pane.current_directory())
             .unwrap_or_else(|| workspace.identity_cwd.clone());
-        let Ok(window_id) = self.create_pane_window(event_loop, &cwd) else {
+        let Ok(window_id) = self.create_pane_window(handle, &cwd) else {
             return;
         };
 
@@ -1266,9 +1481,7 @@ impl Shell {
                 pane_id,
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
     fn creation_result(
@@ -1295,7 +1508,7 @@ impl Shell {
 
     fn host_create_workspace(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         params: CreateWorkspaceOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
         self.end_split_drag();
@@ -1317,7 +1530,7 @@ impl Shell {
             )
         };
         let window_id = self
-            .create_pane_window_with_options(event_loop, options)
+            .create_pane_window_with_options(handle, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id = self.next_workspace_id.saturating_add(1);
@@ -1333,15 +1546,13 @@ impl Shell {
                 pane_id: PaneId(1),
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         self.creation_result(window_id)
     }
 
     fn host_create_tab(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         params: CreateTabOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
         self.end_split_drag();
@@ -1371,7 +1582,7 @@ impl Shell {
             options.terminal_options.working_directory = Some(default_cwd);
         }
         let window_id = self
-            .create_pane_window_with_options(event_loop, options)
+            .create_pane_window_with_options(handle, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace = self
             .workspaces
@@ -1396,15 +1607,13 @@ impl Shell {
                 pane_id: PaneId(1),
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         self.creation_result(window_id)
     }
 
     fn host_split_pane(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         params: SplitPaneOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
         self.end_split_drag();
@@ -1424,7 +1633,7 @@ impl Shell {
             options.terminal_options.working_directory = Some(cwd);
         }
         let window_id = self
-            .create_pane_window_with_options(event_loop, options)
+            .create_pane_window_with_options(handle, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace = self
             .workspaces
@@ -1456,9 +1665,7 @@ impl Shell {
                 pane_id,
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         self.creation_result(window_id)
     }
 
@@ -1493,6 +1700,7 @@ impl Shell {
 
     fn host_close_tab(
         &mut self,
+        handle: ShellLoop<'_>,
         target: TabTarget,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
         self.end_split_drag();
@@ -1530,8 +1738,7 @@ impl Shell {
             workspace.active_tab = next.id;
         }
         self.request_close_panes(&panes)?;
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
+        self.after_topology_change(handle);
         Ok(
             serde_json::json!({"accepted": true, "workspace_id": workspace_id.0, "tab_id": tab_id.0}),
         )
@@ -1785,10 +1992,11 @@ impl Shell {
             .chrome_window
             .as_ref()
             .map_or(1.0, |chrome| chrome.scale_factor());
+        // Headless has no chrome window to be hidden: visibility is the model hierarchy.
         let chrome_visible = self
             .chrome_window
             .as_ref()
-            .is_some_and(|chrome| chrome.is_visible() != Some(false));
+            .is_none_or(|chrome| chrome.is_visible() != Some(false));
         let workspaces = self
             .workspaces
             .iter()
@@ -1929,6 +2137,61 @@ impl Shell {
     fn sync_visibility_and_geometry(&mut self) {
         let placed = self.sync_pane_geometry();
         self.sync_pane_visibility(placed);
+    }
+
+    /// Offscreen equivalent of `sync_visibility_and_geometry` on the virtual display.
+    ///
+    /// Pane rects come from the same split-tree engine over the full virtual display; sizes
+    /// are applied to the headless windows explicitly since no compositor delivers resizes,
+    /// and visibility flips only the automation flag.
+    fn sync_headless_visibility_and_geometry(&mut self, headless: &HeadlessLoop) {
+        let content = PhysicalRect {
+            x: 0,
+            y: 0,
+            width: HEADLESS_WIDTH,
+            height: HEADLESS_HEIGHT,
+        };
+        // Layout, resolve, and neighbor queries read the chrome content rect: point it at the
+        // virtual display so headless reports real geometry through the same code.
+        self.chrome_layout.content = content;
+        let placements = self
+            .active_workspace()
+            .and_then(|workspace| {
+                workspace.active_tab().map(|tab| {
+                    compute_rects(&tab.root, content, HEADLESS_SCALE)
+                        .into_iter()
+                        .filter_map(|(pane_id, rect)| {
+                            tab.panes.get(&pane_id).map(|window_id| (*window_id, rect))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        let active = self.active_workspace;
+        let closing = &self.closing_workspaces;
+        let visibility = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace.tabs.iter().flat_map(move |tab| {
+                    tab.panes.values().copied().map(move |window_id| {
+                        let visible = Some(workspace.id) == active
+                            && tab.id == workspace.active_tab
+                            && !closing.contains(&workspace.id);
+                        (window_id, visible)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        self.pane_rects.clear();
+        let host = HeadlessPaneHost;
+        for (window_id, rect) in placements {
+            host.move_pane(&mut self.processor, headless, window_id, rect);
+            self.pane_rects.insert(window_id, rect);
+        }
+        for (window_id, visible) in visibility {
+            host.reveal(&mut self.processor, window_id, visible);
+        }
     }
 
     fn sync_pane_visibility(&mut self, _placed: PanePlacement) {
@@ -2206,21 +2469,41 @@ impl Shell {
 
     fn resize_active_pane_layout(
         &mut self,
+        handle: ShellLoop<'_>,
         window_id: WindowId,
         width: u32,
         height: u32,
     ) -> Option<PhysicalRect> {
         self.end_split_drag();
         let key = self.pane_index.get(&window_id).copied()?;
-        let scale = self.chrome_window.as_ref()?.scale_factor();
-        let content = self.chrome_layout.content;
+        let scale = match handle {
+            ShellLoop::Winit(_) => self.chrome_window.as_ref()?.scale_factor(),
+            ShellLoop::Headless(_) => HEADLESS_SCALE,
+        };
+        // Headless has no chrome window, so the split tree fills the virtual display.
+        let content = match handle {
+            ShellLoop::Winit(_) => self.chrome_layout.content,
+            ShellLoop::Headless(_) => PhysicalRect {
+                x: 0,
+                y: 0,
+                width: HEADLESS_WIDTH,
+                height: HEADLESS_HEIGHT,
+            },
+        };
         let workspace = self
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == key.workspace_id)?;
         let tab = workspace.tabs.iter_mut().find(|tab| tab.id == key.tab_id)?;
         resize_pane(&mut tab.root, key.pane_id, width, height, content, scale)?;
-        self.sync_pane_geometry();
+        match handle {
+            ShellLoop::Winit(_) => {
+                self.sync_pane_geometry();
+            }
+            ShellLoop::Headless(headless) => {
+                self.sync_headless_visibility_and_geometry(headless);
+            }
+        }
         self.pane_rects.get(&window_id).copied()
     }
 
@@ -2233,6 +2516,14 @@ impl Shell {
             .and_then(Workspace::active_tab)
             .and_then(|tab| tab.focused_window_id());
         let Some(chrome) = self.chrome_window.as_ref().map(Arc::clone) else {
+            // Headless: track keyboard focus in the automation state instead of the OS.
+            if let Some(focused) = window_id {
+                for pane_id in self.pane_index.keys().copied().collect::<Vec<_>>() {
+                    if let Some(pane) = self.processor.window_mut(pane_id) {
+                        pane.set_automation_focused(pane_id == focused);
+                    }
+                }
+            }
             return;
         };
         if let Some(window_id) = window_id {
@@ -2402,7 +2693,7 @@ impl Shell {
         }
     }
 
-    fn reap_closed_panes(&mut self, event_loop: &ActiveEventLoop) {
+    fn reap_closed_panes(&mut self, handle: ShellLoop<'_>) {
         let closed = self
             .pane_index
             .keys()
@@ -2436,7 +2727,7 @@ impl Shell {
         }
 
         if self.workspaces.is_empty() {
-            event_loop.exit();
+            handle.exit();
             return;
         }
         if self.active_workspace.is_none_or(|active| {
@@ -2447,9 +2738,7 @@ impl Shell {
         }) {
             self.active_workspace = self.workspaces.first().map(|workspace| workspace.id);
         }
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
     fn remove_empty_workspace(&mut self, workspace_id: WorkspaceId) {
@@ -3070,7 +3359,7 @@ impl Shell {
                 if let Some(program) = &program {
                     options.terminal_options.set_command(program);
                 }
-                self.create_tab_with_options(event_loop, Some(options));
+                self.create_tab_with_options(ShellLoop::Winit(event_loop), Some(options));
             }
             LaunchAction::NewWindow => self.spawn_new_instance(),
         }
@@ -3388,7 +3677,7 @@ impl Shell {
         options
             .terminal_options
             .set_command(&editor_program(configured_editor().as_deref(), &path));
-        self.create_tab_with_options(event_loop, Some(options));
+        self.create_tab_with_options(ShellLoop::Winit(event_loop), Some(options));
     }
 
     fn render_settings_menu(&mut self) {
@@ -3405,7 +3694,7 @@ impl Shell {
         }
     }
 
-    fn drain_host_requests(&mut self, event_loop: &ActiveEventLoop) {
+    fn drain_host_requests(&mut self, handle: ShellLoop<'_>) {
         for request in self.processor.take_host_requests() {
             let result = match request.method.as_str() {
                 "create_window" => serde_json::from_value::<WindowOptions>(request.params.clone())
@@ -3414,7 +3703,7 @@ impl Shell {
                     })
                     .and_then(|options| {
                         self.host_create_tab(
-                            event_loop,
+                            handle,
                             CreateTabOptions {
                                 workspace_id: self.active_workspace.map(|id| id.0),
                                 workspace_name: None,
@@ -3468,21 +3757,21 @@ impl Shell {
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|options| self.host_create_workspace(event_loop, options))
+                        .and_then(|options| self.host_create_workspace(handle, options))
                 }
                 "vivida_create_tab" => {
                     serde_json::from_value::<CreateTabOptions>(request.params.clone())
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|params| self.host_create_tab(event_loop, params))
+                        .and_then(|params| self.host_create_tab(handle, params))
                 }
                 "vivida_split_pane" => {
                     serde_json::from_value::<SplitPaneOptions>(request.params.clone())
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|params| self.host_split_pane(event_loop, params))
+                        .and_then(|params| self.host_split_pane(handle, params))
                 }
                 "vivida_close_pane" => {
                     serde_json::from_value::<WindowTarget>(request.params.clone())
@@ -3495,7 +3784,7 @@ impl Shell {
                     .map_err(|error| {
                         vivido::host::IpcError::new("invalid_params", error.to_string())
                     })
-                    .and_then(|target| self.host_close_tab(target)),
+                    .and_then(|target| self.host_close_tab(handle, target)),
                 "vivida_close_workspace" => serde_json::from_value::<WorkspaceTarget>(
                     request.params.clone(),
                 )
@@ -3508,7 +3797,7 @@ impl Shell {
                         None,
                         caller,
                     )?;
-                    self.close_workspace(workspace_id);
+                    self.close_workspace(handle, workspace_id);
                     Ok(serde_json::json!({"accepted": true, "workspace_id": workspace_id.0}))
                 }),
                 "vivida_rename_workspace" => {
@@ -3544,13 +3833,13 @@ impl Shell {
         }
     }
 
-    fn drain_shell_actions(&mut self, event_loop: &ActiveEventLoop) {
+    fn drain_shell_actions(&mut self, handle: ShellLoop<'_>) {
         for request in self.processor.take_shell_actions() {
             match request.action {
                 ShellAction::CreateTab(options) => {
                     if let Some(key) = self.pane_index.get(&request.source).copied() {
                         let _ = self.host_create_tab(
-                            event_loop,
+                            handle,
                             CreateTabOptions {
                                 workspace_id: Some(key.workspace_id.0),
                                 workspace_name: None,
@@ -3568,7 +3857,7 @@ impl Shell {
                         } else {
                             -1
                         };
-                        self.cycle_tab(direction);
+                        self.cycle_tab(handle, direction);
                     }
                 }
                 ShellAction::SelectTab(index) => {
@@ -3578,7 +3867,7 @@ impl Shell {
                             .and_then(|workspace| workspace.tabs.get(index))
                             .map(|tab| tab.id)
                     {
-                        self.switch_tab(tab_id);
+                        self.switch_tab(handle, tab_id);
                     }
                 }
                 ShellAction::SelectLastTab => {
@@ -3588,7 +3877,7 @@ impl Shell {
                             .and_then(|workspace| workspace.tabs.last())
                             .map(|tab| tab.id)
                     {
-                        self.switch_tab(tab_id);
+                        self.switch_tab(handle, tab_id);
                     }
                 }
                 ShellAction::Minimize => {
@@ -3621,7 +3910,7 @@ impl Shell {
                 ShellAction::Resize { width, height } => {
                     self.activate_pane(request.source);
                     if let Some(rect) =
-                        self.resize_active_pane_layout(request.source, width, height)
+                        self.resize_active_pane_layout(handle, request.source, width, height)
                         && let Some(chrome) = &self.chrome_window
                     {
                         let current = chrome.inner_size();
@@ -3769,11 +4058,11 @@ impl Shell {
             .split_horizontal
             .contains(cursor.x, cursor.y)
         {
-            self.split_active_pane(event_loop, Axis::Horizontal);
+            self.split_active_pane(ShellLoop::Winit(event_loop), Axis::Horizontal);
             return true;
         }
         if self.chrome_hits.split_vertical.contains(cursor.x, cursor.y) {
-            self.split_active_pane(event_loop, Axis::Vertical);
+            self.split_active_pane(ShellLoop::Winit(event_loop), Axis::Vertical);
             return true;
         }
         if self.chrome_hits.gear.contains(cursor.x, cursor.y) {
@@ -3806,7 +4095,7 @@ impl Shell {
             return true;
         }
         if self.chrome_hits.new_tab.contains(cursor.x, cursor.y) {
-            self.create_tab(event_loop);
+            self.create_tab(ShellLoop::Winit(event_loop));
             return true;
         }
         if let Some(tab_id) = self
@@ -3815,7 +4104,7 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            self.switch_tab(tab_id);
+            self.switch_tab(ShellLoop::Winit(event_loop), tab_id);
             return true;
         }
         if let Some(workspace_id) = self
@@ -3824,12 +4113,12 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            self.close_workspace(workspace_id);
+            self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
             return true;
         }
         if self.chrome_hits.new_workspace.contains(cursor.x, cursor.y) {
             let cwd = self.active_pane_cwd();
-            if let Err(error) = self.create_workspace(event_loop, cwd) {
+            if let Err(error) = self.create_workspace(ShellLoop::Winit(event_loop), cwd) {
                 eprintln!("failed to create workspace: {error}");
             }
             return true;
@@ -4269,7 +4558,7 @@ impl Shell {
         }
         match event.physical_key {
             PhysicalKey::Code(KeyCode::KeyT) => {
-                self.create_tab(event_loop);
+                self.create_tab(ShellLoop::Winit(event_loop));
                 true
             }
             PhysicalKey::Code(KeyCode::KeyD) => {
@@ -4278,12 +4567,12 @@ impl Shell {
                 } else {
                     Axis::Horizontal
                 };
-                self.split_active_pane(event_loop, axis);
+                self.split_active_pane(ShellLoop::Winit(event_loop), axis);
                 true
             }
             PhysicalKey::Code(KeyCode::KeyN) if self.modifiers.shift_key() => {
                 let cwd = self.active_pane_cwd();
-                if let Err(error) = self.create_workspace(event_loop, cwd) {
+                if let Err(error) = self.create_workspace(ShellLoop::Winit(event_loop), cwd) {
                     eprintln!("failed to create workspace: {error}");
                 }
                 true
@@ -4294,7 +4583,7 @@ impl Shell {
             }
             PhysicalKey::Code(KeyCode::KeyW) if self.modifiers.shift_key() => {
                 if let Some(workspace_id) = self.active_workspace {
-                    self.close_workspace(workspace_id);
+                    self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
                 }
                 true
             }
@@ -4303,11 +4592,11 @@ impl Shell {
                 true
             }
             PhysicalKey::Code(KeyCode::BracketRight) if self.modifiers.shift_key() => {
-                self.cycle_tab(1);
+                self.cycle_tab(ShellLoop::Winit(event_loop), 1);
                 true
             }
             PhysicalKey::Code(KeyCode::BracketLeft) if self.modifiers.shift_key() => {
-                self.cycle_tab(-1);
+                self.cycle_tab(ShellLoop::Winit(event_loop), -1);
                 true
             }
             PhysicalKey::Code(code) => workspace_shortcut_index(code)
@@ -4358,7 +4647,7 @@ impl Shell {
         true
     }
 
-    fn cycle_tab(&mut self, direction: isize) {
+    fn cycle_tab(&mut self, handle: ShellLoop<'_>, direction: isize) {
         let Some(workspace) = self.active_workspace() else {
             return;
         };
@@ -4375,7 +4664,7 @@ impl Shell {
         }
         let next = (index as isize + direction).rem_euclid(len as isize) as usize;
         let tab_id = workspace.tabs[next].id;
-        self.switch_tab(tab_id);
+        self.switch_tab(handle, tab_id);
     }
 
     fn refresh_tab_titles(&mut self) {
@@ -4919,12 +5208,12 @@ impl ApplicationHandler<Event> for Shell {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.processor
             .handle_winit_event(event_loop, WinitEvent::AboutToWait);
-        self.drain_shell_actions(event_loop);
-        self.drain_host_requests(event_loop);
+        self.drain_shell_actions(ShellLoop::Winit(event_loop));
+        self.drain_host_requests(ShellLoop::Winit(event_loop));
         if self.processor.has_pending_embedded_redraw() {
             self.request_chrome_redraw();
         }
-        self.reap_closed_panes(event_loop);
+        self.reap_closed_panes(ShellLoop::Winit(event_loop));
         self.refresh_tab_titles();
     }
 
@@ -5241,11 +5530,56 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(VividaCommand::List(options)) => return list_instances(options),
         None => {}
     }
+    if options.headless {
+        return run_headless(options);
+    }
     let mut builder = EventLoop::<Event>::with_user_event();
     configure_event_loop(&mut builder);
     let event_loop = builder.build()?;
     let mut shell = Shell::new(&event_loop, options.terminal_options)?;
     event_loop.run_app(&mut shell)?;
+    Ok(())
+}
+
+/// `--headless` entrypoint: offscreen split-tree host with a registered automation endpoint.
+///
+/// Blocks until quit; prints the endpoint first so CI can target this exact session.
+fn run_headless(options: VividaOptions) -> Result<(), Box<dyn Error>> {
+    let session = options
+        .session
+        .clone()
+        .unwrap_or_else(|| format!("vivida-{}", std::process::id()));
+    let (event_sink, events) = EventSink::headless();
+    let mut shell = Shell::new_headless(options.terminal_options, session.clone(), event_sink)?;
+    let headless = HeadlessLoop::new(
+        winit::dpi::PhysicalSize::new(HEADLESS_WIDTH, HEADLESS_HEIGHT),
+        HEADLESS_SCALE,
+    );
+    shell.initialize_headless(&headless)?;
+    let socket = SessionPaths::for_session(&session)?.socket;
+    println!(
+        "{}",
+        serde_json::json!({"session": session, "socket": socket})
+    );
+    run_headless_server(&mut shell, &events, &headless)
+}
+
+/// Drive an offscreen shell: pump the headless processor, then run Vivida dispatch.
+///
+/// Single-threaded, mirroring what winit's `about_to_wait` does for the headed shell.
+fn run_headless_server(
+    shell: &mut Shell,
+    events: &std::sync::mpsc::Receiver<Event>,
+    headless: &HeadlessLoop,
+) -> Result<(), Box<dyn Error>> {
+    while shell.processor.pump_headless(events, headless) {
+        let handle = ShellLoop::Headless(headless);
+        shell.drain_shell_actions(handle);
+        shell.drain_host_requests(handle);
+        shell.reap_closed_panes(handle);
+        shell.refresh_tab_titles();
+    }
+    shell.processor.finish_headless();
     Ok(())
 }
 
@@ -5620,6 +5954,22 @@ mod tests {
             receiver.recv().unwrap().payload(),
             EventType::Update(UpdateEvent::CheckRequested)
         ));
+    }
+
+    #[test]
+    fn parse_headless_options() {
+        let options =
+            VividaOptions::try_parse_from(["vivida", "--headless", "--session", "ci"]).unwrap();
+        assert!(options.headless);
+        assert_eq!(options.session, Some(String::from("ci")));
+        assert!(options.command.is_none());
+
+        // A session name only makes sense for a headless server.
+        assert!(VividaOptions::try_parse_from(["vivida", "--session", "ci"]).is_err());
+
+        let options = VividaOptions::try_parse_from(["vivida"]).unwrap();
+        assert!(!options.headless);
+        assert_eq!(options.session, None);
     }
 
     #[test]
