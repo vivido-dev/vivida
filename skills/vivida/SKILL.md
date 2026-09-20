@@ -76,7 +76,8 @@ Workspace and tab numbers are one-based **display positions**, not IDs. With nei
 resolution is scoped to the caller's own workspace and tab, even when hidden; without a caller, an
 omitted workspace is accepted only when exactly one exists — it never silently falls back to the
 active one. A route starts at the caller when it belongs to the selected tab, otherwise at that
-tab's focused pane; `--from-pane-id` or `--from-window-id` picks another start.
+tab's focused pane; `--from-pane-id` or `--from-window-id` picks another start. To reach another
+tab, select it first — `--tab 2 --path down` — since an unscoped path never leaves the caller's tab.
 
 **A direction is one navigation step, not a global edge selector.** "The left pane" in a nested
 split may need `--path left,left` or `--path right,down`. Read `split_path`, the rectangles, and the
@@ -130,6 +131,14 @@ never infer a hidden tab's state from an old frame.
 the sub-cell remainder collects at the right and bottom instead of being split, so
 `(width - columns * cell_width) / 2` over-estimates by half the remainder. A producer that guessed
 this shifted every stroke it drew. `scripts/geometry.py` converts cells to pixels from that JSON.
+
+Drive the pointer with one bounded `mouse path` per press/move/release gesture — never one
+invocation per point. Application routing (the default) encodes for the terminal when it has mouse
+reporting active; `--route ui` runs through the normal input processor for Vivido's own bindings
+and local UI behaviour. With application routing, physical pixels survive only under SGR pixel
+mouse mode and otherwise resolve to cells, so check the mode names in `inspect` before trusting
+sub-cell precision. Exact flags, `--duration`, and `--wait-frame` are in
+[references/commands.md](references/commands.md).
 
 Prefer `get-grid` when the question is about *content*: it keeps position, width, style, wrap, and
 selection, so a highlighted menu row or a disabled control stays distinguishable — all of which
