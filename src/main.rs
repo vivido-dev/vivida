@@ -1063,7 +1063,15 @@ impl Shell {
             ShellLoop::Winit(_) => self.sync_visibility_and_geometry(),
             ShellLoop::Headless(headless) => self.sync_headless_visibility_and_geometry(headless),
         }
-        self.focus_active_pane();
+        // A PTY can exit while another application is active. Automatic layout maintenance
+        // must not activate the application; explicit focus requests still use activate_pane.
+        #[cfg(target_os = "macos")]
+        let restore_focus = self.chrome_window.is_none() || platform::application_is_active();
+        #[cfg(not(target_os = "macos"))]
+        let restore_focus = true;
+        if restore_focus {
+            self.focus_active_pane();
+        }
         self.request_chrome_redraw();
     }
 
