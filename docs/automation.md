@@ -113,14 +113,52 @@ vivida msg close-tab --workspace-name "Project Alpha" --tab-name "Server"
 vivida msg close-workspace --workspace-name "Project Alpha"
 ```
 
+`split-pane` takes `--window-id` for the pane being split and `--axis horizontal|vertical`. The
+optional `--new-window-id` names the IPC ID for the pane it creates; it is spelled differently here
+because `--window-id` already names the target, unlike `create-tab` and `create-workspace` where the
+flattened window options own that name.
+
 Creation commands return the new workspace, tab, pane, and window IDs. Close replies acknowledge
 that shutdown was requested; use `wait exit` or `subscribe` when the agent must observe process
 termination. IDs must be rediscovered after Vivida restarts.
 
 Workspace names are globally unique and tab names are unique within a workspace. User-provided
 names are trimmed, bounded to 128 characters, and reject control characters. Context-driven titles
-that collide are assigned deterministic suffixes such as `pwsh (2)`. Renaming a tab pins its title;
-`reset-tab-title` or the UI's **Use Automatic Title** action resumes terminal-context updates.
+use the focused pane's current folder name, without the full path. Titles that collide are assigned
+deterministic suffixes such as `project (2)`. Renaming a tab pins its title;
+`reset-tab-title` or the tab context menu's **Reset** action resumes current-directory updates.
 
 The endpoint accepts connections only from the same operating-system user. Capability material
 used by Vivid presentation is never included in layout, inspection, or diagnostic replies.
+
+## Headless operation
+
+`vivida --headless --session <name>` runs the same split-tree host offscreen with no window
+system: it owns a virtual 1920x1080 display, blocks the foreground process until quit, and
+prints its automation endpoint first so callers can target the exact session:
+
+```sh
+vivida --headless --session ci-smoke
+# {"session":"ci-smoke","socket":"\\\\.\\pipe\\vivido-session-..."}
+```
+
+Every `vivida msg -t ci-smoke` command below works against that endpoint, including the full
+terminal surface: `list-windows`, `layout`, `get-text`, `get-grid`, `find-text`, `typing`
+with `--report`, `key`, `exec`, `split-pane`, and `quit`. Target panes by explicit
+`--window-id` taken from `layout`; `typing` takes literal text as a positional argument and
+`key` sends the submit stroke separately:
+
+```sh
+vivida msg -t ci-smoke get-text --window-id 1
+vivida msg -t ci-smoke typing --window-id 1 --report "echo hello-headless"
+vivida msg -t ci-smoke key --window-id 1 Enter
+vivida msg -t ci-smoke get-text --window-id 1
+vivida msg -t ci-smoke find-text --window-id 1 --pattern hello-headless
+vivida msg -t ci-smoke exec --window-id 1 --command "echo exec-ok"
+vivida msg -t ci-smoke split-pane --window-id 1 --axis horizontal
+vivida msg -t ci-smoke quit
+```
+
+`quit` is silent by design and the server exits 0. The hermetic CI job
+(`vivida-headless-e2e`) runs `tests/e2e/vivida_headless_smoke.py` against an ephemeral
+session on software Vulkan and asserts each of these replies.

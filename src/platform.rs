@@ -1,5 +1,7 @@
 //! Platform boundary for native pane hosting and event-loop integration.
 
+use std::process::{Command, Stdio};
+
 #[cfg(target_os = "macos")]
 use std::error::Error;
 #[cfg(target_os = "macos")]
@@ -23,7 +25,11 @@ pub const RESIZE_EDGE_LOGICAL: f64 = 10.0;
 pub const RESIZE_EDGE_LOGICAL: f64 = 6.0;
 
 pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
-    if cfg!(any(target_os = "windows", target_os = "macos")) {
+    if cfg!(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux"
+    )) {
         (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
     } else {
         0
@@ -34,13 +40,61 @@ pub fn pane_bottom_resize_gutter(scale_factor: f64) -> u32 {
 ///
 /// On macOS a pane is a child NSWindow floating above the chrome, so it would otherwise cover
 /// the chrome's native resize border along its trailing edge (and its leading edge when the
-/// sidebar is hidden). Windows performs side resizing through client-area hit testing, which
-/// the shell already owns, so it needs no side gutter.
+/// sidebar is hidden). Windows child HWNDs likewise intercept mouse events before the shell's
+/// client-area resize hit testing, so they must leave the side border exposed. On Linux a pane is
+/// composited into the chrome surface and dispatched to only through the same position lookup
+/// the resize border uses (see `Shell::embedded_pane_at`), so a pane flush against an edge would
+/// claim every pointer event there before the resize check ever runs.
 pub fn pane_side_resize_gutter(scale_factor: f64) -> u32 {
-    if cfg!(target_os = "macos") {
+    if cfg!(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux"
+    )) {
         (RESIZE_EDGE_LOGICAL * scale_factor).round() as u32
     } else {
         0
+    }
+}
+
+/// Whether a popup window takes the keyboard when it is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupFocus {
+    /// The popup owns the keyboard while it is open, as the rename editor and the shortcuts
+    /// window do.
+    Keyboard,
+    /// The popup appears without disturbing whoever holds the keyboard. The chrome dismisses its
+    /// menus when it resigns focus, so a menu that stole focus on open would close itself.
+    None,
+}
+
+/// Hand a URL to the platform browser.
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let (program, args): (&str, &[&str]) = ("open", &[]);
+    #[cfg(target_os = "linux")]
+    let (program, args): (&str, &[&str]) = ("xdg-open", &[]);
+    // `start` treats its first quoted argument as the window title, so it needs an empty one
+    // before the URL.
+    #[cfg(target_os = "windows")]
+    let (program, args): (&str, &[&str]) = ("cmd", &["/c", "start", ""]);
+
+    match Command::new(program)
+        .args(args)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        // The opener exits as soon as the browser has the URL. Reap it off the event loop so it
+        // does not linger as a zombie for the rest of the session.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => eprintln!("failed to open {url}: {error}"),
     }
 }
 
@@ -80,10 +134,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::configure_chrome_window;
 #[cfg(target_os = "macos")]
+pub use macos::show_launch_menu;
+#[cfg(target_os = "macos")]
 pub use macos::{
     NativePaneHost, configure_event_loop, finalize_chrome_window, focus_chrome_input,
-    position_rename_editor, position_settings_menu, rename_editor_window_attributes,
-    settings_menu_window_attributes,
+    popup_window_attributes, position_popup, set_popup_visible,
 };
 
 #[cfg(target_os = "windows")]
@@ -91,9 +146,11 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
+pub use windows::show_launch_menu;
+#[cfg(target_os = "windows")]
 pub use windows::{
-    configure_event_loop, finalize_chrome_window, focus_chrome_input, position_rename_editor,
-    position_settings_menu, rename_editor_window_attributes, settings_menu_window_attributes,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };
 #[cfg(target_os = "linux")]
 mod linux;
@@ -101,6 +158,20 @@ mod linux;
 pub use linux::configure_chrome_window;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    configure_event_loop, finalize_chrome_window, focus_chrome_input, position_rename_editor,
-    position_settings_menu, rename_editor_window_attributes, settings_menu_window_attributes,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_panes_leave_a_reachable_resize_border() {
+        // Linux dispatches to a pane only by looking up its rect at the pointer position (see
+        // `Shell::embedded_pane_at`), so a pane flush against an edge would swallow every click
+        // and hover there before the chrome's own resize check ever runs.
+        assert!(pane_bottom_resize_gutter(1.0) > 0);
+        assert!(pane_side_resize_gutter(1.0) > 0);
+    }
+}

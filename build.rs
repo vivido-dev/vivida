@@ -5,7 +5,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     #[cfg(windows)]
-    configure_ffmpeg_delay_load();
+    {
+        println!("cargo:rerun-if-changed=vivida.rc");
+        println!("cargo:rerun-if-changed=vivido.ico");
+        embed_resource::compile("vivida.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("failed to embed the Vivida Windows icon");
+        configure_ffmpeg_delay_load();
+    }
 }
 
 #[cfg(windows)]

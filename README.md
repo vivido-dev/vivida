@@ -2,6 +2,14 @@
 
 **The terminal workspace where you and your AI agents finally work in the same window.**
 
+> [!WARNING]
+> **On Windows, do not install WezTerm alongside Vivida.** Older builds of Vivida's embedded
+> Vivido terminal can load WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped
+> key-release events with that DLL, causing controls in apps such as vvdoom to stop responding
+> after the first movement. Builds containing the Vivido fix use Windows' built-in ConPTY instead.
+> If WezTerm is already installed, remove its directory from `PATH` or uninstall it, then restart
+> Vivida completely.
+
 <!-- Screenshot goes here — replace the placeholder below, e.g.:
 ![Vivida](docs/screenshot.png)
 -->
@@ -44,6 +52,30 @@ spot the error in the log, open the right pane, and fix it — while you watch o
 
 You get a workspace that feels great to drive. Your agents get eyes and hands. Vivida is where
 both of you get more done.
+
+## Resizing split panes
+
+Drag the gap between panes to resize the two neighboring sections. The panes resize live; other
+sections keep their boundaries. Press Escape during the drag to restore the original sizes.
+Resizing stops when you release the mouse, switch tabs or workspaces, or leave the window's focus.
+
+## Keyboard shortcuts
+
+`Mod` is `Cmd` on macOS and `Ctrl` elsewhere. The gear in the tab bar opens the same list in a
+scrollable window, alongside the Vivido terminal bindings that reach a pane.
+
+| Shortcut | Action |
+| --- | --- |
+| `Mod T` | New tab |
+| `Mod D` | Split the pane left and right |
+| `Mod Shift D` | Split the pane top and bottom |
+| `Mod W` | Close the focused pane |
+| `Mod Shift N` | New workspace |
+| `Mod Shift W` | Close the workspace |
+| `Mod Shift B` | Expand, shrink, or hide the sidebar |
+| `Mod Shift ]` / `Mod Shift [` | Next or previous tab |
+| `Mod 1` – `Mod 9` | Switch to workspace 1 through 9 |
+| `Ctrl Shift F12` | Recover a stuck terminal |
 
 ## Learn more
 

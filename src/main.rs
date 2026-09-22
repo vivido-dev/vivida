@@ -1,5 +1,6 @@
 //! Native workspace shell embedding Vivido panes in one process.
 
+#![windows_subsystem = "windows"]
 #![warn(rust_2018_idioms, future_incompatible)]
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(clippy, deny(warnings))]
@@ -9,6 +10,10 @@ mod layout;
 mod model;
 mod platform;
 mod session;
+mod shortcuts;
+mod split_resize;
+
+use split_resize::{DragEvent, SplitDrag, divider_at, divider_cursor, drag_event};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -18,8 +23,11 @@ use std::time::{Duration, Instant};
 
 use chrome::{
     ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, ContextMenuRenderState,
-    RenameEditorRenderState, RenameEditorRenderer, SettingsMenuRenderer, SidebarMode,
-    compute_chrome_layout, rename_editor_logical_size, settings_menu_logical_size,
+    RenameEditorRenderState, RenameEditorRenderer, SettingsMenuItem, SettingsMenuRenderer,
+    ShortcutsRenderState, ShortcutsRenderer, SidebarMode, compute_chrome_layout,
+    rename_editor_logical_size, settings_menu_item_at, settings_menu_logical_size,
+    shortcuts_close_rect, shortcuts_content_height, shortcuts_header_height,
+    shortcuts_logical_size, shortcuts_row_height,
 };
 use clap::{Args, Parser, Subcommand};
 use layout::{Axis, PhysicalRect, compute_rects, resize_pane};
@@ -28,24 +36,29 @@ use model::{
     remove_owned_pane, unique_name, workspace_label,
 };
 use platform::{
-    NativePaneHost, PaneHost, RESIZE_EDGE_LOGICAL, configure_chrome_window, configure_event_loop,
-    finalize_chrome_window, focus_chrome_input, position_rename_editor, position_settings_menu,
-    rename_editor_window_attributes, settings_menu_window_attributes,
+    NativePaneHost, PaneHost, PopupFocus, RESIZE_EDGE_LOGICAL, configure_chrome_window,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
 };
 use vivido::config::UiConfig;
+use vivido::config::ui_config::Program;
+#[cfg(test)]
 use vivido::config::window::Decorations;
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
-use vivido::shell::ShellAction;
-use vivido::{Event, Processor};
+use vivido::shell::{LaunchAction, LaunchEntry, ShellAction, launch_entries};
+use vivido::update::UpdateEvent;
+use vivido::{Event, EventSink, EventType, HeadlessLoop, LoopHandle, Processor};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 #[cfg(target_os = "linux")]
 use winit::event::TouchPhase;
-use winit::event::{ElementState, Event as WinitEvent, Ime, MouseButton, StartCause, WindowEvent};
+use winit::event::{
+    ElementState, Event as WinitEvent, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
@@ -63,6 +76,17 @@ const INITIAL_HEIGHT: f64 = 700.0;
 struct VividaOptions {
     #[command(subcommand)]
     command: Option<VividaCommand>,
+
+    /// Run without any OS window: an offscreen split-tree host for hermetic automation.
+    ///
+    /// Blocks until quit; panes are real headless Vivido terminals on a 1920x1080@1.0x
+    /// virtual display, and every layout/host IPC method works as headed.
+    #[arg(long)]
+    headless: bool,
+
+    /// Registered session name for `--headless`, so clients can target it exactly.
+    #[arg(long, value_name = "NAME", requires = "headless")]
+    session: Option<String>,
 
     /// Terminal process and arguments used for every pane.
     #[command(flatten)]
@@ -240,7 +264,50 @@ struct SplitPaneOptions {
     #[arg(long, value_enum)]
     axis: SplitAxis,
     #[command(flatten)]
-    options: WindowOptions,
+    options: NewPaneOptions,
+}
+
+/// `WindowOptions` for the pane a split creates, with its ID argument renamed.
+///
+/// `WindowOptions` calls the ID to assign `--window-id`, which reads correctly for `create-window`
+/// and wrongly here: this command's own `--window-id` names the pane being *split*, matching
+/// `close-pane` and `activate-pane`. Two arguments claiming one long name trip a clap debug
+/// assertion, so `split-pane` panicked in a debug build; a release build bound both to the target,
+/// which made the assigned ID unreachable from the CLI anyway. Renaming keeps both meanings, both
+/// spellings, and the wire shape.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct NewPaneOptions(WindowOptions);
+
+impl clap::Args for NewPaneOptions {
+    fn augment_args(command: clap::Command) -> clap::Command {
+        rename_assigned_window_id(WindowOptions::augment_args(command))
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        rename_assigned_window_id(WindowOptions::augment_args_for_update(command))
+    }
+}
+
+impl clap::FromArgMatches for NewPaneOptions {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        WindowOptions::from_arg_matches(matches).map(Self)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches(matches)
+    }
+}
+
+/// Present the assigned-ID argument as `--new-window-id`, leaving every other option alone.
+fn rename_assigned_window_id(command: clap::Command) -> clap::Command {
+    command.mut_args(|argument| {
+        if argument.get_id() == "ipc_window_id" {
+            argument.long("new-window-id").short(None)
+        } else {
+            argument
+        }
+    })
 }
 
 #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
@@ -304,6 +371,18 @@ enum NameTarget {
 struct NameContextMenu {
     target: NameTarget,
     anchor: PhysicalPosition<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecoveryMenu {
+    pane: WindowId,
+    anchor: PhysicalPosition<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LaunchMenu {
+    anchor: PhysicalPosition<f64>,
+    selected: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -408,11 +487,92 @@ impl NameEditor {
     }
 }
 
+/// Proof that the panes of the active tab have just been placed under the chrome.
+///
+/// Revealing a pane re-attaches it to the chrome at whatever position the pane already holds, and
+/// a hidden pane is detached from the chrome, so it keeps the absolute position it had when it
+/// was last on screen and nothing moves it while it stays hidden. Once the chrome has moved
+/// without it — the system relocating windows for a display change across a sleep/wake is the
+/// case that bites — revealing that pane before placing it attaches it at the stale offset, and
+/// it floats outside the chrome until some later reveal happens to find it in the right place.
+/// Requiring this token keeps placement-before-reveal a property the compiler checks.
+#[derive(Clone, Copy)]
+struct PanePlacement;
+
+/// Virtual display for `--headless`: standard geometry at unit scale, per the automation plan.
+const HEADLESS_WIDTH: u32 = 1920;
+const HEADLESS_HEIGHT: u32 = 1080;
+const HEADLESS_SCALE: f64 = 1.0;
+
+/// Whichever loop drives the shell: a visible winit event loop or the offscreen headless loop.
+///
+/// Threaded through topology changes exactly like `&ActiveEventLoop` was, so headed callers
+/// pass `ShellLoop::Winit(event_loop)` and headless code passes `ShellLoop::Headless(headless)`.
+#[derive(Clone, Copy)]
+enum ShellLoop<'a> {
+    Winit(&'a ActiveEventLoop),
+    Headless(&'a HeadlessLoop),
+}
+
+impl ShellLoop<'_> {
+    fn exit(self) {
+        match self {
+            Self::Winit(event_loop) => event_loop.exit(),
+            Self::Headless(headless) => LoopHandle::Headless(headless).exit(),
+        }
+    }
+}
+
+/// Pane host for `--headless`: Vivido windows with no native parent, sized explicitly.
+///
+/// Position is meaningless offscreen; size drives each pane's grid and PTY through the same
+/// automation-geometry handshake headed resizes use.
+struct HeadlessPaneHost;
+
+impl HeadlessPaneHost {
+    fn create_pane(
+        &self,
+        processor: &mut Processor,
+        headless: &HeadlessLoop,
+        options: WindowOptions,
+    ) -> Result<WindowId, Box<dyn Error>> {
+        let mut options = options;
+        options.parent_window = None;
+        options.no_activate = true;
+        processor.create_hosted_pane(LoopHandle::Headless(headless), options)
+    }
+
+    fn move_pane(
+        &self,
+        processor: &mut Processor,
+        headless: &HeadlessLoop,
+        pane_id: WindowId,
+        rect: PhysicalRect,
+    ) {
+        let _ = processor.resize_headless_window(
+            LoopHandle::Headless(headless),
+            pane_id,
+            winit::dpi::PhysicalSize::new(rect.width.max(1), rect.height.max(1)),
+        );
+    }
+
+    fn reveal(&self, processor: &mut Processor, pane_id: WindowId, visible: bool) {
+        if let Some(pane) = processor.window_mut(pane_id) {
+            pane.set_automation_visible(visible);
+        }
+    }
+
+    fn is_attached(&self, processor: &Processor, pane_id: WindowId) -> bool {
+        processor.window(pane_id).is_some()
+    }
+}
+
 struct Shell {
     config: UiConfig,
     _terminfo: vivido::tty::TerminfoGuard,
     terminal_options: TerminalOptions,
     processor: Processor,
+    event_sink: EventSink,
     _automation_registry: RegistryGuard,
     chrome_window: Option<Arc<Window>>,
     chrome_renderer: Option<ChromeRenderer>,
@@ -421,17 +581,34 @@ struct Shell {
     settings_menu_renderer: Option<SettingsMenuRenderer>,
     settings_menu_id: Option<WindowId>,
     settings_menu_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
+    settings_menu_hover: Option<SettingsMenuItem>,
+    last_gear_click: Option<Instant>,
+    shortcuts_window: Option<Arc<Window>>,
+    shortcuts_renderer: Option<ShortcutsRenderer>,
+    shortcuts_id: Option<WindowId>,
+    shortcuts_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
+    shortcuts_open: bool,
+    shortcuts_scroll: f64,
+    shortcuts_cursor: Option<PhysicalPosition<f64>>,
+    shortcuts_hover_close: bool,
     rename_editor_window: Option<Arc<Window>>,
     rename_editor_renderer: Option<RenameEditorRenderer>,
     rename_editor_id: Option<WindowId>,
     chrome_layout: ChromeLayout,
     chrome_hits: ChromeHitMap,
+    split_drag: Option<SplitDrag<(WorkspaceId, TabId)>>,
+    split_pointer_down: bool,
+    split_hovered_pane: Option<WindowId>,
     cursor_position: Option<PhysicalPosition<f64>>,
     modifiers: ModifiersState,
     sidebar_mode: SidebarMode,
     hovered_workspace: Option<WorkspaceId>,
     settings_menu_open: bool,
+    update_available: bool,
     name_context_menu: Option<NameContextMenu>,
+    recovery_menu: Option<RecoveryMenu>,
+    launch_menu: Option<LaunchMenu>,
+    launch_entries: Option<Vec<LaunchEntry>>,
     name_editor: Option<NameEditor>,
     workspaces: Vec<Workspace>,
     active_workspace: Option<WorkspaceId>,
@@ -467,14 +644,19 @@ impl Shell {
         let automation_paths = SessionPaths::for_session(&automation_name)?;
         automation_paths.prepare_endpoint(&automation_name)?;
         options.automation_name = Some(automation_name.clone());
+        // A pane here is a hosted Vivido window, but its space and tab belong to Vivida — so
+        // Vivida, not Vivido, is the runtime the agent mesh addresses it through. Two strings;
+        // Vivida links no mesh crate and opens no store.
+        // SAFETY: no thread has been started yet; the IPC listener is spawned below.
+        unsafe { vivido::binary::session::scrub_inherited_mesh_environment() };
+        vivido::binary::session::publish_runtime_kind("vivida");
+        vivido::binary::session::publish_instance_name(&automation_name);
+        vivido::binary::session::start_mesh_watcher();
         options.socket = Some(automation_paths.socket.clone());
 
         let terminfo = vivido::tty::setup_env();
-        let _listener = IoListener::spawn(
-            &config,
-            &options,
-            vivido::EventSink::Winit(event_loop.create_proxy()),
-        )?;
+        let event_sink = EventSink::Winit(event_loop.create_proxy());
+        let _listener = IoListener::spawn(&config, &options, event_sink.clone())?;
         let automation_registry = automation_paths.register(&automation_name, (1, 1), false)?;
         let mut processor = Processor::new(config.clone(), options, event_loop);
         processor.claim_ipc_method_capabilities(&[
@@ -504,11 +686,105 @@ impl Shell {
                 }
             })
             .unwrap_or(current_dir);
-        Ok(Self {
+        Ok(Self::base_shell(
+            config,
+            terminfo,
+            terminal_options,
+            processor,
+            event_sink,
+            automation_registry,
+            launch_cwd,
+        ))
+    }
+
+    /// Build an offscreen shell: headless processor, registered endpoint, no windows.
+    ///
+    /// The caller owns the headless loop and event channel (mirroring how `new` leaves the
+    /// winit event loop outside `Shell`): create the initial workspace with
+    /// `initialize_headless`, then drive everything with the pump loop in `main`.
+    fn new_headless(
+        terminal_options: TerminalOptions,
+        session: String,
+        event_sink: EventSink,
+    ) -> Result<Self, Box<dyn Error>> {
+        // The shell owns creation and lifetime for every terminal pane.
+        let mut options = vivido::cli::Options::default();
+        options.daemon = true;
+        let mut config = load_shell_config(&mut options);
+        config.ipc_socket = Some(true);
+
+        let automation_name = session;
+        let automation_paths = SessionPaths::for_session(&automation_name)?;
+        automation_paths.prepare_endpoint(&automation_name)?;
+        options.automation_name = Some(automation_name.clone());
+        // A pane here is a hosted Vivido window, but its space and tab belong to Vivida — so
+        // Vivida, not Vivido, is the runtime the agent mesh addresses it through. Two strings;
+        // Vivida links no mesh crate and opens no store.
+        // SAFETY: no thread has been started yet; the IPC listener is spawned below.
+        unsafe { vivido::binary::session::scrub_inherited_mesh_environment() };
+        vivido::binary::session::publish_runtime_kind("vivida");
+        vivido::binary::session::publish_instance_name(&automation_name);
+        vivido::binary::session::start_mesh_watcher();
+        options.socket = Some(automation_paths.socket.clone());
+
+        let terminfo = vivido::tty::setup_env();
+        let _listener = IoListener::spawn(&config, &options, event_sink.clone())?;
+        let automation_registry = automation_paths.register(&automation_name, (1, 1), true)?;
+        let mut processor = Processor::new_headless(config.clone(), options, event_sink.clone());
+        processor.claim_ipc_method_capabilities(&[
+            MethodCapability::host("create_window", MethodClass::Window, true),
+            MethodCapability::host("vivida_layout", MethodClass::Observe, false),
+            MethodCapability::host("vivida_resolve_pane", MethodClass::Observe, false),
+            MethodCapability::host("vivida_activate_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_create_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_create_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_split_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_pane", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_close_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_rename_workspace", MethodClass::Window, true),
+            MethodCapability::host("vivida_rename_tab", MethodClass::Window, true),
+            MethodCapability::host("vivida_reset_tab_title", MethodClass::Window, true),
+        ]);
+        let current_dir = std::env::current_dir()?;
+        let launch_cwd = terminal_options
+            .working_directory
+            .as_ref()
+            .map(|cwd| {
+                if cwd.is_absolute() {
+                    cwd.clone()
+                } else {
+                    current_dir.join(cwd)
+                }
+            })
+            .unwrap_or(current_dir);
+        Ok(Self::base_shell(
+            config,
+            terminfo,
+            terminal_options,
+            processor,
+            event_sink,
+            automation_registry,
+            launch_cwd,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn base_shell(
+        config: UiConfig,
+        terminfo: vivido::tty::TerminfoGuard,
+        terminal_options: TerminalOptions,
+        processor: Processor,
+        event_sink: EventSink,
+        automation_registry: RegistryGuard,
+        launch_cwd: PathBuf,
+    ) -> Self {
+        Self {
             config,
             _terminfo: terminfo,
             terminal_options,
             processor,
+            event_sink,
             _automation_registry: automation_registry,
             chrome_window: None,
             chrome_renderer: None,
@@ -517,17 +793,34 @@ impl Shell {
             settings_menu_renderer: None,
             settings_menu_id: None,
             settings_menu_embedded_size: None,
+            settings_menu_hover: None,
+            last_gear_click: None,
+            shortcuts_window: None,
+            shortcuts_renderer: None,
+            shortcuts_id: None,
+            shortcuts_embedded_size: None,
+            shortcuts_open: false,
+            shortcuts_scroll: 0.0,
+            shortcuts_cursor: None,
+            shortcuts_hover_close: false,
             rename_editor_window: None,
             rename_editor_renderer: None,
             rename_editor_id: None,
             chrome_layout: ChromeLayout::default(),
             chrome_hits: ChromeHitMap::default(),
+            split_drag: None,
+            split_pointer_down: false,
+            split_hovered_pane: None,
             cursor_position: None,
             modifiers: ModifiersState::empty(),
             sidebar_mode: SidebarMode::default(),
             hovered_workspace: None,
             settings_menu_open: false,
+            update_available: false,
             name_context_menu: None,
+            recovery_menu: None,
+            launch_menu: None,
+            launch_entries: None,
             name_editor: None,
             workspaces: Vec::new(),
             active_workspace: None,
@@ -546,7 +839,7 @@ impl Shell {
             embedded_touch_capture: HashMap::new(),
             #[cfg(target_os = "linux")]
             embedded_focused_pane: None,
-        })
+        }
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
@@ -562,7 +855,7 @@ impl Shell {
                 .with_min_inner_size(LogicalSize::new(640.0, 160.0))
                 // A transparent pane must composite through the host's content region to the desktop.
                 // The chrome renderer still paints the sidebar and tab strip as opaque rectangles.
-                .with_transparent(self.config.window_opacity() < 1.0)
+                .with_transparent(chrome::chrome_requires_transparency(&self.config))
                 // Pane and renderer initialization can take several seconds on a cold GPU cache.
                 // Keep the unpainted native window off screen until its children are ready.
                 .with_visible(false),
@@ -579,7 +872,7 @@ impl Shell {
         self.chrome_renderer = Some(chrome_renderer);
         if !self.restore_session(event_loop) {
             let launch_cwd = self.launch_cwd.clone();
-            self.create_workspace(event_loop, launch_cwd)?;
+            self.create_workspace(ShellLoop::Winit(event_loop), launch_cwd)?;
         }
         self.sync_visibility_and_geometry();
 
@@ -588,7 +881,9 @@ impl Shell {
         }
 
         self.initialize_settings_menu(event_loop)?;
+        self.initialize_shortcuts_window(event_loop)?;
         self.initialize_rename_editor(event_loop)?;
+        self.processor.start_quiet_update_check();
 
         if let Some(chrome) = &self.chrome_window {
             chrome.set_visible(true);
@@ -596,6 +891,28 @@ impl Shell {
         self.request_chrome_redraw();
         self.focus_active_pane();
         Ok(())
+    }
+
+    /// Start the offscreen shell with one workspace, mirroring headed startup without chrome.
+    ///
+    /// Session restore stays headed-only: a headless instance is fresh hermetic state, and no
+    /// update checks run from CI.
+    fn initialize_headless(&mut self, headless: &HeadlessLoop) -> Result<(), Box<dyn Error>> {
+        let handle = ShellLoop::Headless(headless);
+        let launch_cwd = self.launch_cwd.clone();
+        self.create_workspace(handle, launch_cwd)?;
+        self.after_topology_change(handle);
+        if !self.active_panes_have_headless_host() {
+            return Err("a Vivido pane was not attached to the headless host".into());
+        }
+        Ok(())
+    }
+
+    fn active_panes_have_headless_host(&self) -> bool {
+        let host = HeadlessPaneHost;
+        self.pane_index
+            .keys()
+            .all(|pane| host.is_attached(&self.processor, *pane))
     }
 
     fn restore_session(&mut self, event_loop: &ActiveEventLoop) -> bool {
@@ -611,7 +928,8 @@ impl Shell {
             for saved_tab in saved_workspace.tabs {
                 let mut panes = BTreeMap::new();
                 for (pane_id, cwd) in saved_tab.pane_cwds {
-                    let Ok(window_id) = self.create_pane_window(event_loop, &cwd) else {
+                    let Ok(window_id) = self.create_pane_window(ShellLoop::Winit(event_loop), &cwd)
+                    else {
                         continue;
                     };
                     self.pane_index.insert(
@@ -682,37 +1000,66 @@ impl Shell {
 
     fn create_pane_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         cwd: &Path,
     ) -> Result<WindowId, Box<dyn Error>> {
-        let chrome = Arc::clone(
-            self.chrome_window
-                .as_ref()
-                .ok_or("chrome window is not initialized")?,
-        );
-        NativePaneHost::new(chrome).create_pane(
-            &mut self.processor,
-            event_loop,
-            cwd,
-            &self.terminal_options,
-        )
+        match handle {
+            ShellLoop::Winit(event_loop) => {
+                let chrome = Arc::clone(
+                    self.chrome_window
+                        .as_ref()
+                        .ok_or("chrome window is not initialized")?,
+                );
+                NativePaneHost::new(chrome).create_pane(
+                    &mut self.processor,
+                    event_loop,
+                    cwd,
+                    &self.terminal_options,
+                )
+            }
+            ShellLoop::Headless(headless) => {
+                let mut options = WindowOptions::default();
+                options.terminal_options = self.terminal_options.clone();
+                options.terminal_options.working_directory = Some(cwd.to_owned());
+                HeadlessPaneHost.create_pane(&mut self.processor, headless, options)
+            }
+        }
     }
 
     fn create_pane_window_with_options(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         options: WindowOptions,
     ) -> Result<WindowId, Box<dyn Error>> {
-        let chrome = Arc::clone(
-            self.chrome_window
-                .as_ref()
-                .ok_or("chrome window is not initialized")?,
-        );
-        NativePaneHost::new(chrome).create_pane_with_options(
-            &mut self.processor,
-            event_loop,
-            options,
-        )
+        match handle {
+            ShellLoop::Winit(event_loop) => {
+                let chrome = Arc::clone(
+                    self.chrome_window
+                        .as_ref()
+                        .ok_or("chrome window is not initialized")?,
+                );
+                NativePaneHost::new(chrome).create_pane_with_options(
+                    &mut self.processor,
+                    event_loop,
+                    options,
+                )
+            }
+            ShellLoop::Headless(headless) => {
+                HeadlessPaneHost.create_pane(&mut self.processor, headless, options)
+            }
+        }
+    }
+
+    /// Re-sync geometry and visibility after a topology change, then refresh focus affordances.
+    ///
+    /// Chrome calls are no-ops without a chrome window, so headed and headless share this tail.
+    fn after_topology_change(&mut self, handle: ShellLoop<'_>) {
+        match handle {
+            ShellLoop::Winit(_) => self.sync_visibility_and_geometry(),
+            ShellLoop::Headless(headless) => self.sync_headless_visibility_and_geometry(headless),
+        }
+        self.focus_active_pane();
+        self.request_chrome_redraw();
     }
 
     fn platform_window_id(&self, ipc_window_id: u64) -> Option<WindowId> {
@@ -902,10 +1249,11 @@ impl Shell {
 
     fn create_workspace(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         cwd: PathBuf,
     ) -> Result<WorkspaceId, Box<dyn Error>> {
-        let pane_window_id = self.create_pane_window(event_loop, &cwd)?;
+        self.end_split_drag();
+        let pane_window_id = self.create_pane_window(handle, &cwd)?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id += 1;
         let label = unique_name(
@@ -926,9 +1274,7 @@ impl Shell {
         self.workspaces.push(workspace);
         self.active_workspace = Some(workspace_id);
         self.closing_workspaces.remove(&workspace_id);
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         Ok(workspace_id)
     }
 
@@ -954,6 +1300,7 @@ impl Shell {
     }
 
     fn switch_workspace(&mut self, workspace_id: WorkspaceId) {
+        self.end_split_drag();
         if self.active_workspace == Some(workspace_id)
             || !self
                 .workspaces
@@ -969,10 +1316,26 @@ impl Shell {
         self.request_chrome_redraw();
     }
 
-    fn create_tab(&mut self, event_loop: &ActiveEventLoop) {
-        let cwd = self.active_pane_cwd();
-        let Ok(window_id) = self.create_pane_window(event_loop, &cwd) else {
-            return;
+    fn create_tab(&mut self, handle: ShellLoop<'_>) {
+        self.create_tab_with_options(handle, None);
+    }
+
+    /// Add a tab to the active workspace, optionally running something other than the shell.
+    fn create_tab_with_options(&mut self, handle: ShellLoop<'_>, options: Option<WindowOptions>) {
+        self.end_split_drag();
+        let window = match options {
+            Some(options) => self.create_pane_window_with_options(handle, options),
+            None => {
+                let cwd = self.active_pane_cwd();
+                self.create_pane_window(handle, &cwd)
+            }
+        };
+        let window_id = match window {
+            Ok(window_id) => window_id,
+            Err(error) => {
+                eprintln!("failed to create tab: {error}");
+                return;
+            }
         };
         let Some(workspace) = self.active_workspace_mut() else {
             return;
@@ -988,23 +1351,21 @@ impl Shell {
                 pane_id: PaneId(1),
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
-    fn switch_tab(&mut self, tab_id: TabId) {
+    fn switch_tab(&mut self, handle: ShellLoop<'_>, tab_id: TabId) {
+        self.end_split_drag();
         if self
             .active_workspace_mut()
             .is_some_and(|workspace| workspace.switch_tab(tab_id))
         {
-            self.sync_visibility_and_geometry();
-            self.focus_active_pane();
-            self.request_chrome_redraw();
+            self.after_topology_change(handle);
         }
     }
 
     fn close_active_pane(&mut self) {
+        self.end_split_drag();
         let window_id = self
             .active_workspace()
             .and_then(Workspace::active_tab)
@@ -1016,7 +1377,8 @@ impl Shell {
         }
     }
 
-    fn close_workspace(&mut self, workspace_id: WorkspaceId) {
+    fn close_workspace(&mut self, handle: ShellLoop<'_>, workspace_id: WorkspaceId) {
+        self.end_split_drag();
         let Some(index) = self
             .workspaces
             .iter()
@@ -1051,12 +1413,11 @@ impl Shell {
                 }
             }
         }
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
-    fn split_active_pane(&mut self, event_loop: &ActiveEventLoop, axis: Axis) {
+    fn split_active_pane(&mut self, handle: ShellLoop<'_>, axis: Axis) {
+        self.end_split_drag();
         let Some(workspace) = self.active_workspace() else {
             return;
         };
@@ -1070,10 +1431,13 @@ impl Shell {
         let Some(rect) = self.pane_rects.get(&focused_window).copied() else {
             return;
         };
-        let scale = self
-            .chrome_window
-            .as_ref()
-            .map_or(1.0, |window| window.scale_factor());
+        let scale = match handle {
+            ShellLoop::Winit(_) => self
+                .chrome_window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor()),
+            ShellLoop::Headless(_) => HEADLESS_SCALE,
+        };
         let enough_room = match axis {
             Axis::Horizontal => {
                 rect.width >= (chrome::MIN_PANE_WIDTH_LOGICAL * 2.0 * scale).round() as u32
@@ -1091,7 +1455,7 @@ impl Shell {
             .window(focused_window)
             .and_then(|pane| pane.current_directory())
             .unwrap_or_else(|| workspace.identity_cwd.clone());
-        let Ok(window_id) = self.create_pane_window(event_loop, &cwd) else {
+        let Ok(window_id) = self.create_pane_window(handle, &cwd) else {
             return;
         };
 
@@ -1117,9 +1481,7 @@ impl Shell {
                 pane_id,
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
     fn creation_result(
@@ -1146,9 +1508,10 @@ impl Shell {
 
     fn host_create_workspace(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         params: CreateWorkspaceOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let CreateWorkspaceOptions { name, mut options } = params;
         let cwd = options
             .terminal_options
@@ -1167,7 +1530,7 @@ impl Shell {
             )
         };
         let window_id = self
-            .create_pane_window_with_options(event_loop, options)
+            .create_pane_window_with_options(handle, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace_id = WorkspaceId(self.next_workspace_id);
         self.next_workspace_id = self.next_workspace_id.saturating_add(1);
@@ -1183,17 +1546,16 @@ impl Shell {
                 pane_id: PaneId(1),
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         self.creation_result(window_id)
     }
 
     fn host_create_tab(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         params: CreateTabOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let CreateTabOptions {
             workspace_id,
             workspace_name,
@@ -1220,7 +1582,7 @@ impl Shell {
             options.terminal_options.working_directory = Some(default_cwd);
         }
         let window_id = self
-            .create_pane_window_with_options(event_loop, options)
+            .create_pane_window_with_options(handle, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace = self
             .workspaces
@@ -1245,17 +1607,16 @@ impl Shell {
                 pane_id: PaneId(1),
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         self.creation_result(window_id)
     }
 
     fn host_split_pane(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        handle: ShellLoop<'_>,
         params: SplitPaneOptions,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let target = self.platform_window_id(params.window_id).ok_or_else(|| {
             vivido::host::IpcError::new("window_not_found", "target pane not found")
         })?;
@@ -1267,12 +1628,12 @@ impl Shell {
             .window(target)
             .and_then(|pane| pane.current_directory())
             .unwrap_or_else(|| self.launch_cwd.clone());
-        let mut options = params.options;
+        let mut options = params.options.0;
         if options.terminal_options.working_directory.is_none() {
             options.terminal_options.working_directory = Some(cwd);
         }
         let window_id = self
-            .create_pane_window_with_options(event_loop, options)
+            .create_pane_window_with_options(handle, options)
             .map_err(|error| vivido::host::IpcError::new("invalid_params", error.to_string()))?;
         let workspace = self
             .workspaces
@@ -1304,13 +1665,12 @@ impl Shell {
                 pane_id,
             },
         );
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
         self.creation_result(window_id)
     }
 
     fn request_close_panes(&mut self, panes: &[WindowId]) -> Result<(), vivido::host::IpcError> {
+        self.end_split_drag();
         for window_id in panes {
             let pane = self.processor.window_mut(*window_id).ok_or_else(|| {
                 vivido::host::IpcError::new("window_not_found", "target pane not found")
@@ -1340,8 +1700,10 @@ impl Shell {
 
     fn host_close_tab(
         &mut self,
+        handle: ShellLoop<'_>,
         target: TabTarget,
     ) -> Result<serde_json::Value, vivido::host::IpcError> {
+        self.end_split_drag();
         let caller = self.caller_key(target.from_window_id)?;
         let workspace_id = self.resolve_workspace_id(
             target.workspace_id,
@@ -1376,8 +1738,7 @@ impl Shell {
             workspace.active_tab = next.id;
         }
         self.request_close_panes(&panes)?;
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
+        self.after_topology_change(handle);
         Ok(
             serde_json::json!({"accepted": true, "workspace_id": workspace_id.0, "tab_id": tab_id.0}),
         )
@@ -1482,8 +1843,12 @@ impl Shell {
             .find(|tab| tab.id == tab_id)
             .ok_or_else(|| vivido::host::IpcError::new("window_not_found", "tab not found"))?;
         tab.reset_title();
-        workspace.refresh_tab_display_titles();
-        let title = workspace
+        self.refresh_tab_titles();
+        let title = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("the reset workspace exists")
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
@@ -1627,10 +1992,11 @@ impl Shell {
             .chrome_window
             .as_ref()
             .map_or(1.0, |chrome| chrome.scale_factor());
+        // Headless has no chrome window to be hidden: visibility is the model hierarchy.
         let chrome_visible = self
             .chrome_window
             .as_ref()
-            .is_some_and(|chrome| chrome.is_visible() != Some(false));
+            .is_none_or(|chrome| chrome.is_visible() != Some(false));
         let workspaces = self
             .workspaces
             .iter()
@@ -1759,6 +2125,7 @@ impl Shell {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        self.end_split_drag();
         if self.sidebar_mode == mode {
             return;
         }
@@ -1768,11 +2135,66 @@ impl Shell {
     }
 
     fn sync_visibility_and_geometry(&mut self) {
-        self.sync_pane_visibility();
-        self.sync_pane_geometry();
+        let placed = self.sync_pane_geometry();
+        self.sync_pane_visibility(placed);
     }
 
-    fn sync_pane_visibility(&mut self) {
+    /// Offscreen equivalent of `sync_visibility_and_geometry` on the virtual display.
+    ///
+    /// Pane rects come from the same split-tree engine over the full virtual display; sizes
+    /// are applied to the headless windows explicitly since no compositor delivers resizes,
+    /// and visibility flips only the automation flag.
+    fn sync_headless_visibility_and_geometry(&mut self, headless: &HeadlessLoop) {
+        let content = PhysicalRect {
+            x: 0,
+            y: 0,
+            width: HEADLESS_WIDTH,
+            height: HEADLESS_HEIGHT,
+        };
+        // Layout, resolve, and neighbor queries read the chrome content rect: point it at the
+        // virtual display so headless reports real geometry through the same code.
+        self.chrome_layout.content = content;
+        let placements = self
+            .active_workspace()
+            .and_then(|workspace| {
+                workspace.active_tab().map(|tab| {
+                    compute_rects(&tab.root, content, HEADLESS_SCALE)
+                        .into_iter()
+                        .filter_map(|(pane_id, rect)| {
+                            tab.panes.get(&pane_id).map(|window_id| (*window_id, rect))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        let active = self.active_workspace;
+        let closing = &self.closing_workspaces;
+        let visibility = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace.tabs.iter().flat_map(move |tab| {
+                    tab.panes.values().copied().map(move |window_id| {
+                        let visible = Some(workspace.id) == active
+                            && tab.id == workspace.active_tab
+                            && !closing.contains(&workspace.id);
+                        (window_id, visible)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        self.pane_rects.clear();
+        let host = HeadlessPaneHost;
+        for (window_id, rect) in placements {
+            host.move_pane(&mut self.processor, headless, window_id, rect);
+            self.pane_rects.insert(window_id, rect);
+        }
+        for (window_id, visible) in visibility {
+            host.reveal(&mut self.processor, window_id, visible);
+        }
+    }
+
+    fn sync_pane_visibility(&mut self, _placed: PanePlacement) {
         let active = self.active_workspace;
         let closing = &self.closing_workspaces;
         let visibility = self
@@ -1801,18 +2223,233 @@ impl Shell {
         NativePaneHost::new(chrome).reveal(&mut self.processor, window_id, visible);
     }
 
-    fn sync_pane_geometry(&mut self) {
-        let Some(chrome) = &self.chrome_window else {
+    fn end_split_drag(&mut self) {
+        if self.split_drag.take().is_some() {
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn split_context(&self) -> Option<((WorkspaceId, TabId), &layout::Node)> {
+        let workspace = self.active_workspace()?;
+        let tab = workspace.active_tab()?;
+        Some(((workspace.id, tab.id), &tab.root))
+    }
+
+    fn split_context_mut(&mut self) -> Option<((WorkspaceId, TabId), &mut layout::Node)> {
+        let workspace = self.active_workspace_mut()?;
+        let workspace_id = workspace.id;
+        let tab = workspace.active_tab_mut()?;
+        Some(((workspace_id, tab.id), &mut tab.root))
+    }
+
+    fn hovered_split(&self, position: PhysicalPosition<f64>) -> Option<layout::SplitDivider> {
+        if self.settings_menu_open
+            || self.shortcuts_open
+            || self.name_editor.is_some()
+            || self.name_context_menu.is_some()
+            || self.launch_menu.is_some()
+            || self.recovery_menu.is_some()
+        {
+            return None;
+        }
+        let (_, root) = self.split_context()?;
+        let scale = self.chrome_window.as_ref()?.scale_factor();
+        let layout = layout::compute_split_layout(root, self.chrome_layout.content, scale);
+        divider_at(&layout.dividers, position, scale).cloned()
+    }
+
+    fn split_cursor(&self, position: PhysicalPosition<f64>) -> Option<CursorIcon> {
+        self.split_drag
+            .as_ref()
+            .map(|drag| divider_cursor(drag.axis()))
+            .or_else(|| {
+                self.hovered_split(position)
+                    .map(|divider| divider_cursor(divider.axis))
+            })
+    }
+
+    fn split_highlight(&self) -> Option<PhysicalRect> {
+        self.split_drag
+            .as_ref()
+            .and_then(SplitDrag::highlight)
+            .or_else(|| {
+                self.cursor_position
+                    .and_then(|position| self.hovered_split(position))
+                    .map(|divider| divider.rect)
+            })
+    }
+
+    fn move_split_drag(&mut self, position: PhysicalPosition<f64>, restore: bool) {
+        let Some(mut drag) = self.split_drag.take() else {
             return;
+        };
+        let area = self.chrome_layout.content;
+        let Some(scale) = self
+            .chrome_window
+            .as_ref()
+            .map(|window| window.scale_factor())
+        else {
+            return;
+        };
+        let valid = if let Some((owner, root)) = self.split_context_mut() {
+            if restore {
+                drag.restore(&owner, root, area, scale)
+            } else {
+                drag.update(&owner, root, area, scale, position)
+            }
+        } else {
+            false
+        };
+        if valid && !restore {
+            self.split_drag = Some(drag);
+        }
+        self.sync_pane_geometry();
+        self.request_chrome_redraw();
+    }
+
+    /// Consume a divider's complete pointer sequence before routing any input into terminals.
+    fn handle_split_event(&mut self, window_id: WindowId, event: &WindowEvent) -> bool {
+        let chrome_event = Some(window_id) == self.chrome_id;
+        if let WindowEvent::CursorMoved { position, .. } = event
+            && !self.split_pointer_down
+        {
+            let point = if chrome_event {
+                Some(*position)
+            } else {
+                self.pane_rects.get(&window_id).map(|rect| {
+                    PhysicalPosition::new(
+                        position.x + f64::from(rect.x),
+                        position.y + f64::from(rect.y),
+                    )
+                })
+            };
+            if let Some(point) = point {
+                let previous_highlight = self.split_highlight();
+                self.cursor_position = Some(point);
+                if previous_highlight != self.split_highlight() {
+                    self.request_chrome_redraw();
+                }
+                let cursor = self.split_cursor(point);
+                if (chrome_event || cursor.is_none() || self.split_hovered_pane != Some(window_id))
+                    && let Some(previous) = self.split_hovered_pane.take()
+                    && let Some(pane) = self.processor.window_mut(previous)
+                {
+                    pane.display.window.set_mouse_cursor(CursorIcon::Text);
+                }
+                if !chrome_event && let Some(cursor) = cursor {
+                    if let Some(pane) = self.processor.window_mut(window_id) {
+                        pane.display.window.set_mouse_cursor(cursor);
+                        self.split_hovered_pane = Some(window_id);
+                    }
+                    return true;
+                }
+            }
+        }
+        match drag_event(event, chrome_event, self.split_pointer_down) {
+            DragEvent::End => {
+                self.split_drag = None;
+                self.request_chrome_redraw();
+                false
+            }
+            DragEvent::Restore => {
+                self.move_split_drag(PhysicalPosition::new(0.0, 0.0), true);
+                true
+            }
+            DragEvent::Move(position) => {
+                let point = if chrome_event {
+                    Some(position)
+                } else {
+                    self.pane_rects.get(&window_id).map(|rect| {
+                        PhysicalPosition::new(
+                            position.x + f64::from(rect.x),
+                            position.y + f64::from(rect.y),
+                        )
+                    })
+                };
+                if let Some(point) = point {
+                    self.cursor_position = Some(point);
+                    self.move_split_drag(point, false);
+                }
+                true
+            }
+            DragEvent::Release => {
+                self.split_drag = None;
+                self.split_pointer_down = false;
+                self.request_chrome_redraw();
+                if let Some(position) = self.cursor_position {
+                    self.update_chrome_cursor(position);
+                }
+                if self
+                    .chrome_window
+                    .as_ref()
+                    .is_some_and(|window| window.has_focus())
+                {
+                    self.focus_active_pane();
+                }
+                true
+            }
+            DragEvent::Start => {
+                // A fresh press also clears a capture whose release happened outside this app.
+                self.split_pointer_down = false;
+                self.split_drag = None;
+                if (!chrome_event && !self.pane_rects.contains_key(&window_id))
+                    || self.settings_menu_open
+                    || self.shortcuts_open
+                    || self.name_editor.is_some()
+                    || self.name_context_menu.is_some()
+                    || self.launch_menu.is_some()
+                    || self.recovery_menu.is_some()
+                {
+                    return false;
+                }
+                let (Some(position), Some(chrome)) =
+                    (self.cursor_position, self.chrome_window.as_ref())
+                else {
+                    return false;
+                };
+                let Some((owner, root)) = self.split_context() else {
+                    return false;
+                };
+                self.split_drag = SplitDrag::begin(
+                    owner,
+                    root,
+                    self.chrome_layout.content,
+                    chrome.scale_factor(),
+                    position,
+                );
+                if self.split_drag.is_none() {
+                    return false;
+                }
+                self.split_pointer_down = true;
+                chrome.focus_window();
+                self.update_chrome_cursor(position);
+                self.request_chrome_redraw();
+                true
+            }
+            DragEvent::Swallow => true,
+            DragEvent::Pass => false,
+        }
+    }
+
+    fn sync_pane_geometry(&mut self) -> PanePlacement {
+        let Some(chrome) = &self.chrome_window else {
+            return PanePlacement;
         };
         let size = chrome.inner_size();
         let scale = chrome.scale_factor();
         self.chrome_layout = compute_chrome_layout(size, scale, self.sidebar_mode);
+        if self.split_drag.as_ref().is_some_and(|drag| {
+            self.split_context().is_none_or(|(owner, root)| {
+                !drag.valid(&owner, root, self.chrome_layout.content, scale)
+            })
+        }) {
+            self.split_drag = None;
+        }
         let Some(workspace) = self.active_workspace() else {
-            return;
+            return PanePlacement;
         };
         let Some(tab) = workspace.active_tab() else {
-            return;
+            return PanePlacement;
         };
         let rects = compute_rects(&tab.root, self.chrome_layout.content, scale);
         let placements = tab
@@ -1827,33 +2464,66 @@ impl Shell {
             host.move_pane(&mut self.processor, window_id, rect);
             self.pane_rects.insert(window_id, rect);
         }
+        PanePlacement
     }
 
     fn resize_active_pane_layout(
         &mut self,
+        handle: ShellLoop<'_>,
         window_id: WindowId,
         width: u32,
         height: u32,
     ) -> Option<PhysicalRect> {
+        self.end_split_drag();
         let key = self.pane_index.get(&window_id).copied()?;
-        let scale = self.chrome_window.as_ref()?.scale_factor();
-        let content = self.chrome_layout.content;
+        let scale = match handle {
+            ShellLoop::Winit(_) => self.chrome_window.as_ref()?.scale_factor(),
+            ShellLoop::Headless(_) => HEADLESS_SCALE,
+        };
+        // Headless has no chrome window, so the split tree fills the virtual display.
+        let content = match handle {
+            ShellLoop::Winit(_) => self.chrome_layout.content,
+            ShellLoop::Headless(_) => PhysicalRect {
+                x: 0,
+                y: 0,
+                width: HEADLESS_WIDTH,
+                height: HEADLESS_HEIGHT,
+            },
+        };
         let workspace = self
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == key.workspace_id)?;
         let tab = workspace.tabs.iter_mut().find(|tab| tab.id == key.tab_id)?;
         resize_pane(&mut tab.root, key.pane_id, width, height, content, scale)?;
-        self.sync_pane_geometry();
+        match handle {
+            ShellLoop::Winit(_) => {
+                self.sync_pane_geometry();
+            }
+            ShellLoop::Headless(headless) => {
+                self.sync_headless_visibility_and_geometry(headless);
+            }
+        }
         self.pane_rects.get(&window_id).copied()
     }
 
     fn focus_active_pane(&mut self) {
+        if self.split_drag.is_some() {
+            return;
+        }
         let window_id = self
             .active_workspace()
             .and_then(Workspace::active_tab)
             .and_then(|tab| tab.focused_window_id());
         let Some(chrome) = self.chrome_window.as_ref().map(Arc::clone) else {
+            // Headless: track keyboard focus in the automation state instead of the OS.
+            if let Some(focused) = window_id {
+                for pane_id in self.pane_index.keys().copied().collect::<Vec<_>>() {
+                    if let Some(pane) = self.processor.window_mut(pane_id) {
+                        pane.set_automation_focused(pane_id == focused);
+                    }
+                }
+            }
             return;
         };
         if let Some(window_id) = window_id {
@@ -1903,6 +2573,7 @@ impl Shell {
     }
 
     fn activate_pane(&mut self, window_id: WindowId) -> bool {
+        self.end_split_drag();
         if !self.select_pane(window_id) {
             return false;
         }
@@ -1921,7 +2592,6 @@ impl Shell {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn focused_pane_id(&self) -> Option<WindowId> {
         self.active_workspace()
             .and_then(Workspace::active_tab)
@@ -1938,7 +2608,9 @@ impl Shell {
         {
             return None;
         }
-        if (self.name_context_menu.is_some()
+        if ((self.name_context_menu.is_some()
+            || self.recovery_menu.is_some()
+            || self.launch_menu.is_some())
             && self
                 .chrome_hits
                 .context_menu
@@ -1997,8 +2669,18 @@ impl Shell {
         ) else {
             return;
         };
-        chrome.set_cursor(state.cursor);
-        chrome.set_cursor_visible(state.cursor_visible);
+        // Only the pane the pointer is actually over (or one it captured) owns the chrome's
+        // cursor icon. Applying the focused pane's cursor unconditionally on every redraw would
+        // stomp the resize-border arrow the instant a terminal blink or other redraw fires while
+        // the pointer sits in the chrome's own resize gutter or tab strip.
+        let pointer_owns_cursor = self.embedded_pointer_capture == Some(window_id)
+            || self
+                .cursor_position
+                .is_some_and(|position| rect.contains(position.x, position.y));
+        if pointer_owns_cursor {
+            chrome.set_cursor(state.cursor);
+            chrome.set_cursor_visible(state.cursor_visible);
+        }
         chrome.set_ime_allowed(state.ime_allowed);
         if let Some((position, size)) = state.ime_cursor_area {
             chrome.set_ime_cursor_area(
@@ -2011,7 +2693,7 @@ impl Shell {
         }
     }
 
-    fn reap_closed_panes(&mut self, event_loop: &ActiveEventLoop) {
+    fn reap_closed_panes(&mut self, handle: ShellLoop<'_>) {
         let closed = self
             .pane_index
             .keys()
@@ -2022,6 +2704,7 @@ impl Shell {
             return;
         }
 
+        self.end_split_drag();
         for window_id in closed {
             self.pane_rects.remove(&window_id);
             let Some(key) = self.pane_index.remove(&window_id) else {
@@ -2044,7 +2727,7 @@ impl Shell {
         }
 
         if self.workspaces.is_empty() {
-            event_loop.exit();
+            handle.exit();
             return;
         }
         if self.active_workspace.is_none_or(|active| {
@@ -2055,9 +2738,7 @@ impl Shell {
         }) {
             self.active_workspace = self.workspaces.first().map(|workspace| workspace.id);
         }
-        self.sync_visibility_and_geometry();
-        self.focus_active_pane();
-        self.request_chrome_redraw();
+        self.after_topology_change(handle);
     }
 
     fn remove_empty_workspace(&mut self, workspace_id: WorkspaceId) {
@@ -2084,9 +2765,23 @@ impl Shell {
                 &mut self.settings_menu_renderer,
                 self.settings_menu_embedded_size,
             )
-            && let Err(error) = renderer.render(size)
+            && let Err(error) = renderer.render(size, self.settings_menu_hover)
         {
             eprintln!("failed to render embedded settings menu: {error}");
+        }
+        if self.shortcuts_open
+            && self.shortcuts_window.is_none()
+            && let (Some(renderer), Some(size)) =
+                (&mut self.shortcuts_renderer, self.shortcuts_embedded_size)
+            && let Err(error) = renderer.render(
+                size,
+                ShortcutsRenderState {
+                    scroll: self.shortcuts_scroll,
+                    hovered_close: self.shortcuts_hover_close,
+                },
+            )
+        {
+            eprintln!("failed to render embedded shortcuts: {error}");
         }
         let mut embedded_frames = self
             .pane_rects
@@ -2124,21 +2819,50 @@ impl Shell {
                 ),
             });
         }
-        let context_menu = self.name_context_menu.map(|menu| ContextMenuRenderState {
-            anchor: menu.anchor,
-            automatic_title_action: match menu.target {
-                NameTarget::Workspace(_) => false,
-                NameTarget::Tab {
-                    workspace_id,
-                    tab_id,
-                } => self
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)
-                    .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == tab_id))
-                    .is_some_and(model::Tab::is_title_custom),
-            },
-        });
+        if self.shortcuts_open
+            && self.shortcuts_window.is_none()
+            && let Some(frame) = self
+                .shortcuts_renderer
+                .as_ref()
+                .and_then(ShortcutsRenderer::embedded_frame)
+        {
+            let panel = self.chrome_hits.shortcuts;
+            embedded_frames.push(EmbeddedFramePlacement {
+                frame,
+                origin: PhysicalPosition::new(
+                    u32::try_from(panel.x).unwrap_or_default(),
+                    u32::try_from(panel.y).unwrap_or_default(),
+                ),
+            });
+        }
+        let context_menu = self
+            .launch_menu
+            .map(|menu| ContextMenuRenderState {
+                anchor: menu.anchor,
+                recovery_actions: false,
+                reset_title: false,
+                launch_entries: self.launch_entries.as_deref(),
+                selected: menu.selected,
+            })
+            .or_else(|| {
+                self.recovery_menu
+                    .map(|menu| ContextMenuRenderState {
+                        anchor: menu.anchor,
+                        recovery_actions: true,
+                        reset_title: false,
+                        launch_entries: None,
+                        selected: None,
+                    })
+                    .or_else(|| {
+                        self.name_context_menu.map(|menu| ContextMenuRenderState {
+                            anchor: menu.anchor,
+                            recovery_actions: false,
+                            reset_title: matches!(menu.target, NameTarget::Tab { .. }),
+                            launch_entries: None,
+                            selected: None,
+                        })
+                    })
+            });
         let editor_display = self.name_editor.as_ref().map(NameEditor::display_value);
         let rename_editor = self
             .name_editor
@@ -2153,18 +2877,31 @@ impl Shell {
                 display_value,
                 error: editor.error.as_deref(),
             });
+        let split_highlight = self.split_highlight();
         let Some(renderer) = &mut self.chrome_renderer else {
             return;
         };
         match renderer.render(
             chrome.inner_size(),
             ChromeRenderState {
+                cursor: self.cursor_position,
+                split_highlight,
                 sidebar_mode: self.sidebar_mode,
                 workspaces: &self.workspaces,
                 active_workspace: self.active_workspace,
                 hovered_workspace: self.hovered_workspace,
                 fullscreen: chrome.fullscreen().is_some(),
+                #[cfg(target_os = "linux")]
+                maximized: chrome.is_maximized(),
                 settings_menu_open: self.settings_menu_open && self.settings_menu_window.is_none(),
+                settings_menu_hover: self.settings_menu_hover,
+                update_available: self.update_available,
+                shortcuts: (self.shortcuts_open && self.shortcuts_window.is_none()).then_some(
+                    ShortcutsRenderState {
+                        scroll: self.shortcuts_scroll,
+                        hovered_close: self.shortcuts_hover_close,
+                    },
+                ),
                 context_menu,
                 rename_editor,
                 embedded_frames: &embedded_frames,
@@ -2207,7 +2944,8 @@ impl Shell {
             .with_inner_size(LogicalSize::new(width, height))
             .with_resizable(false)
             .with_visible(false);
-        let Some(attributes) = settings_menu_window_attributes(chrome, attributes)? else {
+        let Some(attributes) = popup_window_attributes(chrome, attributes, PopupFocus::None)?
+        else {
             let size = LogicalSize::new(width, height).to_physical(chrome.scale_factor());
             self.settings_menu_renderer = Some(SettingsMenuRenderer::new_embedded(
                 size,
@@ -2226,6 +2964,220 @@ impl Shell {
         Ok(())
     }
 
+    fn initialize_shortcuts_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(chrome) = &self.chrome_window else {
+            return Ok(());
+        };
+        let (width, height) = shortcuts_logical_size();
+        let attributes = Window::default_attributes()
+            .with_title("vivida shortcuts")
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_resizable(false)
+            .with_visible(false);
+        let Some(attributes) = popup_window_attributes(chrome, attributes, PopupFocus::Keyboard)?
+        else {
+            let size = LogicalSize::new(width, height).to_physical(chrome.scale_factor());
+            self.shortcuts_renderer = Some(ShortcutsRenderer::new_embedded(
+                size,
+                &self.config,
+                chrome.scale_factor(),
+            )?);
+            self.shortcuts_embedded_size = Some(size);
+            return Ok(());
+        };
+        let window = Arc::new(event_loop.create_window(attributes)?);
+        let renderer =
+            ShortcutsRenderer::new(Arc::clone(&window), &self.config, window.scale_factor())?;
+        self.shortcuts_id = Some(window.id());
+        self.shortcuts_window = Some(window);
+        self.shortcuts_renderer = Some(renderer);
+        Ok(())
+    }
+
+    fn set_shortcuts_open(&mut self, open: bool) {
+        if self.shortcuts_open == open {
+            if open {
+                // Picking Shortcuts again raises and re-focuses the panel rather than doing
+                // nothing, which would look like the menu had failed.
+                self.sync_shortcuts_window();
+            }
+            return;
+        }
+        self.shortcuts_open = open;
+        // Closing after a focus transfer must not pull focus back from another pane or app.
+        let restore_focus = !open
+            && self
+                .shortcuts_window
+                .as_ref()
+                .is_none_or(|window| window.has_focus());
+        self.shortcuts_scroll = 0.0;
+        self.shortcuts_cursor = None;
+        self.shortcuts_hover_close = false;
+        self.sync_shortcuts_window();
+        if restore_focus {
+            self.focus_active_pane();
+        }
+        self.request_chrome_redraw();
+    }
+
+    fn sync_shortcuts_window(&self) {
+        let (Some(chrome), Some(window)) = (&self.chrome_window, &self.shortcuts_window) else {
+            return;
+        };
+        if self.shortcuts_open {
+            // Show before positioning, as the rename editor does: `position_popup` hands over the
+            // keyboard, which a window that is not on screen yet cannot accept.
+            set_popup_visible(window, true);
+            position_popup(
+                chrome,
+                window,
+                centered_popup_origin(chrome.inner_size(), window.inner_size()),
+                PopupFocus::Keyboard,
+            );
+            window.request_redraw();
+        } else {
+            set_popup_visible(window, false);
+        }
+    }
+
+    fn render_shortcuts(&mut self) {
+        let state = ShortcutsRenderState {
+            scroll: self.shortcuts_scroll,
+            hovered_close: self.shortcuts_hover_close,
+        };
+        let (Some(window), Some(renderer)) = (&self.shortcuts_window, &mut self.shortcuts_renderer)
+        else {
+            return;
+        };
+        match renderer.render(window.inner_size(), state) {
+            Ok(true) => (),
+            Ok(false) => window.request_redraw(),
+            Err(error) => eprintln!("failed to render shortcuts: {error}"),
+        }
+    }
+
+    /// Height of the shortcuts list actually on screen, which the scroll offset is clamped to.
+    fn shortcuts_viewport(&self) -> (f64, f64) {
+        let (size, scale) = match &self.shortcuts_window {
+            Some(window) => (window.inner_size(), window.scale_factor()),
+            None => {
+                let scale = self
+                    .chrome_window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor());
+                match self.shortcuts_embedded_size {
+                    Some(size) => (size, scale),
+                    None => return (0.0, 0.0),
+                }
+            }
+        };
+        let header = shortcuts_header_height(scale);
+        let viewport = f64::from(size.height) - header;
+        (shortcuts_content_height(scale), viewport.max(0.0))
+    }
+
+    /// Whether an in-chrome shortcuts panel is open under the pointer.
+    fn shortcuts_over_chrome(&self) -> bool {
+        self.shortcuts_open
+            && self.shortcuts_window.is_none()
+            && self
+                .cursor_position
+                .is_some_and(|cursor| self.chrome_hits.shortcuts.contains(cursor.x, cursor.y))
+    }
+
+    /// Panel rect the shortcuts pointer is hit-tested against, in that surface's own coordinates.
+    fn shortcuts_panel(&self) -> Option<(PhysicalRect, f64)> {
+        match &self.shortcuts_window {
+            Some(window) => {
+                let size = window.inner_size();
+                Some((
+                    PhysicalRect {
+                        x: 0,
+                        y: 0,
+                        width: size.width,
+                        height: size.height,
+                    },
+                    window.scale_factor(),
+                ))
+            }
+            // The in-chrome fallback is hit-tested against the chrome's own map instead.
+            None => (self.chrome_hits.shortcuts.height > 0).then(|| {
+                (
+                    self.chrome_hits.shortcuts,
+                    self.chrome_window
+                        .as_ref()
+                        .map_or(1.0, |window| window.scale_factor()),
+                )
+            }),
+        }
+    }
+
+    fn hover_shortcuts_close(&mut self) {
+        let hovered = match (self.shortcuts_cursor, self.shortcuts_panel()) {
+            (Some(cursor), Some((panel, scale))) => {
+                shortcuts_close_rect(panel, scale).contains(cursor.x, cursor.y)
+            }
+            _ => false,
+        };
+        if self.shortcuts_hover_close == hovered {
+            return;
+        }
+        self.shortcuts_hover_close = hovered;
+        match &self.shortcuts_window {
+            Some(window) => window.request_redraw(),
+            None => self.request_chrome_redraw(),
+        }
+    }
+
+    /// One wheel notch or arrow press moves the list by a row.
+    fn shortcuts_scroll_step(&self) -> f64 {
+        let scale = self
+            .shortcuts_window
+            .as_ref()
+            .or(self.chrome_window.as_ref())
+            .map_or(1.0, |window| window.scale_factor());
+        shortcuts_row_height(scale)
+    }
+
+    /// Drive an open shortcuts panel from the keyboard, reporting whether the key was consumed.
+    ///
+    /// An in-chrome panel shares the chrome's keyboard with the terminal panes underneath it, so
+    /// anything the panel does not use has to keep travelling to the focused pane.
+    fn handle_shortcuts_key(&mut self, key: PhysicalKey) -> bool {
+        if !self.shortcuts_open {
+            return false;
+        }
+        let (content, viewport) = self.shortcuts_viewport();
+        let step = self.shortcuts_scroll_step();
+        match key {
+            PhysicalKey::Code(KeyCode::Escape) => self.set_shortcuts_open(false),
+            PhysicalKey::Code(KeyCode::ArrowDown) => self.scroll_shortcuts(step),
+            PhysicalKey::Code(KeyCode::ArrowUp) => self.scroll_shortcuts(-step),
+            PhysicalKey::Code(KeyCode::PageDown) => self.scroll_shortcuts(viewport),
+            PhysicalKey::Code(KeyCode::PageUp) => self.scroll_shortcuts(-viewport),
+            PhysicalKey::Code(KeyCode::Home) => self.scroll_shortcuts(-content),
+            PhysicalKey::Code(KeyCode::End) => self.scroll_shortcuts(content),
+            _ => return false,
+        }
+        true
+    }
+
+    fn scroll_shortcuts(&mut self, delta: f64) {
+        let (content, viewport) = self.shortcuts_viewport();
+        let scroll = clamp_scroll(self.shortcuts_scroll + delta, content, viewport);
+        if (scroll - self.shortcuts_scroll).abs() < f64::EPSILON {
+            return;
+        }
+        self.shortcuts_scroll = scroll;
+        match &self.shortcuts_window {
+            Some(window) => window.request_redraw(),
+            None => self.request_chrome_redraw(),
+        }
+    }
+
     fn initialize_rename_editor(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -2239,7 +3191,8 @@ impl Shell {
             .with_inner_size(LogicalSize::new(width, height))
             .with_resizable(false)
             .with_visible(false);
-        let Some(attributes) = rename_editor_window_attributes(chrome, attributes)? else {
+        let Some(attributes) = popup_window_attributes(chrome, attributes, PopupFocus::Keyboard)?
+        else {
             return Ok(());
         };
         let window = Arc::new(event_loop.create_window(attributes)?);
@@ -2256,6 +3209,9 @@ impl Shell {
             return;
         }
         self.settings_menu_open = open;
+        if !open {
+            self.settings_menu_hover = None;
+        }
         self.sync_settings_menu_window();
         self.request_chrome_redraw();
     }
@@ -2283,14 +3239,162 @@ impl Shell {
     }
 
     fn open_name_context_menu(&mut self, target: NameTarget, anchor: PhysicalPosition<f64>) {
+        self.close_launch_menu();
+        self.close_recovery_menu();
         self.set_settings_menu_open(false);
         self.name_editor = None;
-        // Native terminal children sit above the chrome content surface. Keep a tab's primary
-        // Rename row wholly inside the tab strip so its click always reaches the chrome, including
+        // Native terminal children sit above the chrome content surface. Keep both tab actions
+        // wholly inside the tab strip so their clicks always reach the chrome, including
         // when the target tab is inactive.
         let anchor = name_context_anchor(target, anchor);
         self.name_context_menu = Some(NameContextMenu { target, anchor });
         self.request_chrome_redraw();
+    }
+
+    fn open_recovery_menu(&mut self, pane: WindowId) {
+        self.close_launch_menu();
+        self.close_recovery_menu();
+        self.set_settings_menu_open(false);
+        self.name_context_menu = None;
+        self.name_editor = None;
+        let anchor =
+            self.chrome_window
+                .as_ref()
+                .map_or(PhysicalPosition::new(0.0, 0.0), |window| {
+                    let size = window.inner_size();
+                    PhysicalPosition::new(f64::from(size.width) / 2.0, f64::from(size.height) / 3.0)
+                });
+        self.recovery_menu = Some(RecoveryMenu { pane, anchor });
+        self.set_native_pane_visibility(pane, false);
+        self.request_chrome_redraw();
+    }
+
+    fn close_recovery_menu(&mut self) {
+        if self.recovery_menu.take().is_some() {
+            self.sync_visibility_and_geometry();
+            self.focus_active_pane();
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn open_launch_menu(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            self.close_recovery_menu();
+            self.set_settings_menu_open(false);
+            self.name_context_menu = None;
+            self.close_name_editor();
+            let entries = self.launch_entries.get_or_insert_with(launch_entries);
+            if let Some(chrome) = &self.chrome_window {
+                let anchor = PhysicalPosition::new(
+                    self.chrome_hits.new_tab_menu.x,
+                    self.chrome_hits.new_tab_menu.bottom(),
+                );
+                match platform::show_launch_menu(chrome, entries, anchor) {
+                    Ok(Some(index)) => self.activate_launch_entry(event_loop, index),
+                    Ok(None) => self.focus_active_pane(),
+                    Err(error) => eprintln!("failed to show launch menu: {error}"),
+                }
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = event_loop;
+            if self.launch_menu.is_some() {
+                self.close_launch_menu();
+                return;
+            }
+            self.close_recovery_menu();
+            self.set_settings_menu_open(false);
+            self.name_context_menu = None;
+            self.name_editor = None;
+            let entries = self.launch_entries.get_or_insert_with(launch_entries);
+            if entries.is_empty() || self.chrome_hits.new_tab_menu.width == 0 {
+                return;
+            }
+            let anchor = PhysicalPosition::new(
+                f64::from(self.chrome_hits.new_tab_menu.x),
+                f64::from(self.chrome_hits.new_tab_menu.bottom()),
+            );
+            self.launch_menu = Some(LaunchMenu {
+                anchor,
+                selected: None,
+            });
+            #[cfg(target_os = "linux")]
+            self.clear_embedded_focus();
+            if let Some(chrome) = &self.chrome_window {
+                focus_chrome_input(chrome);
+            }
+            self.sync_visibility_and_geometry();
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn close_launch_menu(&mut self) {
+        if self.launch_menu.take().is_some() {
+            self.sync_visibility_and_geometry();
+            self.focus_active_pane();
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn activate_launch_entry(&mut self, event_loop: &ActiveEventLoop, index: usize) {
+        let action = self
+            .launch_entries
+            .as_ref()
+            .and_then(|entries| entries.get(index))
+            .map(|entry| entry.action.clone());
+        self.close_launch_menu();
+        if let Some(action) = action {
+            self.activate_launch_action(event_loop, action);
+        }
+    }
+
+    fn activate_launch_action(&mut self, event_loop: &ActiveEventLoop, action: LaunchAction) {
+        match action {
+            LaunchAction::NewTab(program) => {
+                let mut options = WindowOptions::default();
+                options.terminal_options = self.terminal_options.clone();
+                options.terminal_options.working_directory = Some(self.active_pane_cwd());
+                if let Some(program) = &program {
+                    options.terminal_options.set_command(program);
+                }
+                self.create_tab_with_options(ShellLoop::Winit(event_loop), Some(options));
+            }
+            LaunchAction::NewWindow => self.spawn_new_instance(),
+        }
+    }
+
+    fn spawn_new_instance(&self) {
+        let result = std::env::current_exe().and_then(|executable| {
+            std::process::Command::new(executable)
+                .args(std::env::args_os().skip(1))
+                .spawn()
+                .map(|_| ())
+        });
+        if let Err(error) = result {
+            eprintln!("failed to create Vivida window: {error}");
+        }
+    }
+
+    fn recover_pane(&mut self, pane: WindowId, restart: bool) {
+        let Some(ipc_window_id) = self
+            .processor
+            .window(pane)
+            .map(|window| window.ipc_window_id())
+        else {
+            self.close_recovery_menu();
+            return;
+        };
+        let result = if restart {
+            self.processor.restart_terminal(ipc_window_id)
+        } else {
+            self.processor.reset_terminal(ipc_window_id).map(|_| ())
+        };
+        if let Err(error) = result {
+            eprintln!("terminal recovery failed: {}", error.message);
+        }
+        self.close_recovery_menu();
     }
 
     fn start_name_editor(&mut self, target: NameTarget) {
@@ -2320,21 +3424,14 @@ impl Shell {
         self.clear_embedded_focus();
         if let (Some(chrome), Some(editor)) = (&self.chrome_window, &self.rename_editor_window) {
             editor.set_ime_allowed(true);
-            editor.set_visible(true);
-            let chrome_size = chrome.inner_size();
-            let editor_size = editor.inner_size();
-            let x = chrome_size.width.saturating_sub(editor_size.width) / 2;
-            let y = chrome_size.height.saturating_sub(editor_size.height) / 3;
-            position_rename_editor(
+            set_popup_visible(editor, true);
+            position_popup(
                 chrome,
                 editor,
-                PhysicalPosition::new(
-                    i32::try_from(x).unwrap_or_default(),
-                    i32::try_from(y).unwrap_or_default(),
-                ),
+                centered_popup_origin(chrome.inner_size(), editor.inner_size()),
+                PopupFocus::Keyboard,
             );
             editor.request_redraw();
-            editor.focus_window();
         } else if let Some(chrome) = &self.chrome_window {
             chrome.set_ime_allowed(true);
             focus_chrome_input(chrome);
@@ -2348,7 +3445,7 @@ impl Shell {
         }
         if let Some(editor) = &self.rename_editor_window {
             editor.set_ime_allowed(false);
-            editor.set_visible(false);
+            set_popup_visible(editor, false);
         }
         if let Some(chrome) = &self.chrome_window {
             chrome.set_ime_allowed(false);
@@ -2400,19 +3497,6 @@ impl Shell {
                 self.request_chrome_redraw();
             }
         }
-    }
-
-    fn reset_context_tab_title(&mut self, workspace_id: WorkspaceId, tab_id: TabId) {
-        let _ = self.host_reset_tab_title(TabTarget {
-            workspace_id: Some(workspace_id.0),
-            workspace_name: None,
-            tab_id: Some(tab_id.0),
-            tab_name: None,
-            from_window_id: None,
-        });
-        self.name_context_menu = None;
-        self.focus_active_pane();
-        self.request_chrome_redraw();
     }
 
     fn handle_name_editor_key(&mut self, event: &winit::event::KeyEvent) -> bool {
@@ -2535,32 +3619,82 @@ impl Shell {
                 .right()
                 .saturating_sub(i32::try_from(menu_width).unwrap_or(i32::MAX))
                 .max(0);
-            position_settings_menu(
+            position_popup(
                 chrome,
                 menu,
                 PhysicalPosition::new(x, self.chrome_hits.gear.bottom()),
+                PopupFocus::None,
             );
-            menu.set_visible(true);
+            set_popup_visible(menu, true);
             menu.request_redraw();
         } else {
-            menu.set_visible(false);
+            set_popup_visible(menu, false);
         }
     }
 
+    fn hover_settings_menu(&mut self, position: Option<PhysicalPosition<f64>>) {
+        let Some(window) = &self.settings_menu_window else {
+            return;
+        };
+        let hovered = position.and_then(|position| {
+            settings_menu_item_at(window.inner_size(), window.scale_factor(), position)
+        });
+        if self.settings_menu_hover != hovered {
+            self.settings_menu_hover = hovered;
+            window.request_redraw();
+        }
+    }
+
+    fn activate_settings_item(&mut self, event_loop: &ActiveEventLoop, item: SettingsMenuItem) {
+        match item {
+            SettingsMenuItem::Settings => self.open_config_in_editor(event_loop),
+            SettingsMenuItem::Shortcuts => self.set_shortcuts_open(true),
+            SettingsMenuItem::CheckForUpdates => request_update_check(&self.event_sink),
+            SettingsMenuItem::Documentation => platform::open_url(DOCUMENTATION_URL),
+        }
+    }
+
+    /// Open the Vivido configuration in the user's editor, in a tab of this window.
+    fn open_config_in_editor(&mut self, event_loop: &ActiveEventLoop) {
+        let path = self
+            .config
+            .config_paths
+            .first()
+            .cloned()
+            .or_else(vivido::config::installed_config)
+            .or_else(default_config_path);
+        let Some(path) = path else {
+            eprintln!("cannot locate a vivido.toml to edit");
+            return;
+        };
+        if let Err(error) = ensure_config_file(&path) {
+            eprintln!("failed to create {}: {error}", path.display());
+            return;
+        }
+        let mut options = WindowOptions::default();
+        options.terminal_options = self.terminal_options.clone();
+        options.terminal_options.working_directory = path.parent().map(Path::to_owned);
+        options
+            .terminal_options
+            .set_command(&editor_program(configured_editor().as_deref(), &path));
+        self.create_tab_with_options(ShellLoop::Winit(event_loop), Some(options));
+    }
+
     fn render_settings_menu(&mut self) {
+        let hovered = self.settings_menu_hover;
         let (Some(window), Some(renderer)) =
             (&self.settings_menu_window, &mut self.settings_menu_renderer)
         else {
             return;
         };
-        match renderer.render(window.inner_size()) {
+        match renderer.render(window.inner_size(), hovered) {
             Ok(true) => (),
             Ok(false) => window.request_redraw(),
             Err(error) => eprintln!("failed to render settings menu: {error}"),
         }
     }
 
-    fn drain_host_requests(&mut self, event_loop: &ActiveEventLoop) {
+    fn drain_host_requests(&mut self, handle: ShellLoop<'_>) {
         for request in self.processor.take_host_requests() {
             let result = match request.method.as_str() {
                 "create_window" => serde_json::from_value::<WindowOptions>(request.params.clone())
@@ -2569,7 +3703,7 @@ impl Shell {
                     })
                     .and_then(|options| {
                         self.host_create_tab(
-                            event_loop,
+                            handle,
                             CreateTabOptions {
                                 workspace_id: self.active_workspace.map(|id| id.0),
                                 workspace_name: None,
@@ -2623,21 +3757,21 @@ impl Shell {
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|options| self.host_create_workspace(event_loop, options))
+                        .and_then(|options| self.host_create_workspace(handle, options))
                 }
                 "vivida_create_tab" => {
                     serde_json::from_value::<CreateTabOptions>(request.params.clone())
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|params| self.host_create_tab(event_loop, params))
+                        .and_then(|params| self.host_create_tab(handle, params))
                 }
                 "vivida_split_pane" => {
                     serde_json::from_value::<SplitPaneOptions>(request.params.clone())
                         .map_err(|error| {
                             vivido::host::IpcError::new("invalid_params", error.to_string())
                         })
-                        .and_then(|params| self.host_split_pane(event_loop, params))
+                        .and_then(|params| self.host_split_pane(handle, params))
                 }
                 "vivida_close_pane" => {
                     serde_json::from_value::<WindowTarget>(request.params.clone())
@@ -2650,7 +3784,7 @@ impl Shell {
                     .map_err(|error| {
                         vivido::host::IpcError::new("invalid_params", error.to_string())
                     })
-                    .and_then(|target| self.host_close_tab(target)),
+                    .and_then(|target| self.host_close_tab(handle, target)),
                 "vivida_close_workspace" => serde_json::from_value::<WorkspaceTarget>(
                     request.params.clone(),
                 )
@@ -2663,7 +3797,7 @@ impl Shell {
                         None,
                         caller,
                     )?;
-                    self.close_workspace(workspace_id);
+                    self.close_workspace(handle, workspace_id);
                     Ok(serde_json::json!({"accepted": true, "workspace_id": workspace_id.0}))
                 }),
                 "vivida_rename_workspace" => {
@@ -2699,13 +3833,13 @@ impl Shell {
         }
     }
 
-    fn drain_shell_actions(&mut self, event_loop: &ActiveEventLoop) {
+    fn drain_shell_actions(&mut self, handle: ShellLoop<'_>) {
         for request in self.processor.take_shell_actions() {
             match request.action {
                 ShellAction::CreateTab(options) => {
                     if let Some(key) = self.pane_index.get(&request.source).copied() {
                         let _ = self.host_create_tab(
-                            event_loop,
+                            handle,
                             CreateTabOptions {
                                 workspace_id: Some(key.workspace_id.0),
                                 workspace_name: None,
@@ -2723,7 +3857,7 @@ impl Shell {
                         } else {
                             -1
                         };
-                        self.cycle_tab(direction);
+                        self.cycle_tab(handle, direction);
                     }
                 }
                 ShellAction::SelectTab(index) => {
@@ -2733,7 +3867,7 @@ impl Shell {
                             .and_then(|workspace| workspace.tabs.get(index))
                             .map(|tab| tab.id)
                     {
-                        self.switch_tab(tab_id);
+                        self.switch_tab(handle, tab_id);
                     }
                 }
                 ShellAction::SelectLastTab => {
@@ -2743,7 +3877,7 @@ impl Shell {
                             .and_then(|workspace| workspace.tabs.last())
                             .map(|tab| tab.id)
                     {
-                        self.switch_tab(tab_id);
+                        self.switch_tab(handle, tab_id);
                     }
                 }
                 ShellAction::Minimize => {
@@ -2776,7 +3910,7 @@ impl Shell {
                 ShellAction::Resize { width, height } => {
                     self.activate_pane(request.source);
                     if let Some(rect) =
-                        self.resize_active_pane_layout(request.source, width, height)
+                        self.resize_active_pane_layout(handle, request.source, width, height)
                         && let Some(chrome) = &self.chrome_window
                     {
                         let current = chrome.inner_size();
@@ -2823,9 +3957,44 @@ impl Shell {
         let Some(cursor) = self.cursor_position else {
             return false;
         };
+        if self.shortcuts_open && self.shortcuts_window.is_none() {
+            if self.shortcuts_hover_close {
+                self.set_shortcuts_open(false);
+                return true;
+            }
+            if self.chrome_hits.shortcuts.contains(cursor.x, cursor.y) {
+                return true;
+            }
+        }
         if self.name_editor.is_some() {
             if !self.chrome_hits.rename_editor.contains(cursor.x, cursor.y) {
                 self.close_name_editor();
+            }
+            return true;
+        }
+        if self.launch_menu.is_some() {
+            let item = self
+                .chrome_hits
+                .context_items
+                .iter()
+                .position(|rect| rect.contains(cursor.x, cursor.y));
+            if let Some(index) = item {
+                self.activate_launch_entry(event_loop, index);
+            } else {
+                self.close_launch_menu();
+            }
+            return true;
+        }
+        if let Some(menu) = self.recovery_menu {
+            let item = self
+                .chrome_hits
+                .context_items
+                .iter()
+                .position(|rect| rect.contains(cursor.x, cursor.y));
+            match item {
+                Some(0) => self.recover_pane(menu.pane, false),
+                Some(1) => self.recover_pane(menu.pane, true),
+                _ => self.close_recovery_menu(),
             }
             return true;
         }
@@ -2835,16 +4004,26 @@ impl Shell {
                 .context_items
                 .iter()
                 .position(|rect| rect.contains(cursor.x, cursor.y));
-            match item {
-                Some(0) => self.start_name_editor(menu.target),
-                Some(1) => {
-                    if let NameTarget::Tab {
+            match (menu.target, item) {
+                (target, Some(0)) => self.start_name_editor(target),
+                (
+                    NameTarget::Tab {
                         workspace_id,
                         tab_id,
-                    } = menu.target
-                    {
-                        self.reset_context_tab_title(workspace_id, tab_id);
+                    },
+                    Some(1),
+                ) => {
+                    self.name_context_menu = None;
+                    if let Err(error) = self.host_reset_tab_title(TabTarget {
+                        workspace_id: Some(workspace_id.0),
+                        workspace_name: None,
+                        tab_id: Some(tab_id.0),
+                        tab_name: None,
+                        from_window_id: None,
+                    }) {
+                        eprintln!("failed to reset tab title: {}", error.message);
                     }
+                    self.request_chrome_redraw();
                 }
                 _ => {
                     self.name_context_menu = None;
@@ -2855,7 +4034,14 @@ impl Shell {
         }
         if self.settings_menu_open {
             match settings_menu_click(&self.chrome_hits, cursor) {
-                SettingsMenuClick::Item(_) | SettingsMenuClick::Outside => {
+                SettingsMenuClick::Item(index) => {
+                    self.set_settings_menu_open(false);
+                    if let Some(item) = SettingsMenuItem::from_index(index) {
+                        self.activate_settings_item(event_loop, item);
+                    }
+                    return true;
+                }
+                SettingsMenuClick::Outside => {
                     self.set_settings_menu_open(false);
                     return true;
                 }
@@ -2872,15 +4058,20 @@ impl Shell {
             .split_horizontal
             .contains(cursor.x, cursor.y)
         {
-            self.split_active_pane(event_loop, Axis::Horizontal);
+            self.split_active_pane(ShellLoop::Winit(event_loop), Axis::Horizontal);
             return true;
         }
         if self.chrome_hits.split_vertical.contains(cursor.x, cursor.y) {
-            self.split_active_pane(event_loop, Axis::Vertical);
+            self.split_active_pane(ShellLoop::Winit(event_loop), Axis::Vertical);
             return true;
         }
         if self.chrome_hits.gear.contains(cursor.x, cursor.y) {
-            self.set_settings_menu_open(!self.settings_menu_open);
+            let now = Instant::now();
+            let toggle = gear_toggle_allowed(self.last_gear_click, now);
+            self.last_gear_click = Some(now);
+            if toggle {
+                self.set_settings_menu_open(!self.settings_menu_open);
+            }
             return true;
         }
         if let Some(action) = window_frame_action(&self.chrome_hits, cursor) {
@@ -2899,8 +4090,12 @@ impl Shell {
             }
             return true;
         }
+        if self.chrome_hits.new_tab_menu.contains(cursor.x, cursor.y) {
+            self.open_launch_menu(event_loop);
+            return true;
+        }
         if self.chrome_hits.new_tab.contains(cursor.x, cursor.y) {
-            self.create_tab(event_loop);
+            self.create_tab(ShellLoop::Winit(event_loop));
             return true;
         }
         if let Some(tab_id) = self
@@ -2909,7 +4104,7 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            self.switch_tab(tab_id);
+            self.switch_tab(ShellLoop::Winit(event_loop), tab_id);
             return true;
         }
         if let Some(workspace_id) = self
@@ -2918,12 +4113,12 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            self.close_workspace(workspace_id);
+            self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
             return true;
         }
         if self.chrome_hits.new_workspace.contains(cursor.x, cursor.y) {
             let cwd = self.active_pane_cwd();
-            if let Err(error) = self.create_workspace(event_loop, cwd) {
+            if let Err(error) = self.create_workspace(ShellLoop::Winit(event_loop), cwd) {
                 eprintln!("failed to create workspace: {error}");
             }
             return true;
@@ -2967,8 +4162,9 @@ impl Shell {
         let Some(chrome) = &self.chrome_window else {
             return;
         };
-        let icon = chrome_resize_direction(chrome, position)
-            .map(resize_cursor)
+        let icon = self
+            .split_cursor(position)
+            .or_else(|| chrome_resize_direction(chrome, position).map(resize_cursor))
             .unwrap_or(CursorIcon::Default);
         chrome.set_cursor(icon);
     }
@@ -3005,6 +4201,9 @@ impl Shell {
     }
 
     fn handle_chrome_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        if self.handle_launch_menu_key(event_loop, &event) {
+            return;
+        }
         if self.name_editor.is_none() && self.handle_shell_shortcut(event_loop, &event) {
             return;
         }
@@ -3039,16 +4238,30 @@ impl Shell {
             // Activating the top-level host gives its HWND keyboard focus. Restore focus to the
             // remembered terminal child so activation, task switching, and startup all type into
             // the pane rather than the chrome surface.
-            WindowEvent::Focused(true) => {
-                if self.name_editor.is_none() {
-                    self.focus_active_pane();
-                }
+            WindowEvent::Focused(true)
+                if self.name_editor.is_none()
+                    && self.launch_menu.is_none()
+                    && !self.shortcuts_open =>
+            {
+                self.focus_active_pane();
             }
             WindowEvent::Focused(false) => {
                 #[cfg(target_os = "linux")]
                 self.clear_embedded_focus();
-                self.set_settings_menu_open(false);
+                // A detached settings menu is its own window, so showing it can itself cost the
+                // chrome its focus. Let that popup dismiss on its own focus loss instead; only an
+                // in-chrome menu is bound to the chrome's focus.
+                if self.settings_menu_window.is_none() {
+                    self.set_settings_menu_open(false);
+                }
                 self.name_context_menu = None;
+                if self.launch_menu.take().is_some() {
+                    self.sync_visibility_and_geometry();
+                    self.request_chrome_redraw();
+                }
+                if self.recovery_menu.take().is_some() {
+                    self.sync_visibility_and_geometry();
+                }
                 if self.rename_editor_window.is_none() && self.name_editor.take().is_some() {
                     if let Some(chrome) = &self.chrome_window {
                         chrome.set_ime_allowed(false);
@@ -3063,9 +4276,29 @@ impl Shell {
             } => {
                 #[cfg(not(target_os = "linux"))]
                 let _ = device_id;
+                if self.chrome_hits.hovered_tab_action(self.cursor_position)
+                    != self.chrome_hits.hovered_tab_action(Some(position))
+                {
+                    self.request_chrome_redraw();
+                }
                 self.cursor_position = Some(position);
                 self.update_hovered_workspace(position);
                 self.update_chrome_cursor(position);
+                if self.shortcuts_open && self.shortcuts_window.is_none() {
+                    self.shortcuts_cursor = Some(position);
+                    self.hover_shortcuts_close();
+                }
+                if let Some(menu) = &mut self.launch_menu {
+                    let selected = self
+                        .chrome_hits
+                        .context_items
+                        .iter()
+                        .position(|rect| rect.contains(position.x, position.y));
+                    if menu.selected != selected {
+                        menu.selected = selected;
+                        self.request_chrome_redraw();
+                    }
+                }
                 #[cfg(target_os = "linux")]
                 {
                     let target = self
@@ -3126,7 +4359,19 @@ impl Shell {
                         self.open_name_context_menu(target, position);
                         return;
                     }
-                    if self.name_context_menu.take().is_some() || self.name_editor.is_some() {
+                    let closed_recovery = self.recovery_menu.is_some();
+                    let closed_launch = self.launch_menu.is_some();
+                    if closed_launch {
+                        self.close_launch_menu();
+                    }
+                    if closed_recovery {
+                        self.close_recovery_menu();
+                    }
+                    if self.name_context_menu.take().is_some()
+                        || closed_launch
+                        || closed_recovery
+                        || self.name_editor.is_some()
+                    {
                         self.close_name_editor();
                         self.request_chrome_redraw();
                         return;
@@ -3172,6 +4417,15 @@ impl Shell {
                 {
                     self.begin_chrome_drag_or_resize();
                 }
+            }
+            WindowEvent::MouseWheel {
+                device_id,
+                delta,
+                phase,
+            } if self.shortcuts_over_chrome() => {
+                let _ = (device_id, phase);
+                let step = self.shortcuts_scroll_step();
+                self.scroll_shortcuts(wheel_scroll_delta(delta, step));
             }
             WindowEvent::MouseWheel {
                 device_id,
@@ -3249,6 +4503,12 @@ impl Shell {
             {
                 self.set_settings_menu_open(false);
             }
+            // An in-chrome shortcuts panel has no window of its own to route keys and wheel
+            // events to, so the chrome drives it while it is open.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && self.shortcuts_window.is_none()
+                    && self.handle_shortcuts_key(event.physical_key) => {}
             WindowEvent::KeyboardInput {
                 device_id,
                 event,
@@ -3273,15 +4533,32 @@ impl Shell {
     }
 
     fn handle_shell_shortcut(&mut self, event_loop: &ActiveEventLoop, event: &WindowEvent) -> bool {
-        let WindowEvent::KeyboardInput { event, .. } = event else {
+        let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+        else {
             return false;
         };
-        if event.state != ElementState::Pressed || !shell_modifier_pressed(self.modifiers) {
+        if !shell_shortcut_press(event.state, *is_synthetic) {
+            return false;
+        }
+        if event.physical_key == PhysicalKey::Code(KeyCode::F12)
+            && self.modifiers.control_key()
+            && self.modifiers.shift_key()
+        {
+            if let Some(pane) = self.focused_pane_id() {
+                self.open_recovery_menu(pane);
+            }
+            return true;
+        }
+        if !shell_modifier_pressed(self.modifiers) {
             return false;
         }
         match event.physical_key {
             PhysicalKey::Code(KeyCode::KeyT) => {
-                self.create_tab(event_loop);
+                self.create_tab(ShellLoop::Winit(event_loop));
                 true
             }
             PhysicalKey::Code(KeyCode::KeyD) => {
@@ -3290,12 +4567,12 @@ impl Shell {
                 } else {
                     Axis::Horizontal
                 };
-                self.split_active_pane(event_loop, axis);
+                self.split_active_pane(ShellLoop::Winit(event_loop), axis);
                 true
             }
             PhysicalKey::Code(KeyCode::KeyN) if self.modifiers.shift_key() => {
                 let cwd = self.active_pane_cwd();
-                if let Err(error) = self.create_workspace(event_loop, cwd) {
+                if let Err(error) = self.create_workspace(ShellLoop::Winit(event_loop), cwd) {
                     eprintln!("failed to create workspace: {error}");
                 }
                 true
@@ -3306,7 +4583,7 @@ impl Shell {
             }
             PhysicalKey::Code(KeyCode::KeyW) if self.modifiers.shift_key() => {
                 if let Some(workspace_id) = self.active_workspace {
-                    self.close_workspace(workspace_id);
+                    self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
                 }
                 true
             }
@@ -3315,11 +4592,11 @@ impl Shell {
                 true
             }
             PhysicalKey::Code(KeyCode::BracketRight) if self.modifiers.shift_key() => {
-                self.cycle_tab(1);
+                self.cycle_tab(ShellLoop::Winit(event_loop), 1);
                 true
             }
             PhysicalKey::Code(KeyCode::BracketLeft) if self.modifiers.shift_key() => {
-                self.cycle_tab(-1);
+                self.cycle_tab(ShellLoop::Winit(event_loop), -1);
                 true
             }
             PhysicalKey::Code(code) => workspace_shortcut_index(code)
@@ -3332,7 +4609,45 @@ impl Shell {
         }
     }
 
-    fn cycle_tab(&mut self, direction: isize) {
+    fn handle_launch_menu_key(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) -> bool {
+        let Some(menu) = &mut self.launch_menu else {
+            return false;
+        };
+        let WindowEvent::KeyboardInput { event, .. } = event else {
+            return false;
+        };
+        if event.state != ElementState::Pressed {
+            return true;
+        }
+        let len = self.launch_entries.as_ref().map_or(0, Vec::len);
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_launch_menu(),
+            Key::Named(NamedKey::ArrowDown) if len > 0 => {
+                menu.selected = Some(menu.selected.map_or(0, |index| (index + 1) % len));
+                self.request_chrome_redraw();
+            }
+            Key::Named(NamedKey::ArrowUp) if len > 0 => {
+                menu.selected = Some(
+                    menu.selected
+                        .map_or(len - 1, |index| (index + len - 1) % len),
+                );
+                self.request_chrome_redraw();
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(index) = menu.selected {
+                    self.activate_launch_entry(event_loop, index);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn cycle_tab(&mut self, handle: ShellLoop<'_>, direction: isize) {
         let Some(workspace) = self.active_workspace() else {
             return;
         };
@@ -3349,7 +4664,7 @@ impl Shell {
         }
         let next = (index as isize + direction).rem_euclid(len as isize) as usize;
         let tab_id = workspace.tabs[next].id;
-        self.switch_tab(tab_id);
+        self.switch_tab(handle, tab_id);
     }
 
     fn refresh_tab_titles(&mut self) {
@@ -3361,8 +4676,13 @@ impl Shell {
                     if tab.is_title_custom() {
                         return None;
                     }
-                    let window = tab.window_id(tab.root.first_pane())?;
-                    let title = self.processor.window(window)?.title().to_owned();
+                    let window = tab.focused_window_id()?;
+                    let cwd = self
+                        .processor
+                        .window(window)?
+                        .display_directory()
+                        .unwrap_or_else(|| self.launch_cwd.clone());
+                    let title = directory_tab_title(&cwd);
                     Some((workspace.id, tab.id, title))
                 })
             })
@@ -3394,6 +4714,54 @@ enum WindowFrameAction {
     Close,
 }
 
+fn directory_tab_title(directory: &std::path::Path) -> String {
+    let path = directory.to_string_lossy();
+    // Handle both native Windows and WSL paths, including trailing separators.
+    let name = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    model::automatic_name(name, "root")
+}
+
+#[test]
+fn automatic_tab_labels_use_only_the_current_folder() {
+    for (path, expected) in [
+        (r"C:\Users\dev\project", "project"),
+        ("/home/dev/project/", "project"),
+        (r"\\wsl.localhost\Ubuntu\home\dev\project\", "project"),
+        ("/", "root"),
+        (r"C:\", "C:"),
+    ] {
+        assert_eq!(directory_tab_title(std::path::Path::new(path)), expected);
+    }
+}
+
+#[test]
+fn automatic_tab_label_follows_directory_changes_after_reset() {
+    let mut workspace = Workspace::new(
+        WorkspaceId(1),
+        "test".into(),
+        "/home/dev".into(),
+        WindowId::from(10),
+    );
+    for path in ["/home/dev/project", "/home/dev/another"] {
+        workspace.tabs[0].set_context_title(&directory_tab_title(Path::new(path)));
+        workspace.refresh_tab_display_titles();
+        assert_eq!(workspace.tabs[0].title, path.rsplit('/').next().unwrap());
+    }
+    workspace.tabs[0].set_custom_title("Pinned".into());
+    let changed = directory_tab_title(Path::new("/home/dev/third"));
+    workspace.tabs[0].set_context_title(&changed);
+    workspace.refresh_tab_display_titles();
+    assert_eq!(workspace.tabs[0].title, "Pinned");
+    workspace.tabs[0].reset_title();
+    workspace.tabs[0].set_context_title(&changed);
+    workspace.refresh_tab_display_titles();
+    assert_eq!(workspace.tabs[0].title, "third");
+}
+
 fn name_context_anchor(
     target: NameTarget,
     requested: PhysicalPosition<f64>,
@@ -3412,6 +4780,105 @@ fn translated_pane_position(
     PhysicalPosition::new(
         position.x - f64::from(rect.x),
         position.y - f64::from(rect.y),
+    )
+}
+
+const DOCUMENTATION_URL: &str = "https://vivido.dev/docs";
+
+/// Written into a Vivido configuration the shell had to create, so the editor never opens on an
+/// empty buffer with no hint of what belongs there.
+const CONFIG_STUB: &str = "# Vivido configuration.\n# Reference: https://vivido.dev/docs\n";
+
+/// Where a Vivido configuration belongs when the user has none yet.
+fn default_config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config"));
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        });
+    Some(base?.join("vivido").join("vivido.toml"))
+}
+
+fn ensure_config_file(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, CONFIG_STUB)
+}
+
+fn configured_editor() -> Option<String> {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|editor| !editor.trim().is_empty())
+}
+
+/// Editor command for `path`.
+///
+/// `editor` is split on whitespace rather than handed to a shell, so `EDITOR="code -w"` works
+/// without inheriting a shell's quoting rules.
+fn editor_program(editor: Option<&str>, path: &Path) -> Program {
+    let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+    let mut words = editor
+        .unwrap_or(fallback)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let program = if words.is_empty() {
+        fallback.to_owned()
+    } else {
+        words.remove(0)
+    };
+    words.push(path.to_string_lossy().into_owned());
+    Program::WithArgs {
+        program,
+        args: words,
+    }
+}
+
+/// Scroll distance a wheel event asks for. Winit reports upward scrolling as positive, while the
+/// list offset grows downward.
+fn wheel_scroll_delta(delta: MouseScrollDelta, step: f64) -> f64 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, lines) => -f64::from(lines) * step,
+        MouseScrollDelta::PixelDelta(position) => -position.y,
+    }
+}
+
+/// Keep a scroll offset inside a list, allowing none at all when the content already fits.
+fn clamp_scroll(offset: f64, content: f64, viewport: f64) -> f64 {
+    offset.clamp(0.0, (content - viewport).max(0.0))
+}
+
+/// A double-click on the gear must leave the menu open, so the repeat click is swallowed rather
+/// than toggling the menu shut again. A later, deliberate click still closes it.
+const GEAR_REPEAT_CLICK: Duration = Duration::from_millis(400);
+
+fn gear_toggle_allowed(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= GEAR_REPEAT_CLICK)
+}
+
+/// Origin, relative to the chrome's client area, that centres a popup horizontally and sets it a
+/// third of the way down. Shared by the rename editor and the shortcuts window.
+fn centered_popup_origin(
+    chrome: winit::dpi::PhysicalSize<u32>,
+    popup: winit::dpi::PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let x = chrome.width.saturating_sub(popup.width) / 2;
+    let y = chrome.height.saturating_sub(popup.height) / 3;
+    PhysicalPosition::new(
+        i32::try_from(x).unwrap_or_default(),
+        i32::try_from(y).unwrap_or_default(),
     )
 }
 
@@ -3499,6 +4966,21 @@ fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
     }
 }
 
+fn request_update_check(event_sink: &EventSink) {
+    let _ = event_sink.send_event(Event::new(
+        EventType::Update(UpdateEvent::CheckRequested),
+        None,
+    ));
+}
+
+fn update_availability(event: &EventType) -> Option<bool> {
+    match event {
+        EventType::Update(UpdateEvent::Available { .. }) => Some(true),
+        EventType::Update(UpdateEvent::UpToDate { .. } | UpdateEvent::Failed { .. }) => Some(false),
+        _ => None,
+    }
+}
+
 impl ApplicationHandler<Event> for Shell {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
@@ -3520,6 +5002,20 @@ impl ApplicationHandler<Event> for Shell {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(windows)]
+        if (Some(window_id) == self.chrome_id
+            || Some(window_id) == self.settings_menu_id
+            || Some(window_id) == self.shortcuts_id)
+            && let Some(events) = vivido::shell::touch_click_events(&event)
+        {
+            for event in events {
+                self.window_event(event_loop, window_id, event);
+            }
+            return;
+        }
+        if self.handle_split_event(window_id, &event) {
+            return;
+        }
         if Some(window_id) == self.rename_editor_id {
             match event {
                 WindowEvent::CloseRequested | WindowEvent::Focused(false) => {
@@ -3553,6 +5049,54 @@ impl ApplicationHandler<Event> for Shell {
             }
             return;
         }
+        if Some(window_id) == self.shortcuts_id {
+            match event {
+                WindowEvent::CloseRequested | WindowEvent::Focused(false) => {
+                    self.set_shortcuts_open(false);
+                }
+                WindowEvent::RedrawRequested => self.render_shortcuts(),
+                WindowEvent::Resized(size) => {
+                    if let Some(renderer) = &mut self.shortcuts_renderer {
+                        let scale = self
+                            .shortcuts_window
+                            .as_ref()
+                            .map_or(1.0, |window| window.scale_factor());
+                        renderer.resize(size, scale, &self.config);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    if let (Some(renderer), Some(window)) =
+                        (&mut self.shortcuts_renderer, &self.shortcuts_window)
+                    {
+                        renderer.resize(window.inner_size(), scale_factor, &self.config);
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.shortcuts_cursor = Some(position);
+                    self.hover_shortcuts_close();
+                }
+                WindowEvent::CursorLeft { .. } => {
+                    self.shortcuts_cursor = None;
+                    self.hover_shortcuts_close();
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let step = self.shortcuts_scroll_step();
+                    self.scroll_shortcuts(wheel_scroll_delta(delta, step));
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } if self.shortcuts_hover_close => self.set_shortcuts_open(false),
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed =>
+                {
+                    let _ = self.handle_shortcuts_key(event.physical_key);
+                }
+                _ => (),
+            }
+            return;
+        }
         if Some(window_id) == self.settings_menu_id {
             match event {
                 WindowEvent::CloseRequested => self.set_settings_menu_open(false),
@@ -3573,11 +5117,21 @@ impl ApplicationHandler<Event> for Shell {
                         renderer.resize(window.inner_size(), scale_factor, &self.config);
                     }
                 }
+                WindowEvent::Focused(false) => self.set_settings_menu_open(false),
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.hover_settings_menu(Some(position));
+                }
+                WindowEvent::CursorLeft { .. } => self.hover_settings_menu(None),
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } => self.set_settings_menu_open(false),
+                } => {
+                    if let Some(item) = self.settings_menu_hover {
+                        self.set_settings_menu_open(false);
+                        self.activate_settings_item(event_loop, item);
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed
                         && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
@@ -3617,8 +5171,35 @@ impl ApplicationHandler<Event> for Shell {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        #[cfg(target_os = "macos")]
+        if let Some(action) = macos_launch_action(&event) {
+            self.activate_launch_action(event_loop, action);
+            return;
+        }
+        let update_available = update_availability(event.payload());
+        if matches!(event.payload(), EventType::Shutdown) {
+            event_loop.exit();
+        }
+        let directory_may_have_changed = matches!(
+            event.payload(),
+            vivido::EventType::Terminal(
+                vivido::terminal::event::Event::WorkingDirectory(_)
+                    | vivido::terminal::event::Event::Wakeup
+            )
+        );
         self.processor
             .handle_winit_event(event_loop, WinitEvent::UserEvent(event));
+        if let Some(update_available) = update_available
+            && self.update_available != update_available
+        {
+            self.update_available = update_available;
+            self.request_chrome_redraw();
+        }
+        // Windows can keep dispatching PTY messages without reaching AboutToWait. Update
+        // labels on the report/wakeup itself so a cd does not wait for another UI action.
+        if directory_may_have_changed {
+            self.refresh_tab_titles();
+        }
         if self.processor.has_pending_embedded_redraw() {
             self.request_chrome_redraw();
         }
@@ -3627,12 +5208,12 @@ impl ApplicationHandler<Event> for Shell {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.processor
             .handle_winit_event(event_loop, WinitEvent::AboutToWait);
-        self.drain_shell_actions(event_loop);
-        self.drain_host_requests(event_loop);
+        self.drain_shell_actions(ShellLoop::Winit(event_loop));
+        self.drain_host_requests(ShellLoop::Winit(event_loop));
         if self.processor.has_pending_embedded_redraw() {
             self.request_chrome_redraw();
         }
-        self.reap_closed_panes(event_loop);
+        self.reap_closed_panes(ShellLoop::Winit(event_loop));
         self.refresh_tab_titles();
     }
 
@@ -3655,14 +5236,14 @@ impl ApplicationHandler<Event> for Shell {
 }
 
 fn load_shell_config(options: &mut vivido::cli::Options) -> UiConfig {
-    let mut config = vivido::config::load(options);
-
-    // Pane windows are embedded in vivida's own chrome, so only these two window-management
-    // settings are shell-owned. All visual settings, including opacity, come from the user's
-    // Vivido configuration.
-    config.window.decorations = Decorations::None;
-    config.window.resize_increments = false;
-    config
+    // Keep shell-owned window settings in the persistent overrides so config reloads also
+    // apply them to future tabs and splits. Visual settings still come from the user's config.
+    let overrides = vivido::cli::ParsedOptions::from_options(&[
+        "window.decorations = \"None\"".into(),
+        "window.resize_increments = false".into(),
+    ]);
+    options.config_options.extend_from_slice(&overrides);
+    vivido::config::load(options)
 }
 
 fn ordinal_index(ordinal: u64) -> Option<usize> {
@@ -3804,6 +5385,12 @@ fn layout_node_json(
     }
 }
 
+// Focus changes synthesize presses for held keys on Windows. Creating a pane moves focus, so
+// replaying those presses would run the shortcut again in the newly created pane.
+fn shell_shortcut_press(state: ElementState, is_synthetic: bool) -> bool {
+    state == ElementState::Pressed && !is_synthetic
+}
+
 fn workspace_shortcut_index(key_code: KeyCode) -> Option<usize> {
     match key_code {
         KeyCode::Digit1 => Some(0),
@@ -3815,6 +5402,18 @@ fn workspace_shortcut_index(key_code: KeyCode) -> Option<usize> {
         KeyCode::Digit7 => Some(6),
         KeyCode::Digit8 => Some(7),
         KeyCode::Digit9 => Some(8),
+        _ => None,
+    }
+}
+
+/// Creation belongs to the workspace shell even when chrome, rather than a pane, holds focus.
+#[cfg(target_os = "macos")]
+fn macos_launch_action(event: &Event) -> Option<LaunchAction> {
+    use vivido::{EventType, MacOsMenuCommand};
+
+    match event.payload() {
+        EventType::MacOsMenu(MacOsMenuCommand::NewWindow) => Some(LaunchAction::NewWindow),
+        EventType::MacOsMenu(MacOsMenuCommand::NewTab) => Some(LaunchAction::NewTab(None)),
         _ => None,
     }
 }
@@ -3916,11 +5515,23 @@ fn list_instances(options: ListOptions) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Linked with the windows subsystem, so a `msg` or `list` invocation from an existing
+    // console would otherwise print to nowhere. Attach first, mirroring vivido.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+
     let options = VividaOptions::parse();
     match options.command {
         Some(VividaCommand::Msg(options)) => return send_vivida_message(*options),
         Some(VividaCommand::List(options)) => return list_instances(options),
         None => {}
+    }
+    if options.headless {
+        return run_headless(options);
     }
     let mut builder = EventLoop::<Event>::with_user_event();
     configure_event_loop(&mut builder);
@@ -3930,11 +5541,145 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `--headless` entrypoint: offscreen split-tree host with a registered automation endpoint.
+///
+/// Blocks until quit; prints the endpoint first so CI can target this exact session.
+fn run_headless(options: VividaOptions) -> Result<(), Box<dyn Error>> {
+    let session = options
+        .session
+        .clone()
+        .unwrap_or_else(|| format!("vivida-{}", std::process::id()));
+    let (event_sink, events) = EventSink::headless();
+    let mut shell = Shell::new_headless(options.terminal_options, session.clone(), event_sink)?;
+    let headless = HeadlessLoop::new(
+        winit::dpi::PhysicalSize::new(HEADLESS_WIDTH, HEADLESS_HEIGHT),
+        HEADLESS_SCALE,
+    );
+    shell.initialize_headless(&headless)?;
+    let socket = SessionPaths::for_session(&session)?.socket;
+    println!(
+        "{}",
+        serde_json::json!({"session": session, "socket": socket})
+    );
+    run_headless_server(&mut shell, &events, &headless)
+}
+
+/// Drive an offscreen shell: pump the headless processor, then run Vivida dispatch.
+///
+/// Single-threaded, mirroring what winit's `about_to_wait` does for the headed shell.
+fn run_headless_server(
+    shell: &mut Shell,
+    events: &std::sync::mpsc::Receiver<Event>,
+    headless: &HeadlessLoop,
+) -> Result<(), Box<dyn Error>> {
+    while shell.processor.pump_headless(events, headless) {
+        let handle = ShellLoop::Headless(headless);
+        shell.drain_shell_actions(handle);
+        shell.drain_host_requests(handle);
+        shell.reap_closed_panes(handle);
+        shell.refresh_tab_titles();
+    }
+    shell.processor.finish_headless();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_file_menu_creation_routes_to_the_shell_without_a_focused_terminal() {
+        use vivido::{EventType, MacOsMenuCommand};
+
+        for (command, expected) in [
+            (MacOsMenuCommand::NewWindow, LaunchAction::NewWindow),
+            (MacOsMenuCommand::NewTab, LaunchAction::NewTab(None)),
+        ] {
+            let event = Event::new(EventType::MacOsMenu(command), None);
+            assert_eq!(macos_launch_action(&event), Some(expected));
+        }
+        for command in [
+            MacOsMenuCommand::Copy,
+            MacOsMenuCommand::Paste,
+            MacOsMenuCommand::Find,
+            MacOsMenuCommand::Clear,
+        ] {
+            let event = Event::new(EventType::MacOsMenu(command), None);
+            assert_eq!(macos_launch_action(&event), None);
+        }
+        assert_eq!(
+            macos_launch_action(&Event::new(EventType::HostWakeup, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn every_command_has_unambiguous_arguments() {
+        // `split-pane` shipped with two arguments claiming `--window-id`: its own pane target and
+        // the assigned ID flattened in from `WindowOptions`. clap only checks that under
+        // `debug_assertions`, so a release build silently bound both to the first. This asserts it
+        // for the whole CLI rather than one command, since any future flatten can repeat it.
+        use clap::CommandFactory;
+
+        VividaOptions::command().debug_assert();
+    }
+
+    #[test]
+    fn split_pane_names_the_target_and_the_new_pane_separately() {
+        let parsed = VividaOptions::try_parse_from([
+            "vivida",
+            "msg",
+            "split-pane",
+            "--window-id",
+            "7",
+            "--axis",
+            "horizontal",
+            "--new-window-id",
+            "500",
+        ])
+        .expect("split-pane accepts both IDs");
+
+        let Some(VividaCommand::Msg(message)) = parsed.command else {
+            panic!("expected a msg command");
+        };
+        let VividaMessage::SplitPane(options) = message.message else {
+            panic!("expected split-pane");
+        };
+
+        assert_eq!(
+            options.window_id, 7,
+            "--window-id names the pane being split"
+        );
+        assert_eq!(
+            options.options.0.ipc_window_id,
+            Some(500),
+            "--new-window-id names the pane the split creates"
+        );
+    }
+
+    #[test]
+    fn shell_panes_stay_frameless_after_config_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vivido.toml");
+        fs::write(&path, "[window]\nopacity = 0.42\n").unwrap();
+        let mut options = vivido::cli::Options::default();
+        options.config_file = Some(path.clone());
+        load_shell_config(&mut options);
+
+        fs::write(
+            &path,
+            "[window]\ndecorations = \"Full\"\nresize_increments = true\nopacity = 0.75\n",
+        )
+        .unwrap();
+        let config = vivido::config::reload(&path, &mut options).unwrap();
+
+        assert_eq!(config.window.decorations, Decorations::None);
+        assert!(!config.window.resize_increments);
+        assert!((config.window_opacity() - 0.75).abs() < f32::EPSILON);
+    }
 
     #[test]
     fn shell_loads_vivido_window_opacity() {
@@ -3961,6 +5706,24 @@ mod tests {
     fn windows_shell_shortcuts_use_control() {
         assert!(shell_modifier_pressed(ModifiersState::CONTROL));
         assert!(!shell_modifier_pressed(ModifiersState::SUPER));
+    }
+
+    #[test]
+    fn shortcut_runs_once_across_pane_focus_changes() {
+        let events = [
+            (ElementState::Pressed, false),
+            (ElementState::Released, true),
+            (ElementState::Pressed, true),
+            (ElementState::Released, false),
+        ];
+        assert_eq!(
+            events
+                .into_iter()
+                .filter(|&(state, synthetic)| shell_shortcut_press(state, synthetic))
+                .count(),
+            1
+        );
+        assert!(shell_shortcut_press(ElementState::Pressed, false));
     }
 
     #[cfg(target_os = "macos")]
@@ -4058,6 +5821,29 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_side_resize_targets_stay_outside_terminal_panes() {
+        let size = winit::dpi::PhysicalSize::new(1200, 800);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for sidebar in [
+                SidebarMode::Expanded,
+                SidebarMode::Compact,
+                SidebarMode::Hidden,
+            ] {
+                let layout = chrome::compute_chrome_layout(size, scale, sidebar);
+                for (x, direction) in [
+                    (5.0 * scale, ResizeDirection::West),
+                    (f64::from(size.width) - 5.0 * scale, ResizeDirection::East),
+                ] {
+                    let position = PhysicalPosition::new(x, 400.0);
+                    assert!(!layout.content.contains(position.x, position.y));
+                    assert_eq!(resize_direction_at(size, scale, position), Some(direction));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn resize_hit_regions_overlap_the_windows_padded_frame() {
         let size = winit::dpi::PhysicalSize::new(640, 480);
         assert_eq!(
@@ -4083,7 +5869,7 @@ mod tests {
                 x: 144,
                 y: 35,
                 width: 190,
-                height: 102,
+                height: 136,
             },
             settings_items: vec![
                 PhysicalRect {
@@ -4104,6 +5890,12 @@ mod tests {
                     width: 190,
                     height: 34,
                 },
+                PhysicalRect {
+                    x: 144,
+                    y: 137,
+                    width: 190,
+                    height: 34,
+                },
             ],
             ..ChromeHitMap::default()
         };
@@ -4120,12 +5912,177 @@ mod tests {
             SettingsMenuClick::Item(2)
         );
         assert_eq!(
+            settings_menu_click(&hit_map, PhysicalPosition::new(150.0, 145.0)),
+            SettingsMenuClick::Item(3)
+        );
+        assert_eq!(
             settings_menu_click(&hit_map, PhysicalPosition::new(310.0, 10.0)),
             SettingsMenuClick::Gear
         );
         assert_eq!(
             settings_menu_click(&hit_map, PhysicalPosition::new(20.0, 200.0)),
             SettingsMenuClick::Outside
+        );
+
+        // The hit map's row order is what maps a click onto an action.
+        assert_eq!(
+            SettingsMenuItem::from_index(0),
+            Some(SettingsMenuItem::Settings)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(1),
+            Some(SettingsMenuItem::Shortcuts)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(2),
+            Some(SettingsMenuItem::CheckForUpdates)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(3),
+            Some(SettingsMenuItem::Documentation)
+        );
+        assert_eq!(SettingsMenuItem::from_index(4), None);
+    }
+
+    #[test]
+    fn check_for_updates_settings_item_emits_a_manual_request() {
+        let (event_sink, receiver) = EventSink::headless();
+
+        request_update_check(&event_sink);
+
+        assert!(matches!(
+            receiver.recv().unwrap().payload(),
+            EventType::Update(UpdateEvent::CheckRequested)
+        ));
+    }
+
+    #[test]
+    fn parse_headless_options() {
+        let options =
+            VividaOptions::try_parse_from(["vivida", "--headless", "--session", "ci"]).unwrap();
+        assert!(options.headless);
+        assert_eq!(options.session, Some(String::from("ci")));
+        assert!(options.command.is_none());
+
+        // A session name only makes sense for a headless server.
+        assert!(VividaOptions::try_parse_from(["vivida", "--session", "ci"]).is_err());
+
+        let options = VividaOptions::try_parse_from(["vivida"]).unwrap();
+        assert!(!options.headless);
+        assert_eq!(options.session, None);
+    }
+
+    #[test]
+    fn update_results_drive_the_available_badge() {
+        let manifest: vivido::update::UpdateManifest = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "product": "vivido",
+            "version": "1.0.0",
+            "publishedUtc": "2026-09-18T00:00:00Z",
+            "notesUrl": null,
+            "asset": {
+                "name": "vivido.msi",
+                "url": "https://example.com/vivido.msi",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "bytes": 1,
+                "kind": "msi",
+                "publisher": "Vivido",
+                "teamId": null
+            }
+        }))
+        .unwrap();
+        let available = EventType::Update(UpdateEvent::Available {
+            version: manifest.version.clone(),
+            bytes: manifest.asset.bytes,
+            notes_url: None,
+            manifest: Box::new(manifest),
+            manual: false,
+        });
+        let current = EventType::Update(UpdateEvent::UpToDate {
+            current: vivido::update::current_version(),
+        });
+        let failed = EventType::Update(UpdateEvent::Failed {
+            message: "offline".into(),
+            manual: false,
+        });
+
+        assert_eq!(update_availability(&available), Some(true));
+        assert_eq!(update_availability(&current), Some(false));
+        assert_eq!(update_availability(&failed), Some(false));
+        assert_eq!(update_availability(&EventType::HostWakeup), None);
+    }
+
+    #[test]
+    fn a_repeat_gear_click_leaves_the_menu_open() {
+        let first = Instant::now();
+        assert!(gear_toggle_allowed(None, first));
+        // The second half of a double-click must not toggle the menu back shut.
+        assert!(!gear_toggle_allowed(
+            Some(first),
+            first + Duration::from_millis(120)
+        ));
+        // A later, deliberate click still closes it.
+        assert!(gear_toggle_allowed(
+            Some(first),
+            first + GEAR_REPEAT_CLICK + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn editor_program_falls_back_and_keeps_editor_arguments() {
+        let path = Path::new("/tmp/vivido.toml");
+        let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+
+        let Program::WithArgs { program, args } = editor_program(None, path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, fallback);
+        assert_eq!(args, vec![path.display().to_string()]);
+
+        let Program::WithArgs { program, args } = editor_program(Some("vim"), path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, "vim");
+        assert_eq!(args, vec![path.display().to_string()]);
+
+        // A configured editor may carry flags, and they must precede the path.
+        let Program::WithArgs { program, args } = editor_program(Some("code -w"), path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, "code");
+        assert_eq!(args, vec!["-w".to_owned(), path.display().to_string()]);
+
+        let Program::WithArgs { program, .. } = editor_program(Some("   "), path) else {
+            panic!("editor program must carry the path as an argument");
+        };
+        assert_eq!(program, fallback);
+    }
+
+    #[test]
+    fn scroll_stays_inside_the_list_and_stalls_when_it_fits() {
+        assert_eq!(clamp_scroll(-40.0, 600.0, 200.0), 0.0);
+        assert_eq!(clamp_scroll(120.0, 600.0, 200.0), 120.0);
+        assert_eq!(clamp_scroll(900.0, 600.0, 200.0), 400.0);
+        // Content shorter than the viewport must never scroll.
+        assert_eq!(clamp_scroll(50.0, 120.0, 400.0), 0.0);
+    }
+
+    #[test]
+    fn wheel_and_pixel_scrolling_move_the_list_the_same_way() {
+        assert_eq!(
+            wheel_scroll_delta(MouseScrollDelta::LineDelta(0.0, -2.0), 26.0),
+            52.0
+        );
+        assert_eq!(
+            wheel_scroll_delta(MouseScrollDelta::LineDelta(0.0, 1.0), 26.0),
+            -26.0
+        );
+        assert_eq!(
+            wheel_scroll_delta(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -18.0)),
+                26.0
+            ),
+            18.0
         );
     }
 

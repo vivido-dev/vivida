@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vivida"
+  short_description: "Control Vivida panes, tabs, and workspaces"
+  default_prompt: "Use $vivida to inspect and control another Vivida pane."
