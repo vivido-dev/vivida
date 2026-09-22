@@ -37,8 +37,8 @@ use model::{
 };
 use platform::{
     NativePaneHost, PaneHost, PopupFocus, RESIZE_EDGE_LOGICAL, configure_chrome_window,
-    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
-    position_popup, set_popup_visible,
+    configure_event_loop, confirm_close, confirm_workspace_close, finalize_chrome_window,
+    focus_chrome_input, popup_window_attributes, position_popup, set_popup_visible,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
@@ -4086,7 +4086,11 @@ impl Shell {
                         chrome.set_maximized(!chrome.is_maximized());
                     }
                 }
-                WindowFrameAction::Close => event_loop.exit(),
+                WindowFrameAction::Close => {
+                    if self.chrome_window.as_deref().is_some_and(confirm_close) {
+                        event_loop.exit();
+                    }
+                }
             }
             return true;
         }
@@ -4113,7 +4117,17 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
+            let confirmed = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .zip(self.chrome_window.as_deref())
+                .is_some_and(|(workspace, window)| {
+                    confirm_workspace_close(window, &workspace.label)
+                });
+            if confirmed {
+                self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
+            }
             return true;
         }
         if self.chrome_hits.new_workspace.contains(cursor.x, cursor.y) {
@@ -4208,7 +4222,11 @@ impl Shell {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.chrome_window.as_deref().is_some_and(confirm_close) {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(chrome) = &self.chrome_window {
                     finalize_chrome_window(chrome);

@@ -18,6 +18,16 @@ pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes
 }
 pub fn finalize_chrome_window(_window: &Window) {}
 
+// Linux currently has no native dialog dependency. Preserve the existing close behavior until
+// Vivida grows an in-chrome confirmation overlay that also works under Wayland.
+pub fn confirm_close(_window: &Window) -> bool {
+    true
+}
+
+pub fn confirm_workspace_close(_window: &Window, _workspace_name: &str) -> bool {
+    true
+}
+
 pub fn focus_chrome_input(window: &Window) {
     window.focus_window();
 }
