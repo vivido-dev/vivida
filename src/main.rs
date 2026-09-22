@@ -537,7 +537,12 @@ impl HeadlessPaneHost {
         options: WindowOptions,
     ) -> Result<WindowId, Box<dyn Error>> {
         let mut options = options;
-        options.parent_window = None;
+        // Clearing a parent only applies where vivido's `WindowOptions` carries one; Linux
+        // headless windows have no native-parent field at all.
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            options.parent_window = None;
+        }
         options.no_activate = true;
         processor.create_hosted_pane(LoopHandle::Headless(headless), options)
     }
