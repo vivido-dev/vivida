@@ -4162,13 +4162,22 @@ impl Shell {
         false
     }
 
-    fn begin_chrome_drag_or_resize(&mut self) {
+    fn begin_chrome_resize(&self) -> bool {
         let (Some(chrome), Some(cursor)) = (&self.chrome_window, self.cursor_position) else {
-            return;
+            return false;
         };
         if let Some(direction) = chrome_resize_direction(chrome, cursor) {
             let _ = chrome.drag_resize_window(direction);
-        } else if self.chrome_layout.tab_bar.contains(cursor.x, cursor.y) {
+            return true;
+        }
+        false
+    }
+
+    fn begin_chrome_drag(&mut self) {
+        let (Some(chrome), Some(cursor)) = (&self.chrome_window, self.cursor_position) else {
+            return;
+        };
+        if self.chrome_layout.tab_bar.contains(cursor.x, cursor.y) {
             let now = Instant::now();
             let is_double_click = self.last_title_click.is_some_and(|(at, position)| {
                 now.duration_since(at) <= Duration::from_millis(500)
@@ -4408,6 +4417,14 @@ impl Shell {
                         return;
                     }
                 }
+                // The frame controls extend to the window edge. Give resize drags the border
+                // before any chrome control (including Close) can claim the same press.
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && self.begin_chrome_resize()
+                {
+                    return;
+                }
                 #[cfg(target_os = "linux")]
                 {
                     if state == ElementState::Pressed
@@ -4446,7 +4463,7 @@ impl Shell {
                     && button == MouseButton::Left
                     && !self.handle_chrome_click(event_loop)
                 {
-                    self.begin_chrome_drag_or_resize();
+                    self.begin_chrome_drag();
                 }
             }
             WindowEvent::MouseWheel {
@@ -5847,6 +5864,24 @@ mod tests {
         assert_eq!(
             resize_direction_at(size, 1.0, PhysicalPosition::new(320.0, 240.0)),
             None
+        );
+    }
+
+    #[test]
+    fn top_right_resize_border_overlaps_the_close_button() {
+        let size = winit::dpi::PhysicalSize::new(640, 480);
+        let close = PhysicalRect {
+            x: 590,
+            y: 0,
+            width: 50,
+            height: 35,
+        };
+        let corner = PhysicalPosition::new(639.0, 1.0);
+
+        assert!(close.contains(corner.x, corner.y));
+        assert_eq!(
+            resize_direction_at(size, 1.0, corner),
+            Some(ResizeDirection::NorthEast)
         );
     }
 
