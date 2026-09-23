@@ -5,7 +5,10 @@ use std::error::Error;
 use vivido::Event;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
-use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TASKMODAL, MB_YESNO, MessageBoxW,
+    SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos,
+};
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -31,6 +34,47 @@ pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes
 }
 
 pub fn finalize_chrome_window(_window: &Window) {}
+
+/// Ask before terminating every terminal hosted by the workspace shell.
+pub fn confirm_close(window: &Window) -> bool {
+    confirm(
+        window,
+        "Quit Vivida?",
+        "Quit Vivida?\n\nAll running terminal processes will be stopped. Your workspace layout will be restored next time.",
+    )
+}
+
+/// Ask before terminating every terminal in one workspace.
+pub fn confirm_workspace_close(window: &Window, workspace_name: &str) -> bool {
+    confirm(
+        window,
+        "Close Workspace?",
+        &format!(
+            "Close workspace \"{workspace_name}\"?\n\nAll terminal processes in this workspace will be stopped."
+        ),
+    )
+}
+
+fn confirm(window: &Window, title: &str, message: &str) -> bool {
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let Some(owner) = hwnd(handle.as_raw()) else {
+        return false;
+    };
+    let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let title = title.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    // SAFETY: `owner` is the live chrome HWND, and both UTF-16 buffers remain alive and
+    // NUL-terminated for the duration of the modal call. Button two (No) is the safe default.
+    unsafe {
+        MessageBoxW(
+            owner,
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TASKMODAL,
+        ) == IDYES
+    }
+}
 
 pub fn focus_chrome_input(window: &Window) {
     window.focus_window();

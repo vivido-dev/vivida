@@ -4,8 +4,11 @@ use std::ptr;
 use std::sync::Arc;
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSView, NSWindowButton, NSWindowOrderingMode};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_app_kit::{
+    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSView, NSWindowButton,
+    NSWindowOrderingMode,
+};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use vivido::cli::TerminalOptions;
 use vivido::{Event, LoopHandle, ParentWindowHandle, Processor, WindowOptions};
@@ -26,6 +29,11 @@ pub fn configure_event_loop(builder: &mut EventLoopBuilder<Event>) {
     builder
         .with_activation_policy(ActivationPolicy::Regular)
         .with_activate_ignoring_other_apps(true);
+}
+
+pub fn application_is_active() -> bool {
+    let mtm = MainThreadMarker::new().expect("pane hosting runs on the main thread");
+    NSApplication::sharedApplication(mtm).isActive()
 }
 
 pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes {
@@ -87,6 +95,38 @@ pub fn finalize_chrome_window(window: &Window) {
             ));
         }
     }
+}
+
+/// Ask before terminating every terminal hosted by the workspace shell.
+pub fn confirm_close(_window: &Window) -> bool {
+    confirm(
+        "Quit Vivida?",
+        "All running terminal processes will be stopped. Your workspace layout will be restored next time.",
+    )
+}
+
+/// Ask before terminating every terminal in one workspace.
+pub fn confirm_workspace_close(_window: &Window, workspace_name: &str) -> bool {
+    confirm(
+        "Close Workspace?",
+        &format!(
+            "Close workspace \"{workspace_name}\"? All terminal processes in this workspace will be stopped."
+        ),
+    )
+}
+
+fn confirm(title: &str, message: &str) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    // Put the safe action first so Return dismisses the prompt without quitting.
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.addButtonWithTitle(&NSString::from_str("Quit Vivida"));
+    alert.runModal() == NSAlertSecondButtonReturn
 }
 
 pub fn focus_chrome_input(window: &Window) {
@@ -249,15 +289,13 @@ impl PaneHost for NativePaneHost {
             return;
         };
         if let Some(pane) = processor.window_mut(pane_id) {
-            pane.display
-                .window
-                .set_outer_position(PhysicalPosition::new(
+            pane.display.window.set_geometry(
+                PhysicalPosition::new(
                     origin.x.saturating_add(rect.x),
                     origin.y.saturating_add(rect.y),
-                ));
-            pane.display
-                .window
-                .request_inner_size(winit::dpi::PhysicalSize::new(rect.width, rect.height));
+                ),
+                winit::dpi::PhysicalSize::new(rect.width, rect.height),
+            );
         }
     }
 
@@ -270,15 +308,19 @@ impl PaneHost for NativePaneHost {
         {
             chrome.removeChildWindow(&pane);
         }
-        if let Some(pane) = processor.window_mut(pane_id) {
-            pane.set_automation_visible(visible);
-            if visible {
-                pane.display.window.order_front_without_focus();
-            }
-        }
-        if visible && let Some((chrome, pane)) = self.native_windows(processor, pane_id) {
+        if visible
+            && let Some((chrome, pane)) = self.native_windows(processor, pane_id)
+            && !pane
+                .parentWindow()
+                .is_some_and(|parent| ptr::eq(&*parent, &*chrome))
+        {
+            // Attach before mapping so visibility is ordered relative to the host, not the
+            // frontmost application. Already attached panes keep their sibling order.
             // SAFETY: both retained NSWindows are live on the main event-loop thread.
             unsafe { chrome.addChildWindow_ordered(&pane, NSWindowOrderingMode::Above) };
+        }
+        if let Some(pane) = processor.window_mut(pane_id) {
+            pane.set_automation_visible(visible);
         }
     }
 

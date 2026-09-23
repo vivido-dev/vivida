@@ -37,8 +37,8 @@ use model::{
 };
 use platform::{
     NativePaneHost, PaneHost, PopupFocus, RESIZE_EDGE_LOGICAL, configure_chrome_window,
-    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
-    position_popup, set_popup_visible,
+    configure_event_loop, confirm_close, confirm_workspace_close, finalize_chrome_window,
+    focus_chrome_input, popup_window_attributes, position_popup, set_popup_visible,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
@@ -537,7 +537,12 @@ impl HeadlessPaneHost {
         options: WindowOptions,
     ) -> Result<WindowId, Box<dyn Error>> {
         let mut options = options;
-        options.parent_window = None;
+        // Clearing a parent only applies where vivido's `WindowOptions` carries one; Linux
+        // headless windows have no native-parent field at all.
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            options.parent_window = None;
+        }
         options.no_activate = true;
         processor.create_hosted_pane(LoopHandle::Headless(headless), options)
     }
@@ -1058,7 +1063,15 @@ impl Shell {
             ShellLoop::Winit(_) => self.sync_visibility_and_geometry(),
             ShellLoop::Headless(headless) => self.sync_headless_visibility_and_geometry(headless),
         }
-        self.focus_active_pane();
+        // A PTY can exit while another application is active. Automatic layout maintenance
+        // must not activate the application; explicit focus requests still use activate_pane.
+        #[cfg(target_os = "macos")]
+        let restore_focus = self.chrome_window.is_none() || platform::application_is_active();
+        #[cfg(not(target_os = "macos"))]
+        let restore_focus = true;
+        if restore_focus {
+            self.focus_active_pane();
+        }
         self.request_chrome_redraw();
     }
 
@@ -4086,7 +4099,11 @@ impl Shell {
                         chrome.set_maximized(!chrome.is_maximized());
                     }
                 }
-                WindowFrameAction::Close => event_loop.exit(),
+                WindowFrameAction::Close => {
+                    if self.chrome_window.as_deref().is_some_and(confirm_close) {
+                        event_loop.exit();
+                    }
+                }
             }
             return true;
         }
@@ -4113,7 +4130,17 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
+            let confirmed = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .zip(self.chrome_window.as_deref())
+                .is_some_and(|(workspace, window)| {
+                    confirm_workspace_close(window, &workspace.label)
+                });
+            if confirmed {
+                self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
+            }
             return true;
         }
         if self.chrome_hits.new_workspace.contains(cursor.x, cursor.y) {
@@ -4135,13 +4162,22 @@ impl Shell {
         false
     }
 
-    fn begin_chrome_drag_or_resize(&mut self) {
+    fn begin_chrome_resize(&self) -> bool {
         let (Some(chrome), Some(cursor)) = (&self.chrome_window, self.cursor_position) else {
-            return;
+            return false;
         };
         if let Some(direction) = chrome_resize_direction(chrome, cursor) {
             let _ = chrome.drag_resize_window(direction);
-        } else if self.chrome_layout.tab_bar.contains(cursor.x, cursor.y) {
+            return true;
+        }
+        false
+    }
+
+    fn begin_chrome_drag(&mut self) {
+        let (Some(chrome), Some(cursor)) = (&self.chrome_window, self.cursor_position) else {
+            return;
+        };
+        if self.chrome_layout.tab_bar.contains(cursor.x, cursor.y) {
             let now = Instant::now();
             let is_double_click = self.last_title_click.is_some_and(|(at, position)| {
                 now.duration_since(at) <= Duration::from_millis(500)
@@ -4208,7 +4244,11 @@ impl Shell {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested
+                if self.chrome_window.as_deref().is_some_and(confirm_close) =>
+            {
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(chrome) = &self.chrome_window {
                     finalize_chrome_window(chrome);
@@ -4377,6 +4417,14 @@ impl Shell {
                         return;
                     }
                 }
+                // The frame controls extend to the window edge. Give resize drags the border
+                // before any chrome control (including Close) can claim the same press.
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && self.begin_chrome_resize()
+                {
+                    return;
+                }
                 #[cfg(target_os = "linux")]
                 {
                     if state == ElementState::Pressed
@@ -4415,7 +4463,7 @@ impl Shell {
                     && button == MouseButton::Left
                     && !self.handle_chrome_click(event_loop)
                 {
-                    self.begin_chrome_drag_or_resize();
+                    self.begin_chrome_drag();
                 }
             }
             WindowEvent::MouseWheel {
@@ -5816,6 +5864,24 @@ mod tests {
         assert_eq!(
             resize_direction_at(size, 1.0, PhysicalPosition::new(320.0, 240.0)),
             None
+        );
+    }
+
+    #[test]
+    fn top_right_resize_border_overlaps_the_close_button() {
+        let size = winit::dpi::PhysicalSize::new(640, 480);
+        let close = PhysicalRect {
+            x: 590,
+            y: 0,
+            width: 50,
+            height: 35,
+        };
+        let corner = PhysicalPosition::new(639.0, 1.0);
+
+        assert!(close.contains(corner.x, corner.y));
+        assert_eq!(
+            resize_direction_at(size, 1.0, corner),
+            Some(ResizeDirection::NorthEast)
         );
     }
 
