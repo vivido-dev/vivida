@@ -2,19 +2,9 @@
 
 **The terminal workspace where you and your AI agents finally work in the same window.**
 
-> [!WARNING]
-> **On Windows, do not install WezTerm alongside Vivida.** Older builds of Vivida's embedded
-> Vivido terminal can load WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped
-> key-release events with that DLL, causing controls in apps such as vvdoom to stop responding
-> after the first movement. Builds containing the Vivido fix use Windows' built-in ConPTY instead.
-> If WezTerm is already installed, remove its directory from `PATH` or uninstall it, then restart
-> Vivida completely.
+<img width="1915" height="1077" alt="vivida_screenshot" src="https://github.com/user-attachments/assets/7bdac9ce-d794-44d6-970f-430a4a2dbf90" />
 
-<!-- Screenshot goes here — replace the placeholder below, e.g.:
-![Vivida](docs/screenshot.png)
--->
-
-📗 *[Screenshot placeholder — drop a hero image of the Vivida workspace here.]*
+(See it in action on [youtube](https://youtu.be/wiVmHJg4e2E)) (also: [simple demo of using vvrd with ai agents](https://youtu.be/Qa1DrxK1Bu8))
 
 ---
 
@@ -85,14 +75,15 @@ scrollable window, alongside the Vivido terminal bindings that reach a pane.
 
 ## License
 
-Copyright 2026 Wensheng Wang
+Vivida is released under the Apache-2.0 license. See [LICENSE](LICENSE)
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
-in compliance with the License. You may obtain a copy of the License at
+## Notes
 
-    http://www.apache.org/licenses/LICENSE-2.0
+> [!WARNING]
+> **On Windows, do not install WezTerm alongside Vivida.** Older builds of Vivida's embedded
+> Vivido terminal can load WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped
+> key-release events with that DLL, causing controls in apps such as vvdoom to stop responding
+> after the first movement. Builds containing the Vivido fix use Windows' built-in ConPTY instead.
+> If WezTerm is already installed, remove its directory from `PATH` or uninstall it, then restart
+> Vivida completely.
 
-Unless required by applicable law or agreed to in writing, software distributed under the License
-is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-or implied. See the [LICENSE](LICENSE) file for the specific language governing permissions and
-limitations under the License.
