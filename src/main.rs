@@ -4244,10 +4244,10 @@ impl Shell {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => {
-                if self.chrome_window.as_deref().is_some_and(confirm_close) {
-                    event_loop.exit();
-                }
+            WindowEvent::CloseRequested
+                if self.chrome_window.as_deref().is_some_and(confirm_close) =>
+            {
+                event_loop.exit();
             }
             WindowEvent::Resized(size) => {
                 if let Some(chrome) = &self.chrome_window {
