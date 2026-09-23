@@ -141,8 +141,8 @@ pub use macos::confirm_workspace_close;
 pub use macos::show_launch_menu;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    NativePaneHost, configure_event_loop, finalize_chrome_window, focus_chrome_input,
-    popup_window_attributes, position_popup, set_popup_visible,
+    NativePaneHost, application_is_active, configure_event_loop, finalize_chrome_window,
+    focus_chrome_input, popup_window_attributes, position_popup, set_popup_visible,
 };
 
 #[cfg(target_os = "windows")]
