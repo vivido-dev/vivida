@@ -1,9 +1,10 @@
 use std::error::Error;
 use std::path::Path;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
-use objc2::MainThreadMarker;
+use objc2::runtime::{Bool, Sel};
+use objc2::{ClassType, MainThreadMarker, ffi, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSView, NSWindowButton,
     NSWindowOrderingMode,
@@ -44,16 +45,18 @@ pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes
 }
 
 pub fn finalize_chrome_window(window: &Window) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let Some(ns_window) = ns_window(handle.as_raw()) else {
+        return;
+    };
+    keep_content_clicks(&ns_window);
     // macOS manages a separate fullscreen titlebar; forcing its geometry causes visual glitches.
     if window.fullscreen().is_some() {
         return;
     }
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
-    let Some(window) = ns_window(handle.as_raw()) else {
-        return;
-    };
+    let window = ns_window;
     let Some(close) = window.standardWindowButton(NSWindowButton::CloseButton) else {
         return;
     };
@@ -95,6 +98,40 @@ pub fn finalize_chrome_window(window: &Window) {
             ));
         }
     }
+}
+
+/// Keep presses on the custom-drawn tab strip for the chrome.
+///
+/// Winit's transparent content view inherits `mouseDownCanMoveWindow == YES` from `NSView`. On
+/// macOS 27, AppKit uses that answer to claim presses in the title-bar band of a full-size
+/// content view as native window drags, so the tabs and buttons drawn there never see the click.
+/// The chrome already hit-tests its own controls and starts drags itself from empty strip space
+/// (`begin_chrome_drag`), so the view never offers the window to AppKit. The override applies to
+/// the view class, which also backs the borderless pane windows; they never move themselves.
+fn keep_content_clicks(window: &objc2_app_kit::NSWindow) {
+    static INSTALL: Once = Once::new();
+    let Some(content) = window.contentView() else {
+        return;
+    };
+    INSTALL.call_once(|| {
+        extern "C-unwind" fn cannot_move_window(_: &NSView, _: Sel) -> Bool {
+            Bool::NO
+        }
+        let sel = sel!(mouseDownCanMoveWindow);
+        // SAFETY: the selector is inherited from NSView, so the lookup finds its method and the
+        // replacement keeps that method's `BOOL (id, SEL)` signature and encoding.
+        unsafe {
+            let inherited = ffi::class_getInstanceMethod(NSView::class(), sel);
+            if inherited.is_null() {
+                return;
+            }
+            let class = ptr::from_ref(content.class()).cast_mut();
+            let imp: unsafe extern "C-unwind" fn() = std::mem::transmute(
+                cannot_move_window as extern "C-unwind" fn(&NSView, Sel) -> Bool,
+            );
+            ffi::class_replaceMethod(class, sel, imp, ffi::method_getTypeEncoding(inherited));
+        }
+    });
 }
 
 /// Ask before terminating every terminal hosted by the workspace shell.
