@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use vivido::display::progress::{Progress, most_urgent};
 use winit::window::WindowId;
 
 use crate::layout::{Axis, Node};
@@ -106,6 +107,8 @@ pub struct Tab {
     custom_title: Option<String>,
     pub focused_pane: PaneId,
     pub panes: BTreeMap<PaneId, WindowId>,
+    /// The most urgent OSC 9;4 progress among this tab's panes; runtime state, never saved.
+    pub progress: Option<Progress>,
     next_pane_id: u64,
 }
 
@@ -120,6 +123,7 @@ impl Tab {
             custom_title: None,
             focused_pane: pane_id,
             panes: BTreeMap::from([(pane_id, pane_window_id)]),
+            progress: None,
             next_pane_id: 2,
         }
     }
@@ -151,6 +155,7 @@ impl Tab {
             custom_title: custom_title.then_some(title),
             focused_pane,
             panes,
+            progress: None,
             next_pane_id,
         }
     }
@@ -230,6 +235,11 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// The most urgent progress among this workspace's tabs, for its sidebar badge.
+    pub fn progress(&self) -> Option<Progress> {
+        most_urgent(self.tabs.iter().filter_map(|tab| tab.progress))
+    }
+
     pub fn new(id: WorkspaceId, label: String, identity_cwd: PathBuf, pane_id: WindowId) -> Self {
         let tab_id = TabId(1);
         Self {
@@ -385,7 +395,43 @@ pub fn workspace_label(cwd: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use vivido::display::progress::ProgressKind;
+
     use super::*;
+
+    #[test]
+    fn a_workspace_badge_shows_its_most_urgent_tab() {
+        let mut workspace = Workspace::new(
+            WorkspaceId(1),
+            "one".into(),
+            "/one".into(),
+            WindowId::from(10),
+        );
+        let second = workspace.add_tab(WindowId::from(11));
+        assert_eq!(workspace.progress(), None, "no tab reports progress");
+
+        let running = Progress {
+            kind: ProgressKind::Normal,
+            percent: Some(30),
+        };
+        let failed = Progress {
+            kind: ProgressKind::Error,
+            percent: Some(80),
+        };
+        workspace.tabs[0].progress = Some(running);
+        assert_eq!(workspace.progress(), Some(running));
+        workspace
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == second)
+            .unwrap()
+            .progress = Some(failed);
+        assert_eq!(
+            workspace.progress(),
+            Some(failed),
+            "a failure in a background tab outranks running work"
+        );
+    }
 
     #[test]
     fn logical_pane_ids_restart_per_workspace() {

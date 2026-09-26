@@ -47,6 +47,7 @@ use vivido::config::UiConfig;
 use vivido::config::ui_config::Program;
 #[cfg(test)]
 use vivido::config::window::Decorations;
+use vivido::display::progress::most_urgent;
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::host::{IoListener, MethodCapability, MethodClass, RegistryGuard, SessionPaths};
 use vivido::shell::{LaunchAction, LaunchEntry, ShellAction, launch_entries};
@@ -610,6 +611,9 @@ struct Shell {
     hovered_workspace: Option<WorkspaceId>,
     settings_menu_open: bool,
     update_available: bool,
+    /// Progress last shown in the chrome window's taskbar button.
+    #[cfg(windows)]
+    taskbar_progress: Option<vivido::display::progress::Progress>,
     name_context_menu: Option<NameContextMenu>,
     recovery_menu: Option<RecoveryMenu>,
     launch_menu: Option<LaunchMenu>,
@@ -822,6 +826,8 @@ impl Shell {
             hovered_workspace: None,
             settings_menu_open: false,
             update_available: false,
+            #[cfg(windows)]
+            taskbar_progress: None,
             name_context_menu: None,
             recovery_menu: None,
             launch_menu: None,
@@ -4715,6 +4721,40 @@ impl Shell {
         self.switch_tab(handle, tab_id);
     }
 
+    /// Mirror each pane's OSC 9;4 progress onto its tab, its workspace's badge, and the window.
+    ///
+    /// Panes draw their own bar; this is what shows progress for tabs and workspaces that are
+    /// not on screen. The chrome window's taskbar button shows the most urgent of all of them.
+    fn refresh_progress(&mut self) {
+        let mut changed = false;
+        for tab in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.tabs.iter_mut())
+        {
+            let progress = most_urgent(tab.panes.values().filter_map(|window_id| {
+                self.processor
+                    .window(*window_id)
+                    .and_then(|pane| pane.progress())
+            }));
+            if tab.progress != progress {
+                tab.progress = progress;
+                changed = true;
+            }
+        }
+        #[cfg(windows)]
+        if let Some(chrome) = &self.chrome_window {
+            let progress = most_urgent(self.workspaces.iter().filter_map(Workspace::progress));
+            if progress != self.taskbar_progress {
+                vivido::display::progress_indicator::set_taskbar_progress(&**chrome, progress);
+                self.taskbar_progress = progress;
+            }
+        }
+        if changed {
+            self.request_chrome_redraw();
+        }
+    }
+
     fn refresh_tab_titles(&mut self) {
         let updates = self
             .workspaces
@@ -5235,6 +5275,11 @@ impl ApplicationHandler<Event> for Shell {
                     | vivido::terminal::event::Event::Wakeup
             )
         );
+        let progress_may_have_changed = matches!(
+            event.payload(),
+            vivido::EventType::Terminal(vivido::terminal::event::Event::Progress(_))
+                | vivido::EventType::ProgressTimeout
+        );
         self.processor
             .handle_winit_event(event_loop, WinitEvent::UserEvent(event));
         if let Some(update_available) = update_available
@@ -5247,6 +5292,9 @@ impl ApplicationHandler<Event> for Shell {
         // labels on the report/wakeup itself so a cd does not wait for another UI action.
         if directory_may_have_changed {
             self.refresh_tab_titles();
+        }
+        if progress_may_have_changed {
+            self.refresh_progress();
         }
         if self.processor.has_pending_embedded_redraw() {
             self.request_chrome_redraw();
@@ -5263,6 +5311,7 @@ impl ApplicationHandler<Event> for Shell {
         }
         self.reap_closed_panes(ShellLoop::Winit(event_loop));
         self.refresh_tab_titles();
+        self.refresh_progress();
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
@@ -5626,6 +5675,7 @@ fn run_headless_server(
         shell.drain_host_requests(handle);
         shell.reap_closed_panes(handle);
         shell.refresh_tab_titles();
+        shell.refresh_progress();
     }
     shell.processor.finish_headless();
     Ok(())

@@ -7,6 +7,7 @@ use vello::peniko::{Color, Fill};
 use vivido::config::UiConfig;
 use vivido::config::font::FontSize;
 use vivido::display::color::Rgb;
+use vivido::display::progress::{Progress, ProgressKind};
 use vivido::display::rects::{RenderRect, paint_rects};
 use vivido::display::renderer::EmbeddedFramePlacement;
 use vivido::display::renderer::SceneRenderer;
@@ -100,6 +101,7 @@ const TEXT: Rgb = Rgb::new(232, 232, 238);
 const MUTED: Rgb = Rgb::new(155, 155, 170);
 const ACCENT: Rgb = Rgb::new(129, 140, 248);
 const DANGER: Rgb = Rgb::new(243, 139, 168);
+const WARNING: Rgb = Rgb::new(249, 226, 175);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -834,6 +836,9 @@ impl ChromeRenderer {
                         );
                         scene.pop_layer();
                     }
+                    if let Some(progress) = tab.progress {
+                        paint_rects(&mut scene, tab_progress_rects(tab_rect, progress, scale));
+                    }
                 }
                 let x =
                     tabs_area.x + (workspace.tabs.len() as u32 * tab_width).min(tabs_width) as i32;
@@ -1210,7 +1215,21 @@ impl ChromeRenderer {
                 );
             }
 
-            // Leave a stable leading slot for a future attention badge. Phase 2 draws no badge.
+            // The leading slot carries the workspace's progress badge.
+            if let Some(progress) = workspace.progress() {
+                let center = (
+                    f64::from(padding) + f64::from(status_slot) / 2.0 - scale,
+                    f64::from(y) + f64::from(row_height) / 2.0,
+                );
+                let color = progress_color(progress.kind);
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    Color::from_rgb8(color.r, color.g, color.b),
+                    None,
+                    &Circle::new(center, PROGRESS_BADGE_RADIUS_LOGICAL * scale),
+                );
+            }
             let label_x = padding.saturating_add(status_slot);
             let label = if mode == SidebarMode::Expanded {
                 workspace.label.clone()
@@ -1724,6 +1743,55 @@ fn split_handle_rects(
         .collect()
 }
 
+/// Radius of a workspace's progress badge in the sidebar, in logical pixels.
+const PROGRESS_BADGE_RADIUS_LOGICAL: f64 = 3.5;
+/// Thickness of a tab's progress strip, in logical pixels.
+const TAB_PROGRESS_LOGICAL: f64 = 2.0;
+/// Opacity of the strip's unfilled track, and of the whole strip while busy.
+const TAB_PROGRESS_TRACK_ALPHA: f32 = 0.3;
+const TAB_PROGRESS_BUSY_ALPHA: f32 = 0.7;
+
+fn progress_color(kind: ProgressKind) -> Rgb {
+    match kind {
+        ProgressKind::Normal | ProgressKind::Indeterminate => ACCENT,
+        ProgressKind::Paused => WARNING,
+        ProgressKind::Error => DANGER,
+    }
+}
+
+/// A strip along the bottom of a tab, just above the tab bar's border: a faint track filled to
+/// the reported percent, or a steady full-width strip while busy with no percent.
+///
+/// It stays still: a background tab must not keep the chrome redrawing.
+fn tab_progress_rects(tab: PhysicalRect, progress: Progress, scale: f64) -> Vec<RenderRect> {
+    let height = (TAB_PROGRESS_LOGICAL * scale).round().max(1.0) as f32;
+    let border = scale.max(1.0) as f32;
+    let y = (tab.bottom() as f32 - border - height).max(tab.y as f32);
+    let (x, width) = (tab.x as f32, tab.width as f32);
+    let color = progress_color(progress.kind);
+    match progress.percent {
+        None => vec![RenderRect::new(
+            x,
+            y,
+            width,
+            height,
+            color,
+            TAB_PROGRESS_BUSY_ALPHA,
+        )],
+        Some(percent) => vec![
+            RenderRect::new(x, y, width, height, color, TAB_PROGRESS_TRACK_ALPHA),
+            RenderRect::new(
+                x,
+                y,
+                width * f32::from(percent.min(100)) / 100.0,
+                height,
+                color,
+                1.0,
+            ),
+        ],
+    }
+}
+
 fn rect(rect: PhysicalRect, color: Rgb) -> RenderRect {
     RenderRect::new(
         rect.x as f32,
@@ -1802,6 +1870,52 @@ mod tests {
     use vello::kurbo::{PathEl, Point};
 
     use super::*;
+
+    #[test]
+    fn a_tab_progress_strip_fills_to_the_percent_above_the_border() {
+        let tab = PhysicalRect {
+            x: 200,
+            y: 0,
+            width: 150,
+            height: 35,
+        };
+        let rects = tab_progress_rects(
+            tab,
+            Progress {
+                kind: ProgressKind::Paused,
+                percent: Some(40),
+            },
+            1.0,
+        );
+        let [track, fill] = rects.as_slice() else {
+            panic!("a determinate strip is a track and a fill: {rects:?}");
+        };
+        assert_eq!(
+            (track.x, track.width, track.alpha),
+            (200.0, 150.0, TAB_PROGRESS_TRACK_ALPHA)
+        );
+        assert_eq!((fill.x, fill.width, fill.alpha), (200.0, 60.0, 1.0));
+        assert_eq!(fill.color, WARNING);
+        assert_eq!(
+            fill.y + fill.height,
+            34.0,
+            "the strip ends on the tab bar's border"
+        );
+
+        let rects = tab_progress_rects(
+            tab,
+            Progress {
+                kind: ProgressKind::Indeterminate,
+                percent: None,
+            },
+            2.0,
+        );
+        let [busy] = rects.as_slice() else {
+            panic!("a busy strip is one steady rectangle: {rects:?}");
+        };
+        assert_eq!((busy.width, busy.height, busy.color), (150.0, 4.0, ACCENT));
+        assert_eq!(busy.y + busy.height, 33.0);
+    }
 
     #[test]
     fn idle_split_handles_are_opaque_mouse_targets_in_translucent_windows() {
