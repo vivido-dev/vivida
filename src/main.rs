@@ -5315,8 +5315,13 @@ impl ApplicationHandler<Event> for Shell {
         );
         let progress_may_have_changed = matches!(
             event.payload(),
-            vivido::EventType::Terminal(vivido::terminal::event::Event::Progress(_))
-                | vivido::EventType::ProgressTimeout
+            vivido::EventType::Terminal(
+                vivido::terminal::event::Event::Progress(_)
+                    | vivido::terminal::event::Event::Title(_)
+                    | vivido::terminal::event::Event::ResetTitle
+                    | vivido::terminal::event::Event::ChildExit(_)
+                    | vivido::terminal::event::Event::ClientResetComplete(_)
+            ) | vivido::EventType::ProgressTimeout
         );
         self.processor
             .handle_winit_event(event_loop, WinitEvent::UserEvent(event));
