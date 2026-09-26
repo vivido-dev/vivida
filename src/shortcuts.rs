@@ -57,6 +57,7 @@ const VIVIDA: &[Row] = &[
 const TERMINAL: &[Row] = &[
     row("⌘C", "Copy the selection"),
     row("⌘V", "Paste"),
+    row("⌘⇧P", "Command palette"),
     row("⌘F", "Search forward"),
     row("⌘B", "Search backward"),
     row("⌘K", "Clear the scrollback"),
@@ -73,6 +74,7 @@ const TERMINAL: &[Row] = &[
     row("Ctrl Shift C", "Copy the selection"),
     row("Ctrl Shift V", "Paste"),
     row("Shift Insert", "Paste the primary selection"),
+    row("Ctrl Shift P", "Command palette"),
     row("Ctrl Shift F", "Search forward"),
     row("Ctrl 0", "Reset the font size"),
     row("Ctrl + / Ctrl −", "Increase or decrease the font size"),
