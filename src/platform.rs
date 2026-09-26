@@ -134,10 +134,6 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::configure_chrome_window;
 #[cfg(target_os = "macos")]
-pub use macos::confirm_close;
-#[cfg(target_os = "macos")]
-pub use macos::confirm_workspace_close;
-#[cfg(target_os = "macos")]
 pub use macos::show_launch_menu;
 #[cfg(target_os = "macos")]
 pub use macos::{
@@ -150,10 +146,6 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::configure_chrome_window;
 #[cfg(target_os = "windows")]
-pub use windows::confirm_close;
-#[cfg(target_os = "windows")]
-pub use windows::confirm_workspace_close;
-#[cfg(target_os = "windows")]
 pub use windows::show_launch_menu;
 #[cfg(target_os = "windows")]
 pub use windows::{
@@ -164,10 +156,6 @@ pub use windows::{
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::configure_chrome_window;
-#[cfg(target_os = "linux")]
-pub use linux::confirm_close;
-#[cfg(target_os = "linux")]
-pub use linux::confirm_workspace_close;
 #[cfg(target_os = "linux")]
 pub use linux::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,

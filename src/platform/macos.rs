@@ -5,11 +5,8 @@ use std::sync::{Arc, Once};
 
 use objc2::runtime::{Bool, Sel};
 use objc2::{ClassType, MainThreadMarker, ffi, sel};
-use objc2_app_kit::{
-    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSView, NSWindowButton,
-    NSWindowOrderingMode,
-};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_app_kit::{NSApplication, NSView, NSWindowButton, NSWindowOrderingMode};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use vivido::cli::TerminalOptions;
 use vivido::{Event, LoopHandle, ParentWindowHandle, Processor, WindowOptions};
@@ -132,38 +129,6 @@ fn keep_content_clicks(window: &objc2_app_kit::NSWindow) {
             ffi::class_replaceMethod(class, sel, imp, ffi::method_getTypeEncoding(inherited));
         }
     });
-}
-
-/// Ask before terminating every terminal hosted by the workspace shell.
-pub fn confirm_close(_window: &Window) -> bool {
-    confirm(
-        "Quit Vivida?",
-        "All running terminal processes will be stopped. Your workspace layout will be restored next time.",
-    )
-}
-
-/// Ask before terminating every terminal in one workspace.
-pub fn confirm_workspace_close(_window: &Window, workspace_name: &str) -> bool {
-    confirm(
-        "Close Workspace?",
-        &format!(
-            "Close workspace \"{workspace_name}\"? All terminal processes in this workspace will be stopped."
-        ),
-    )
-}
-
-fn confirm(title: &str, message: &str) -> bool {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return false;
-    };
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Warning);
-    alert.setMessageText(&NSString::from_str(title));
-    alert.setInformativeText(&NSString::from_str(message));
-    // Put the safe action first so Return dismisses the prompt without quitting.
-    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-    alert.addButtonWithTitle(&NSString::from_str("Quit Vivida"));
-    alert.runModal() == NSAlertSecondButtonReturn
 }
 
 pub fn focus_chrome_input(window: &Window) {

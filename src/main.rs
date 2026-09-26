@@ -37,8 +37,8 @@ use model::{
 };
 use platform::{
     NativePaneHost, PaneHost, PopupFocus, RESIZE_EDGE_LOGICAL, configure_chrome_window,
-    configure_event_loop, confirm_close, confirm_workspace_close, finalize_chrome_window,
-    focus_chrome_input, popup_window_attributes, position_popup, set_popup_visible,
+    configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
+    position_popup, set_popup_visible,
 };
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
@@ -1383,6 +1383,7 @@ impl Shell {
         }
     }
 
+    /// Close the focused pane at the user's request, asking first if it is running a program.
     fn close_active_pane(&mut self) {
         self.end_split_drag();
         let window_id = self
@@ -1390,10 +1391,65 @@ impl Shell {
             .and_then(Workspace::active_tab)
             .and_then(|tab| tab.focused_window_id());
         if let Some(window_id) = window_id.and_then(|id| self.processor.window(id).map(|_| id))
+            && self.confirm_closing(&[window_id], "Close this pane?", "this pane", "Close")
             && let Some(pane) = self.processor.window(window_id)
         {
             let _ = pane.signal_process_group(pane_close_signal());
         }
+    }
+
+    /// Close a workspace at the user's request, asking first if any of its panes is running a
+    /// program. Automation closes workspaces through [`Self::close_workspace`] directly.
+    fn request_close_workspace(&mut self, handle: ShellLoop<'_>, workspace_id: WorkspaceId) {
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        let panes = workspace_windows(workspace);
+        let title = format!("Close workspace \"{}\"?", workspace.label);
+        if self.confirm_closing(&panes, &title, "this workspace", "Close") {
+            self.close_workspace(handle, workspace_id);
+        }
+    }
+
+    /// Quit at the user's request, asking first if any pane is running a program. The layout is
+    /// saved either way and restored next time.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        let panes = self
+            .workspaces
+            .iter()
+            .flat_map(workspace_windows)
+            .collect::<Vec<_>>();
+        if self.confirm_closing(&panes, "Quit Vivida?", "Vivida", "Quit") {
+            event_loop.exit();
+        }
+    }
+
+    /// Whether closing these panes may go ahead: silently when none is running a program,
+    /// otherwise only if the user confirms.
+    fn confirm_closing(
+        &self,
+        panes: &[WindowId],
+        title: &str,
+        subject: &str,
+        action: &str,
+    ) -> bool {
+        let programs = self.processor.running_programs(panes.iter().copied());
+        programs.is_empty()
+            || vivido::shell::confirm_close(
+                self.chrome_window
+                    .as_deref()
+                    .map(|chrome| chrome as &dyn winit::raw_window_handle::HasWindowHandle),
+                &vivido::shell::CloseConfirmation {
+                    title,
+                    subject,
+                    action,
+                    programs: &programs,
+                },
+            )
     }
 
     fn close_workspace(&mut self, handle: ShellLoop<'_>, workspace_id: WorkspaceId) {
@@ -4105,11 +4161,7 @@ impl Shell {
                         chrome.set_maximized(!chrome.is_maximized());
                     }
                 }
-                WindowFrameAction::Close => {
-                    if self.chrome_window.as_deref().is_some_and(confirm_close) {
-                        event_loop.exit();
-                    }
-                }
+                WindowFrameAction::Close => self.quit(event_loop),
             }
             return true;
         }
@@ -4136,17 +4188,7 @@ impl Shell {
             .iter()
             .find_map(|(id, rect)| rect.contains(cursor.x, cursor.y).then_some(*id))
         {
-            let confirmed = self
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == workspace_id)
-                .zip(self.chrome_window.as_deref())
-                .is_some_and(|(workspace, window)| {
-                    confirm_workspace_close(window, &workspace.label)
-                });
-            if confirmed {
-                self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
-            }
+            self.request_close_workspace(ShellLoop::Winit(event_loop), workspace_id);
             return true;
         }
         if self.chrome_hits.new_workspace.contains(cursor.x, cursor.y) {
@@ -4250,11 +4292,7 @@ impl Shell {
             return;
         }
         match event {
-            WindowEvent::CloseRequested
-                if self.chrome_window.as_deref().is_some_and(confirm_close) =>
-            {
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(chrome) = &self.chrome_window {
                     finalize_chrome_window(chrome);
@@ -4637,7 +4675,7 @@ impl Shell {
             }
             PhysicalKey::Code(KeyCode::KeyW) if self.modifiers.shift_key() => {
                 if let Some(workspace_id) = self.active_workspace {
-                    self.close_workspace(ShellLoop::Winit(event_loop), workspace_id);
+                    self.request_close_workspace(ShellLoop::Winit(event_loop), workspace_id);
                 }
                 true
             }
@@ -5679,6 +5717,15 @@ fn run_headless_server(
     }
     shell.processor.finish_headless();
     Ok(())
+}
+
+/// Every terminal pane in a workspace, across all of its tabs.
+fn workspace_windows(workspace: &Workspace) -> Vec<WindowId> {
+    workspace
+        .tabs
+        .iter()
+        .flat_map(|tab| tab.panes.values().copied())
+        .collect()
 }
 
 #[cfg(test)]
