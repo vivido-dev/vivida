@@ -3119,6 +3119,11 @@ impl Shell {
     }
 
     fn render_shortcuts(&mut self) {
+        // Winit can deliver a redraw queued before the popup was hidden (including at
+        // creation). A hidden surface cannot present; retrying it would keep the loop awake.
+        if !self.shortcuts_open {
+            return;
+        }
         let state = ShortcutsRenderState {
             scroll: self.shortcuts_scroll,
             hovered_close: self.shortcuts_hover_close,
@@ -3756,6 +3761,10 @@ impl Shell {
     }
 
     fn render_settings_menu(&mut self) {
+        // Ignore startup and stale redraws while closed. Opening the menu requests a frame.
+        if !self.settings_menu_open {
+            return;
+        }
         let hovered = self.settings_menu_hover;
         let (Some(window), Some(renderer)) =
             (&self.settings_menu_window, &mut self.settings_menu_renderer)
