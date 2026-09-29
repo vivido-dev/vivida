@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.8"
+version = "1.5.9"
 dependencies = [
  "getrandom 0.4.3",
  "vivid_protocol",
@@ -3990,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "vivida"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "embed-resource",
@@ -4009,7 +4009,7 @@ dependencies = [
 
 [[package]]
 name = "vivido"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "accesskit",
  "accesskit_winit",
