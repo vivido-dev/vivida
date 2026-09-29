@@ -747,14 +747,7 @@ impl ChromeRenderer {
             [
                 rect(layout.tab_bar, BACKGROUND),
                 rect(layout.sidebar, SIDEBAR),
-                RenderRect::new(
-                    layout.sidebar.width.saturating_sub(1) as f32,
-                    0.0,
-                    scale.max(1.0) as f32,
-                    size.height as f32,
-                    BORDER,
-                    1.0,
-                ),
+                sidebar_border_rect(layout, size, scale, state.fullscreen),
                 RenderRect::new(
                     layout.tab_bar.x as f32,
                     layout.tab_bar.height.saturating_sub(1) as f32,
@@ -994,6 +987,12 @@ impl ChromeRenderer {
             height: tab_bar.height,
         };
 
+        // A compact sidebar ends inside the leading control reservation, so the traffic lights
+        // straddle the sidebar/tab-bar boundary. Give the strip behind them the sidebar color;
+        // the toggle beside it is already that color, keeping the whole band uniform.
+        if let Some(band) = traffic_light_band_rect(layout, leading_inset) {
+            paint_rects(scene, [rect(band, SIDEBAR)]);
+        }
         paint_rects(
             scene,
             [
@@ -1270,21 +1269,26 @@ impl ChromeRenderer {
             }
         }
 
-        if mode == SidebarMode::Expanded {
-            hit_map.new_workspace = PhysicalRect {
-                x: 0,
-                y: list_bottom as i32,
-                width: area.width,
-                height: footer_height,
-            };
-            self.text.paint_text(
-                scene,
-                "+ New Workspace",
-                (padding as f32, list_bottom as f32 + (13.0 * scale) as f32),
-                ACCENT,
-                true,
-            );
-        }
+        // The footer stays a click target in every visible mode; only its label shrinks.
+        hit_map.new_workspace = PhysicalRect {
+            x: 0,
+            y: list_bottom as i32,
+            width: area.width,
+            height: footer_height,
+        };
+        let (label, label_x) = if mode == SidebarMode::Expanded {
+            ("+ New Workspace", padding as f32)
+        } else {
+            let plus_width = self.text.measure_text("+", true);
+            ("+", ((area.width as f32 - plus_width) / 2.0).max(0.0))
+        };
+        self.text.paint_text(
+            scene,
+            label,
+            (label_x, list_bottom as f32 + (13.0 * scale) as f32),
+            ACCENT,
+            true,
+        );
     }
 
     fn paint_shortcuts(
@@ -1688,6 +1692,46 @@ fn sidebar_footer_metrics(area_height: u32, scale_factor: f64) -> (u32, u32) {
     )
 }
 
+/// The sidebar's trailing border. A compact sidebar is narrower than the leading control
+/// reservation, so on macOS the border would cut straight through the traffic lights; there it
+/// starts below the tab bar instead of at the window's top edge.
+fn sidebar_border_rect(
+    layout: ChromeLayout,
+    size: PhysicalSize<u32>,
+    scale: f64,
+    fullscreen: bool,
+) -> RenderRect {
+    let top = if leading_control_inset(scale, fullscreen) > layout.sidebar.width {
+        layout.tab_bar.height
+    } else {
+        0
+    };
+    RenderRect::new(
+        layout.sidebar.width.saturating_sub(1) as f32,
+        top as f32,
+        scale.max(1.0) as f32,
+        size.height.saturating_sub(top) as f32,
+        BORDER,
+        1.0,
+    )
+}
+
+/// The tab-band strip between a visible sidebar and the leading control reservation. A compact
+/// sidebar ends inside that reservation, leaving the traffic lights over two background colors;
+/// the strip takes the sidebar color so the band behind the buttons stays uniform.
+fn traffic_light_band_rect(layout: ChromeLayout, leading_inset: u32) -> Option<PhysicalRect> {
+    if layout.sidebar.width == 0 {
+        return None;
+    }
+    let width = leading_inset.checked_sub(layout.sidebar.width)?;
+    (width > 0).then_some(PhysicalRect {
+        x: layout.sidebar.width as i32,
+        y: layout.tab_bar.y,
+        width,
+        height: layout.tab_bar.height,
+    })
+}
+
 /// Strips of the chrome that panes leave uncovered so its resize border stays reachable,
 /// painted with the pane background for a seamless edge. Order is fixed: bottom, trailing,
 /// leading (the last only when the sidebar is hidden).
@@ -2088,6 +2132,55 @@ mod tests {
     fn macos_workspace_footer_does_not_cover_the_bottom_resize_gutter() {
         let (y, height) = sidebar_footer_metrics(600, 1.0);
         assert_eq!(y + height, 594);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compact_band_behind_traffic_lights_takes_the_sidebar_color() {
+        let size = PhysicalSize::new(1000, 600);
+
+        // Compact: the strip from the sidebar's edge to the reservation is sidebar-colored.
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let band =
+            traffic_light_band_rect(layout, leading_control_inset(1.0, false)).expect("band");
+        assert_eq!(band.x, 44);
+        assert_eq!(band.y, 0);
+        assert_eq!(band.width, 20);
+        assert_eq!(band.height, 35);
+
+        // Expanded hides nothing (the reservation is inside the sidebar) and hidden keeps the
+        // tab band a single background color.
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+        assert!(traffic_light_band_rect(layout, leading_control_inset(1.0, false)).is_none());
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Hidden);
+        assert!(traffic_light_band_rect(layout, leading_control_inset(1.0, false)).is_none());
+        // Fullscreen has no traffic-light reservation either.
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        assert!(traffic_light_band_rect(layout, leading_control_inset(1.0, true)).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compact_sidebar_border_starts_below_the_traffic_lights() {
+        let size = PhysicalSize::new(1000, 600);
+
+        // The compact sidebar is narrower than the traffic-light reservation, so its border
+        // must not enter the band the buttons occupy.
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let border = sidebar_border_rect(layout, size, 1.0, false);
+        assert_eq!(border.x, 43.0);
+        assert_eq!(border.y, 35.0);
+        assert_eq!(border.height, 565.0);
+
+        // Expanded and fullscreen keep the full-height border.
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+        let border = sidebar_border_rect(layout, size, 1.0, false);
+        assert_eq!(border.y, 0.0);
+        assert_eq!(border.height, 600.0);
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let border = sidebar_border_rect(layout, size, 1.0, true);
+        assert_eq!(border.y, 0.0);
+        assert_eq!(border.height, 600.0);
     }
 
     #[cfg(target_os = "windows")]
