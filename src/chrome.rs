@@ -811,6 +811,7 @@ impl ChromeRenderer {
                     if tab.id == workspace.active_tab {
                         paint_rects(&mut scene, [rect(tab_rect, ACTIVE)]);
                     }
+                    paint_rects(&mut scene, tab_border_rects(tab_rect, scale, index == 0));
                     if let Some(title_clip) = tab_title_clip(tab_rect, scale) {
                         scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &title_clip);
                         self.text.paint_text(
@@ -1680,6 +1681,30 @@ fn tab_title_clip(tab: PhysicalRect, scale_factor: f64) -> Option<Rect> {
             f64::from(tab.y) + f64::from(tab.height),
         )
     })
+}
+
+fn tab_border_rects(
+    tab: PhysicalRect,
+    scale_factor: f64,
+    first: bool,
+) -> impl Iterator<Item = RenderRect> {
+    let thickness = (scale_factor.round().max(1.0) as u32)
+        .min(tab.width)
+        .min(tab.height);
+    let x = tab.x as f32;
+    let y = tab.y as f32;
+    let width = tab.width as f32;
+    let height = tab.height as f32;
+    let thickness = thickness as f32;
+    let borders = [
+        RenderRect::new(x, y, width, thickness, BORDER, 1.0),
+        // Match the tab bar's existing bottom rule so high-DPI borders do not stack.
+        RenderRect::new(x, y + height - 1.0, width, thickness, BORDER, 1.0),
+        RenderRect::new(x + width - thickness, y, thickness, height, BORDER, 1.0),
+    ];
+    borders
+        .into_iter()
+        .chain(first.then_some(RenderRect::new(x, y, thickness, height, BORDER, 1.0)))
 }
 
 fn sidebar_footer_metrics(area_height: u32, scale_factor: f64) -> (u32, u32) {
