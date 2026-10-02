@@ -2420,7 +2420,16 @@ impl Shell {
                 }
             }
         }
-        match drag_event(event, chrome_event, self.split_pointer_down) {
+        // A click in another macOS child pane can briefly take key focus from the chrome.
+        // Keep the divider capture while the application itself is still active.
+        #[cfg(target_os = "macos")]
+        let focus_handoff = chrome_event
+            && self.split_pointer_down
+            && matches!(event, WindowEvent::Focused(false))
+            && platform::application_is_active();
+        #[cfg(not(target_os = "macos"))]
+        let focus_handoff = false;
+        match drag_event(event, chrome_event, self.split_pointer_down, focus_handoff) {
             DragEvent::End => {
                 self.split_drag = None;
                 self.request_chrome_redraw();

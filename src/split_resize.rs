@@ -18,13 +18,19 @@ pub enum DragEvent {
     Pass,
 }
 
-pub fn drag_event(event: &winit::event::WindowEvent, chrome: bool, captured: bool) -> DragEvent {
+pub fn drag_event(
+    event: &winit::event::WindowEvent,
+    chrome: bool,
+    captured: bool,
+    focus_handoff: bool,
+) -> DragEvent {
     use winit::event::{ElementState, MouseButton, WindowEvent};
     match event {
         // Keep keyboard focus with the divider until release (or Escape). The chrome's
         // ordinary activation handler restores terminal focus, which makes a macOS child
         // NSWindow key and immediately cancels this drag through the chrome's focus loss.
         WindowEvent::Focused(true) if chrome && captured => DragEvent::Swallow,
+        WindowEvent::Focused(false) if chrome && captured && focus_handoff => DragEvent::Swallow,
         WindowEvent::Focused(false)
         | WindowEvent::Resized(_)
         | WindowEvent::ScaleFactorChanged { .. }
@@ -75,20 +81,21 @@ fn drag_key(
     }
 }
 
-/// Include nine logical points of the adjoining pane edges. Native child windows can own
-/// the event at a divider boundary, so they must offer the same hit target as the chrome.
+/// Include only the three logical pixels of default terminal padding at adjoining pane edges.
+/// Native child windows can own the event at a divider boundary, but the first text cell must
+/// remain available for selection.
 pub fn divider_contains(divider: &SplitDivider, point: PhysicalPosition<f64>, scale: f64) -> bool {
-    let slop = 9.0 * scale;
+    let slop = 3.0 * scale;
     let rect = divider.rect;
     match divider.axis {
         Axis::Horizontal => {
-            point.x >= f64::from(rect.x) - slop
+            point.x > f64::from(rect.x) - slop
                 && point.x < f64::from(rect.right()) + slop
                 && point.y >= f64::from(rect.y)
                 && point.y < f64::from(rect.bottom())
         }
         Axis::Vertical => {
-            point.y >= f64::from(rect.y) - slop
+            point.y > f64::from(rect.y) - slop
                 && point.y < f64::from(rect.bottom()) + slop
                 && point.x >= f64::from(rect.x)
                 && point.x < f64::from(rect.right())
@@ -475,22 +482,26 @@ mod tests {
         for axis in [Axis::Horizontal, Axis::Vertical] {
             let root = three(axis);
             let divider = compute_split_layout(&root, area(), 2.0).dividers.remove(0);
-            let point = match axis {
-                Axis::Horizontal => {
-                    PhysicalPosition::new(f64::from(divider.rect.right()) + 10.0, 100.0)
-                }
-                Axis::Vertical => {
-                    PhysicalPosition::new(200.0, f64::from(divider.rect.bottom()) + 10.0)
-                }
+            let edges = match axis {
+                Axis::Horizontal => [f64::from(divider.rect.x), f64::from(divider.rect.right())],
+                Axis::Vertical => [f64::from(divider.rect.y), f64::from(divider.rect.bottom())],
             };
-            assert!(divider_contains(&divider, point, 2.0));
-            assert!(SplitDrag::begin(1, &root, area(), 2.0, point).is_some());
-            let interior = match axis {
-                Axis::Horizontal => PhysicalPosition::new(point.x + 13.0, point.y),
-                Axis::Vertical => PhysicalPosition::new(point.x, point.y + 13.0),
-            };
-            assert!(!divider_contains(&divider, interior, 2.0));
-            assert!(SplitDrag::begin(1, &root, area(), 2.0, interior).is_none());
+            for (edge, direction) in [(edges[0], -1.0), (edges[1], 1.0)] {
+                let point = match axis {
+                    Axis::Horizontal => PhysicalPosition::new(edge + direction * 4.0, 100.0),
+                    Axis::Vertical => PhysicalPosition::new(200.0, edge + direction * 4.0),
+                };
+                assert!(divider_contains(&divider, point, 2.0));
+                assert!(SplitDrag::begin(1, &root, area(), 2.0, point).is_some());
+                // Six physical pixels are the default pane padding at 2x scale. The first
+                // text cell begins here and belongs to the terminal on either side.
+                let text = match axis {
+                    Axis::Horizontal => PhysicalPosition::new(edge + direction * 6.0, 100.0),
+                    Axis::Vertical => PhysicalPosition::new(200.0, edge + direction * 6.0),
+                };
+                assert!(!divider_contains(&divider, text, 2.0));
+                assert!(SplitDrag::begin(1, &root, area(), 2.0, text).is_none());
+            }
         }
     }
 
@@ -653,11 +664,11 @@ mod event_tests {
         // focuses the chrome, whose normal activation handler would focus the pane again
         // and generate a chrome focus loss that cancels the drag.
         assert_eq!(
-            drag_event(&WindowEvent::Focused(false), false, true),
+            drag_event(&WindowEvent::Focused(false), false, true, false),
             DragEvent::Pass
         );
         assert_eq!(
-            drag_event(&WindowEvent::Focused(true), true, true),
+            drag_event(&WindowEvent::Focused(true), true, true, false),
             DragEvent::Swallow
         );
         let motion = WindowEvent::CursorMoved {
@@ -665,7 +676,7 @@ mod event_tests {
             position: PhysicalPosition::new(200.0, 300.0),
         };
         assert_eq!(
-            drag_event(&motion, false, true),
+            drag_event(&motion, false, true, false),
             DragEvent::Move(PhysicalPosition::new(200.0, 300.0))
         );
         let release = WindowEvent::MouseInput {
@@ -673,16 +684,21 @@ mod event_tests {
             state: ElementState::Released,
             button: MouseButton::Left,
         };
-        assert_eq!(drag_event(&release, false, true), DragEvent::Release);
+        assert_eq!(drag_event(&release, false, true, false), DragEvent::Release);
         // Normal activation still returns input to the terminal after capture ends.
         assert_eq!(
-            drag_event(&WindowEvent::Focused(true), true, false),
+            drag_event(&WindowEvent::Focused(true), true, false, false),
             DragEvent::Pass
         );
         // Switching away from the app must still cancel the gesture.
         assert_eq!(
-            drag_event(&WindowEvent::Focused(false), true, true),
+            drag_event(&WindowEvent::Focused(false), true, true, false),
             DragEvent::End
+        );
+        // An active application can move key focus between native child panes mid-drag.
+        assert_eq!(
+            drag_event(&WindowEvent::Focused(false), true, true, true),
+            DragEvent::Swallow
         );
     }
 
@@ -693,15 +709,15 @@ mod event_tests {
             state: ElementState::Released,
             button: MouseButton::Left,
         };
-        assert_eq!(drag_event(&release, false, true), DragEvent::Release);
-        assert_eq!(drag_event(&release, false, false), DragEvent::Pass);
+        assert_eq!(drag_event(&release, false, true, false), DragEvent::Release);
+        assert_eq!(drag_event(&release, false, false, false), DragEvent::Pass);
         assert_eq!(
-            drag_event(&WindowEvent::Focused(false), true, true),
+            drag_event(&WindowEvent::Focused(false), true, true, false),
             DragEvent::End
         );
         // The starting pane loses focus when chrome takes over; that must not end the gesture.
         assert_eq!(
-            drag_event(&WindowEvent::Focused(false), false, true),
+            drag_event(&WindowEvent::Focused(false), false, true, false),
             DragEvent::Pass
         );
         assert_eq!(
@@ -737,11 +753,17 @@ mod event_tests {
             device_id: DeviceId::dummy(),
             position: point,
         };
-        assert_eq!(drag_event(&motion, true, true), DragEvent::Move(point));
-        assert_eq!(drag_event(&motion, false, true), DragEvent::Move(point));
-        assert_eq!(drag_event(&motion, true, false), DragEvent::Pass);
+        assert_eq!(
+            drag_event(&motion, true, true, false),
+            DragEvent::Move(point)
+        );
+        assert_eq!(
+            drag_event(&motion, false, true, false),
+            DragEvent::Move(point)
+        );
+        assert_eq!(drag_event(&motion, true, false, false), DragEvent::Pass);
         let resize = WindowEvent::Resized(winit::dpi::PhysicalSize::new(400, 300));
-        assert_eq!(drag_event(&resize, true, true), DragEvent::End);
-        assert_eq!(drag_event(&resize, false, true), DragEvent::Pass);
+        assert_eq!(drag_event(&resize, true, true, false), DragEvent::End);
+        assert_eq!(drag_event(&resize, false, true, false), DragEvent::Pass);
     }
 }
