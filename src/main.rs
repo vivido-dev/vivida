@@ -1409,8 +1409,8 @@ impl Shell {
             return;
         };
         let panes = workspace_windows(workspace);
-        let title = format!("Close workspace \"{}\"?", workspace.label);
-        if self.confirm_closing(&panes, &title, "this workspace", "Close") {
+        let title = format!("Close space \"{}\"?", workspace.label);
+        if self.confirm_closing(&panes, &title, "this space", "Close") {
             self.close_workspace(handle, workspace_id);
         }
     }
@@ -2955,7 +2955,7 @@ impl Shell {
             .filter(|_| self.rename_editor_window.is_none())
             .map(|(editor, display_value)| RenameEditorRenderState {
                 label: match editor.target {
-                    NameTarget::Workspace(_) => "Rename Workspace",
+                    NameTarget::Workspace(_) => "Rename Space",
                     NameTarget::Tab { .. } => "Rename Tab",
                 },
                 display_value,
@@ -3683,7 +3683,7 @@ impl Shell {
         let display_value = editor.display_value();
         let state = RenameEditorRenderState {
             label: match editor.target {
-                NameTarget::Workspace(_) => "Rename Workspace",
+                NameTarget::Workspace(_) => "Rename Space",
                 NameTarget::Tab { .. } => "Rename Tab",
             },
             display_value: &display_value,

@@ -29,12 +29,12 @@ const VIVIDA: &[Row] = &[
     row("⌘D", "Split the pane left and right"),
     row("⌘⇧D", "Split the pane top and bottom"),
     row("⌘W", "Close the focused pane"),
-    row("⌘⇧N", "New workspace"),
-    row("⌘⇧W", "Close the workspace"),
+    row("⌘⇧N", "New space"),
+    row("⌘⇧W", "Close the space"),
     row("⌘⇧B", "Expand, shrink, or hide the sidebar"),
     row("⌘⇧]", "Next tab"),
     row("⌘⇧[", "Previous tab"),
-    row("⌘1 – ⌘9", "Switch to workspace 1 through 9"),
+    row("⌘1 – ⌘9", "Switch to space 1 through 9"),
     row("⌃⇧F12", "Recover a stuck terminal"),
 ];
 
@@ -44,12 +44,12 @@ const VIVIDA: &[Row] = &[
     row("Ctrl D", "Split the pane left and right"),
     row("Ctrl Shift D", "Split the pane top and bottom"),
     row("Ctrl W", "Close the focused pane"),
-    row("Ctrl Shift N", "New workspace"),
-    row("Ctrl Shift W", "Close the workspace"),
+    row("Ctrl Shift N", "New space"),
+    row("Ctrl Shift W", "Close the space"),
     row("Ctrl Shift B", "Expand, shrink, or hide the sidebar"),
     row("Ctrl Shift ]", "Next tab"),
     row("Ctrl Shift [", "Previous tab"),
-    row("Ctrl 1 – Ctrl 9", "Switch to workspace 1 through 9"),
+    row("Ctrl 1 – Ctrl 9", "Switch to space 1 through 9"),
     row("Ctrl Shift F12", "Recover a stuck terminal"),
 ];
 

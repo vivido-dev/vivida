@@ -1179,7 +1179,7 @@ impl ChromeRenderer {
         if mode == SidebarMode::Expanded {
             self.text.paint_text(
                 scene,
-                "Workspaces",
+                "Spaces",
                 (
                     sidebar_label_x as f32 + (8.0 * scale) as f32,
                     (12.0 * scale) as f32,
@@ -1278,7 +1278,7 @@ impl ChromeRenderer {
             height: footer_height,
         };
         let (label, label_x) = if mode == SidebarMode::Expanded {
-            ("+ New Workspace", padding as f32)
+            ("+ New Space", padding as f32)
         } else {
             let plus_width = self.text.measure_text("+", true);
             ("+", ((area.width as f32 - plus_width) / 2.0).max(0.0))
@@ -1662,12 +1662,18 @@ fn settings_menu_rect(gear: PhysicalRect, size: PhysicalSize<u32>, scale: f64) -
 }
 
 fn text_system(config: &UiConfig, scale_factor: f64) -> TextSystem {
-    TextSystem::new(
-        config
-            .font
-            .clone()
-            .with_size(FontSize::new((13.0 * scale_factor) as f32)),
-    )
+    #[cfg(windows)]
+    let font = {
+        let _ = config;
+        serde_json::from_value::<vivido::config::font::Font>(serde_json::json!({
+            "normal": { "family": "Tahoma" }
+        }))
+        .expect("the built-in chrome font configuration is valid")
+    };
+    #[cfg(not(windows))]
+    let font = config.font.clone();
+    let size = if cfg!(windows) { 11.0 } else { 13.0 };
+    TextSystem::new(font.with_size(FontSize::new((size * scale_factor) as f32)))
 }
 
 fn tab_title_clip(tab: PhysicalRect, scale_factor: f64) -> Option<Rect> {
