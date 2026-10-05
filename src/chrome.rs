@@ -22,7 +22,7 @@ use crate::model::{TabId, Workspace, WorkspaceId};
 use crate::platform::{pane_bottom_resize_gutter, pane_side_resize_gutter};
 use crate::shortcuts;
 
-pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 220.0;
+pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 132.0;
 pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
 pub const TAB_BAR_LOGICAL: f64 = 35.0;
 pub const MIN_PANE_WIDTH_LOGICAL: f64 = 160.0;
@@ -2036,7 +2036,7 @@ mod tests {
             compute_chrome_layout(size, 1.0, SidebarMode::Expanded)
                 .sidebar
                 .width,
-            220
+            132
         );
         assert_eq!(
             compute_chrome_layout(size, 1.0, SidebarMode::Compact)
@@ -2054,8 +2054,8 @@ mod tests {
 
     #[test]
     fn expanded_sidebar_never_starves_the_minimum_pane_width() {
-        let layout = compute_chrome_layout(PhysicalSize::new(300, 200), 1.0, SidebarMode::Expanded);
-        assert_eq!(layout.sidebar.width, 140);
+        let layout = compute_chrome_layout(PhysicalSize::new(280, 200), 1.0, SidebarMode::Expanded);
+        assert_eq!(layout.sidebar.width, 120);
         assert_eq!(
             layout.content.width,
             160u32.saturating_sub(pane_side_resize_gutter(1.0))
@@ -2066,7 +2066,7 @@ mod tests {
             PhysicalRect {
                 x: 0,
                 y: 0,
-                width: 300,
+                width: 280,
                 height: 35
             }
         );
@@ -2084,9 +2084,9 @@ mod tests {
             resize_gutter_rects(size, layout),
             vec![
                 PhysicalRect {
-                    x: 220,
+                    x: 132,
                     y: 590,
-                    width: 780,
+                    width: 868,
                     height: 10,
                 },
                 PhysicalRect {
@@ -2116,9 +2116,9 @@ mod tests {
             resize_gutter_rects(size, layout),
             vec![
                 PhysicalRect {
-                    x: 220,
+                    x: 132,
                     y: 594,
-                    width: 780,
+                    width: 868,
                     height: 6,
                 },
                 PhysicalRect {
@@ -2221,7 +2221,7 @@ mod tests {
         let new_workspace = PhysicalRect {
             x: 0,
             y: i32::try_from(y).unwrap(),
-            width: 220,
+            width: 132,
             height,
         };
 
@@ -2273,9 +2273,9 @@ mod tests {
     #[test]
     fn application_controls_are_right_aligned_and_distinct() {
         let bar = PhysicalRect {
-            x: 220,
+            x: 132,
             y: 0,
-            width: 780,
+            width: 868,
             height: 35,
         };
         let width = CHROME_CONTROL_LOGICAL as u32;
