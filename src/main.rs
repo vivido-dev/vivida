@@ -68,6 +68,17 @@ const CHROME_TITLE: &str = "vivida";
 const INITIAL_WIDTH: f64 = 1100.0;
 const INITIAL_HEIGHT: f64 = 700.0;
 
+fn launch_directory(
+    working_directory: Option<&Path>,
+    current_directory: &Path,
+    default_directory: &Path,
+) -> PathBuf {
+    match working_directory {
+        Some(directory) => current_directory.join(directory),
+        None => default_directory.to_owned(),
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "vivida",
@@ -684,17 +695,16 @@ impl Shell {
             MethodCapability::host("vivida_reset_tab_title", MethodClass::Window, true),
         ]);
         let current_dir = std::env::current_dir()?;
-        let launch_cwd = terminal_options
-            .working_directory
-            .as_ref()
-            .map(|cwd| {
-                if cwd.is_absolute() {
-                    cwd.clone()
-                } else {
-                    current_dir.join(cwd)
-                }
-            })
-            .unwrap_or(current_dir);
+        // Finder launches installed apps in `/`; match Vivido's home-directory default.
+        #[cfg(target_os = "macos")]
+        let default_dir = home::home_dir().unwrap_or_else(|| current_dir.clone());
+        #[cfg(not(target_os = "macos"))]
+        let default_dir = current_dir.clone();
+        let launch_cwd = launch_directory(
+            terminal_options.working_directory.as_deref(),
+            &current_dir,
+            &default_dir,
+        );
         Ok(Self::base_shell(
             config,
             terminfo,
@@ -756,17 +766,11 @@ impl Shell {
             MethodCapability::host("vivida_reset_tab_title", MethodClass::Window, true),
         ]);
         let current_dir = std::env::current_dir()?;
-        let launch_cwd = terminal_options
-            .working_directory
-            .as_ref()
-            .map(|cwd| {
-                if cwd.is_absolute() {
-                    cwd.clone()
-                } else {
-                    current_dir.join(cwd)
-                }
-            })
-            .unwrap_or(current_dir);
+        let launch_cwd = launch_directory(
+            terminal_options.working_directory.as_deref(),
+            &current_dir,
+            &current_dir,
+        );
         Ok(Self::base_shell(
             config,
             terminfo,
@@ -5756,6 +5760,24 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finder_launch_defaults_to_home_and_preserves_directory_overrides() {
+        let inherited = Path::new("/");
+        let home = Path::new("/Users/test");
+        assert_eq!(launch_directory(None, inherited, home), home);
+        assert_eq!(
+            launch_directory(Some(Path::new("/tmp/project")), inherited, home),
+            Path::new("/tmp/project")
+        );
+        let inherited = Path::new("/tmp");
+        assert_eq!(
+            launch_directory(Some(Path::new("project")), inherited, home),
+            Path::new("/tmp/project")
+        );
+        assert_eq!(launch_directory(None, inherited, inherited), inherited);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

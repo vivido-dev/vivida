@@ -20,6 +20,7 @@ winit = { version = "0.30.13", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+home = "0.5"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
   "std",
