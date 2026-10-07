@@ -31,12 +31,25 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSApplication",
   "NSButton",
   "NSControl",
+  "NSFontDescriptor",
   "NSGraphics",
+  "NSGraphicsContext",
+  "NSImage",
+  "NSImageRep",
   "NSMenu",
   "NSMenuItem",
   "NSResponder",
   "NSView",
   "NSWindow",
+  "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+  "std",
+  "CGBitmapContext",
+  "CGColorSpace",
+  "CGContext",
+  "CGGeometry",
+  "CGImage",
 ] }
 raw-window-handle = "0.6"
 

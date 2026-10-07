@@ -136,6 +136,8 @@ pub use macos::configure_chrome_window;
 #[cfg(target_os = "macos")]
 pub use macos::show_launch_menu;
 #[cfg(target_os = "macos")]
+pub use macos::sidebar_symbol;
+#[cfg(target_os = "macos")]
 pub use macos::{
     NativePaneHost, application_is_active, configure_event_loop, finalize_chrome_window,
     focus_chrome_input, popup_window_attributes, position_popup, set_popup_visible,

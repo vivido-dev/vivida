@@ -42,6 +42,8 @@ pub fn chrome_requires_transparency(config: &UiConfig) -> bool {
 const CORNER_RADIUS_LOGICAL: f64 = 12.0;
 
 const CHROME_CONTROL_LOGICAL: f64 = 34.0;
+const SIDEBAR_ICON_LOGICAL: f64 = 16.0;
+const SIDEBAR_HEADER_LOGICAL: f64 = 34.0;
 const NEW_TAB_LOGICAL: f64 = 36.0;
 const MACOS_TRAFFIC_LIGHTS_LOGICAL: f64 = 64.0;
 const GEAR_TEETH: usize = 8;
@@ -223,6 +225,8 @@ pub struct ChromeRenderer {
     transparent_content: bool,
     pane_background: Rgb,
     pane_opacity: f32,
+    #[cfg(target_os = "macos")]
+    sidebar_symbol: Option<vello::peniko::ImageData>,
 }
 
 pub struct ChromeRenderState<'a> {
@@ -709,6 +713,11 @@ impl ChromeRenderer {
             transparent_content,
             pane_background: config.colors.primary.background,
             pane_opacity: config.window_opacity(),
+            #[cfg(target_os = "macos")]
+            sidebar_symbol: crate::platform::sidebar_symbol(
+                (SIDEBAR_ICON_LOGICAL * scale_factor).round() as u32,
+                ACCENT,
+            ),
         })
     }
 
@@ -719,6 +728,13 @@ impl ChromeRenderer {
         if (scale_factor - self.scale_factor).abs() > f64::EPSILON {
             self.scale_factor = scale_factor;
             self.text = text_system(config, scale_factor);
+            #[cfg(target_os = "macos")]
+            {
+                self.sidebar_symbol = crate::platform::sidebar_symbol(
+                    (SIDEBAR_ICON_LOGICAL * scale_factor).round() as u32,
+                    ACCENT,
+                );
+            }
         }
     }
 
@@ -740,7 +756,6 @@ impl ChromeRenderer {
         let layout = compute_chrome_layout(size, scale, state.sidebar_mode);
         let mut scene = Scene::new();
         let mut hit_map = ChromeHitMap::default();
-        let mut sidebar_label_x = 0;
 
         paint_rects(
             &mut scene,
@@ -779,14 +794,13 @@ impl ChromeRenderer {
         }
 
         if layout.tab_bar.height > 0 {
-            let (tabs_area, label_x) = self.paint_top_controls(
+            let tabs_area = self.paint_top_controls(
                 &mut scene,
                 layout,
                 state.fullscreen,
                 state.update_available,
                 &mut hit_map,
             );
-            sidebar_label_x = label_x;
             let workspace = state
                 .workspaces
                 .iter()
@@ -865,7 +879,7 @@ impl ChromeRenderer {
                 state.workspaces,
                 state.active_workspace,
                 state.hovered_workspace,
-                sidebar_label_x,
+                layout.tab_bar.height,
                 &mut hit_map,
             );
         }
@@ -934,17 +948,12 @@ impl ChromeRenderer {
         fullscreen: bool,
         update_available: bool,
         hit_map: &mut ChromeHitMap,
-    ) -> (PhysicalRect, i32) {
+    ) -> PhysicalRect {
         let scale = self.scale_factor;
         let tab_bar = layout.tab_bar;
         let button_width = (CHROME_CONTROL_LOGICAL * scale).round() as u32;
         let leading_inset = leading_control_inset(scale, fullscreen);
-        hit_map.toggle = PhysicalRect {
-            x: leading_inset as i32,
-            y: tab_bar.y,
-            width: button_width,
-            height: tab_bar.height,
-        };
+        hit_map.toggle = sidebar_toggle_rect(tab_bar, leading_inset, scale);
 
         let system_width = system_control_width(scale);
         let system_start = tab_bar.width.saturating_sub(system_width);
@@ -1001,32 +1010,9 @@ impl ChromeRenderer {
                 rect(hit_map.split_horizontal, SIDEBAR),
                 rect(hit_map.split_vertical, SIDEBAR),
                 rect(hit_map.gear, SIDEBAR),
-                RenderRect::new(
-                    hit_map.toggle.x as f32 + (9.0 * scale) as f32,
-                    (10.0 * scale) as f32,
-                    (16.0 * scale) as f32,
-                    (2.0 * scale).max(1.0) as f32,
-                    ACCENT,
-                    1.0,
-                ),
-                RenderRect::new(
-                    hit_map.toggle.x as f32 + (9.0 * scale) as f32,
-                    (16.0 * scale) as f32,
-                    (16.0 * scale) as f32,
-                    (2.0 * scale).max(1.0) as f32,
-                    ACCENT,
-                    1.0,
-                ),
-                RenderRect::new(
-                    hit_map.toggle.x as f32 + (9.0 * scale) as f32,
-                    (22.0 * scale) as f32,
-                    (16.0 * scale) as f32,
-                    (2.0 * scale).max(1.0) as f32,
-                    ACCENT,
-                    1.0,
-                ),
             ],
         );
+        self.paint_sidebar_toggle(scene, hit_map.toggle);
         for (button, label) in [
             (hit_map.split_horizontal, "↔"),
             (hit_map.split_vertical, "↕"),
@@ -1059,10 +1045,39 @@ impl ChromeRenderer {
             self.paint_window_controls(scene, hit_map);
         }
 
-        (
-            tabs_area,
-            hit_map.toggle.x + i32::try_from(hit_map.toggle.width).unwrap_or(i32::MAX),
-        )
+        tabs_area
+    }
+
+    fn paint_sidebar_toggle(&mut self, scene: &mut Scene, button: PhysicalRect) {
+        let size = (SIDEBAR_ICON_LOGICAL * self.scale_factor)
+            .min(f64::from(button.width))
+            .min(f64::from(button.height));
+        let center_x = f64::from(button.x) + f64::from(button.width) / 2.0;
+        let center_y = f64::from(button.y) + f64::from(button.height) / 2.0;
+        #[cfg(target_os = "macos")]
+        if let Some(image) = &self.sidebar_symbol {
+            scene.draw_image(
+                image,
+                Affine::translate((center_x - size / 2.0, center_y - size / 2.0))
+                    * Affine::scale(size / f64::from(image.width)),
+            );
+            return;
+        }
+        let mut icon = Scene::new();
+        let width =
+            f64::from(
+                self.text
+                    .paint_text(&mut icon, "\u{25e7}", (0.0, 0.0), ACCENT, false),
+            );
+        let height = f64::from(self.text.metrics().cell_height);
+        let fit = size / width.max(height).max(1.0);
+        scene.append(
+            &icon,
+            Some(
+                Affine::translate((center_x - width * fit / 2.0, center_y - height * fit / 2.0))
+                    * Affine::scale(fit),
+            ),
+        );
     }
 
     fn paint_window_controls(&mut self, scene: &mut Scene, hit_map: &ChromeHitMap) {
@@ -1166,11 +1181,12 @@ impl ChromeRenderer {
         workspaces: &[Workspace],
         active_workspace: Option<WorkspaceId>,
         hovered_workspace: Option<WorkspaceId>,
-        sidebar_label_x: i32,
+        sidebar_top: u32,
         hit_map: &mut ChromeHitMap,
     ) {
         let scale = self.scale_factor;
-        let header_height = (44.0 * scale).round() as u32;
+        let header = sidebar_header_rect(area, sidebar_top, scale, mode);
+        let header_height = header.bottom().max(0) as u32;
         let row_height = (38.0 * scale).round() as u32;
         let (list_bottom, footer_height) = sidebar_footer_metrics(area.height, scale);
         let padding = (10.0 * scale).round() as u32;
@@ -1180,10 +1196,7 @@ impl ChromeRenderer {
             self.text.paint_text(
                 scene,
                 "Spaces",
-                (
-                    sidebar_label_x as f32 + (8.0 * scale) as f32,
-                    (12.0 * scale) as f32,
-                ),
+                (padding as f32, header.y as f32 + (10.0 * scale) as f32),
                 MUTED,
                 true,
             );
@@ -1713,6 +1726,37 @@ fn tab_border_rects(
         .chain(first.then_some(RenderRect::new(x, y, thickness, height, BORDER, 1.0)))
 }
 
+fn sidebar_toggle_rect(tab_bar: PhysicalRect, leading_inset: u32, scale: f64) -> PhysicalRect {
+    let padding = ((4.0 * scale).round() as u32).min(tab_bar.height / 2);
+    PhysicalRect {
+        x: tab_bar.x + leading_inset.saturating_add(padding) as i32,
+        y: tab_bar.y + padding as i32,
+        width: ((CHROME_CONTROL_LOGICAL * scale).round() as u32)
+            .saturating_sub(padding.saturating_mul(2)),
+        height: tab_bar.height.saturating_sub(padding.saturating_mul(2)),
+    }
+}
+
+fn sidebar_header_rect(
+    area: PhysicalRect,
+    tab_bar_height: u32,
+    scale: f64,
+    mode: SidebarMode,
+) -> PhysicalRect {
+    let top = tab_bar_height.min(area.height);
+    let logical_height = if mode == SidebarMode::Expanded {
+        SIDEBAR_HEADER_LOGICAL
+    } else {
+        9.0
+    };
+    PhysicalRect {
+        x: area.x,
+        y: area.y + top as i32,
+        width: area.width,
+        height: ((logical_height * scale).round() as u32).min(area.height.saturating_sub(top)),
+    }
+}
+
 fn sidebar_footer_metrics(area_height: u32, scale_factor: f64) -> (u32, u32) {
     let available_height =
         area_height.saturating_sub(pane_bottom_resize_gutter(scale_factor).min(area_height));
@@ -2236,6 +2280,38 @@ mod tests {
         assert_eq!(SidebarMode::Expanded.next(), SidebarMode::Compact);
         assert_eq!(SidebarMode::Compact.next(), SidebarMode::Hidden);
         assert_eq!(SidebarMode::Hidden.next(), SidebarMode::Expanded);
+    }
+
+    #[test]
+    fn sidebar_heading_stays_below_top_controls_and_inside_the_sidebar() {
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let size = PhysicalSize::new((1000.0 * scale) as u32, (600.0 * scale) as u32);
+            let layout = compute_chrome_layout(size, scale, SidebarMode::Expanded);
+            let header = sidebar_header_rect(
+                layout.sidebar,
+                layout.tab_bar.height,
+                scale,
+                SidebarMode::Expanded,
+            );
+            assert_eq!(header.y, layout.tab_bar.bottom());
+            assert_eq!(header.x, layout.sidebar.x);
+            assert_eq!(header.right(), layout.sidebar.right());
+            assert!(header.bottom() < sidebar_footer_metrics(size.height, scale).0 as i32);
+        }
+    }
+
+    #[test]
+    fn sidebar_toggle_padding_clears_the_tab_bar_bottom_border() {
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let bar =
+                compute_chrome_layout(PhysicalSize::new(1000, 600), scale, SidebarMode::Expanded)
+                    .tab_bar;
+            let toggle = sidebar_toggle_rect(bar, leading_control_inset(scale, false), scale);
+            assert!(toggle.y > bar.y);
+            assert!(toggle.bottom() < bar.bottom() - scale.ceil() as i32);
+            assert!(toggle.width < (CHROME_CONTROL_LOGICAL * scale).round() as u32);
+            assert!(f64::from(toggle.height) > SIDEBAR_ICON_LOGICAL * scale);
+        }
     }
 
     #[test]
