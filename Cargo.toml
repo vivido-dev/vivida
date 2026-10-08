@@ -65,6 +65,10 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3"
 
+[[test]]
+name = "macos_pane_geometry"
+harness = false
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0"
 

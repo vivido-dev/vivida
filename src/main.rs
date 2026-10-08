@@ -4370,6 +4370,12 @@ impl Shell {
         }
         match event {
             WindowEvent::CloseRequested => self.quit(event_loop),
+            // AppKit can relocate child windows independently during a display/Space change.
+            // Reassert the shell's offsets even when the destination has the same scale.
+            #[cfg(target_os = "macos")]
+            WindowEvent::Moved(_) => {
+                self.sync_pane_geometry();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(chrome) = &self.chrome_window {
                     finalize_chrome_window(chrome);

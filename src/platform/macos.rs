@@ -20,6 +20,8 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use super::{PaneHost, PopupFocus};
 use crate::layout::PhysicalRect;
 
+mod pane_geometry;
+
 mod launch_menu;
 pub use launch_menu::show_launch_menu;
 mod sidebar_symbol;
@@ -289,17 +291,8 @@ impl PaneHost for NativePaneHost {
     }
 
     fn move_pane(&self, processor: &mut Processor, pane_id: WindowId, rect: PhysicalRect) {
-        let Ok(origin) = self.chrome.inner_position() else {
-            return;
-        };
-        if let Some(pane) = processor.window_mut(pane_id) {
-            pane.display.window.set_geometry(
-                PhysicalPosition::new(
-                    origin.x.saturating_add(rect.x),
-                    origin.y.saturating_add(rect.y),
-                ),
-                winit::dpi::PhysicalSize::new(rect.width, rect.height),
-            );
+        if let Some((chrome, pane)) = self.native_windows(processor, pane_id) {
+            pane_geometry::place_pane(&chrome, &pane, rect);
         }
     }
 
