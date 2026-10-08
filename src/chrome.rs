@@ -70,14 +70,18 @@ pub enum SettingsMenuItem {
     Shortcuts,
     CheckForUpdates,
     Documentation,
+    #[cfg(any(windows, target_os = "linux"))]
+    About,
 }
 
 impl SettingsMenuItem {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: &[Self] = &[
         Self::Settings,
         Self::Shortcuts,
         Self::CheckForUpdates,
         Self::Documentation,
+        #[cfg(any(windows, target_os = "linux"))]
+        Self::About,
     ];
 
     pub fn label(self) -> &'static str {
@@ -86,6 +90,8 @@ impl SettingsMenuItem {
             Self::Shortcuts => "Shortcuts",
             Self::CheckForUpdates => "Check for Updates…",
             Self::Documentation => "Documentation",
+            #[cfg(any(windows, target_os = "linux"))]
+            Self::About => "About Vivida",
         }
     }
 
@@ -386,7 +392,7 @@ impl SettingsMenuRenderer {
                 ),
             ],
         );
-        for (index, item) in SettingsMenuItem::ALL.into_iter().enumerate() {
+        for (index, item) in SettingsMenuItem::ALL.iter().copied().enumerate() {
             let top = (index as u32 * row_height) as f32;
             if hovered == Some(item) {
                 paint_rects(
@@ -439,6 +445,7 @@ pub fn settings_menu_item_at(
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShortcutsRenderState {
+    pub about: bool,
     pub scroll: f64,
     pub hovered_close: bool,
 }
@@ -552,6 +559,16 @@ pub fn shortcuts_close_rect(panel: PhysicalRect, scale_factor: f64) -> PhysicalR
     }
 }
 
+/// Website link hit area in the About panel.
+pub fn about_link_rect(panel: PhysicalRect, scale: f64) -> PhysicalRect {
+    PhysicalRect {
+        x: panel.x + (SHORTCUTS_PADDING_LOGICAL * scale).round() as i32,
+        y: panel.y + (94.0 * scale).round() as i32,
+        width: (190.0 * scale).round() as u32,
+        height: (28.0 * scale).round() as u32,
+    }
+}
+
 fn paint_shortcuts_panel(
     text: &mut TextSystem,
     scale: f64,
@@ -577,7 +594,11 @@ fn paint_shortcuts_panel(
     );
     text.paint_text(
         scene,
-        "Keyboard Shortcuts",
+        if state.about {
+            "Vivida"
+        } else {
+            "Keyboard Shortcuts"
+        },
         (
             panel.x as f32 + padding,
             panel.y as f32 + 11.0 * scale as f32,
@@ -607,6 +628,28 @@ fn paint_shortcuts_panel(
         (center.0 - arm, center.1 + arm),
         scale,
     );
+
+    if state.about {
+        text.paint_text(
+            scene,
+            concat!("Version ", env!("CARGO_PKG_VERSION")),
+            (
+                panel.x as f32 + padding,
+                panel.y as f32 + 60.0 * scale as f32,
+            ),
+            TEXT,
+            false,
+        );
+        let link = about_link_rect(panel, scale);
+        text.paint_text(
+            scene,
+            "https://vivido.dev",
+            (link.x as f32, link.y as f32 + 5.0 * scale as f32),
+            ACCENT,
+            false,
+        );
+        return;
+    }
 
     let list = PhysicalRect {
         x: panel.x,
@@ -1312,7 +1355,11 @@ impl ChromeRenderer {
         state: ShortcutsRenderState,
         hit_map: &mut ChromeHitMap,
     ) {
-        hit_map.shortcuts = shortcuts_rect(size, self.scale_factor);
+        hit_map.shortcuts = if state.about {
+            panel_rect(size, self.scale_factor, (320.0, 150.0))
+        } else {
+            shortcuts_rect(size, self.scale_factor)
+        };
         hit_map.shortcuts_close = shortcuts_close_rect(hit_map.shortcuts, self.scale_factor);
         paint_shortcuts_panel(
             &mut self.text,
@@ -1347,7 +1394,7 @@ impl ChromeRenderer {
                 ),
             ],
         );
-        for (index, item) in SettingsMenuItem::ALL.into_iter().enumerate() {
+        for (index, item) in SettingsMenuItem::ALL.iter().copied().enumerate() {
             let row = PhysicalRect {
                 x: hit_map.settings_menu.x,
                 y: hit_map.settings_menu.y + (index as u32 * row_height) as i32,
@@ -1646,7 +1693,14 @@ fn leading_control_inset(scale: f64, fullscreen: bool) -> u32 {
 /// Placement of an in-chrome shortcuts panel: centred horizontally, a third of the way down, and
 /// clamped to the chrome so it never overhangs.
 fn shortcuts_rect(size: PhysicalSize<u32>, scale: f64) -> PhysicalRect {
-    let (width_logical, height_logical) = shortcuts_logical_size();
+    panel_rect(size, scale, shortcuts_logical_size())
+}
+
+fn panel_rect(
+    size: PhysicalSize<u32>,
+    scale: f64,
+    (width_logical, height_logical): (f64, f64),
+) -> PhysicalRect {
     let width = ((width_logical * scale).round() as u32).min(size.width);
     let height = ((height_logical * scale).round() as u32).min(size.height);
     PhysicalRect {
@@ -2387,7 +2441,7 @@ mod tests {
                 x: 404,
                 y: 35,
                 width: 190,
-                height: 136
+                height: 34 * SettingsMenuItem::ALL.len() as u32
             }
         );
     }
@@ -2452,7 +2506,7 @@ mod tests {
 
     #[test]
     fn settings_menu_rows_map_to_items_and_reject_the_margins() {
-        let size = PhysicalSize::new(190, 136);
+        let size = PhysicalSize::new(190, 34 * SettingsMenuItem::ALL.len() as u32);
         assert_eq!(
             settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 5.0)),
             Some(SettingsMenuItem::Settings)
@@ -2470,13 +2524,36 @@ mod tests {
             Some(SettingsMenuItem::Documentation)
         );
         assert_eq!(
-            settings_menu_item_at(size, 1.0, PhysicalPosition::new(10.0, 136.0)),
+            settings_menu_item_at(
+                size,
+                1.0,
+                PhysicalPosition::new(10.0, f64::from(size.height))
+            ),
             None
         );
         assert_eq!(
             settings_menu_item_at(size, 1.0, PhysicalPosition::new(-1.0, 40.0)),
             None
         );
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn about_follows_documentation_and_its_link_scales_with_the_panel() {
+        assert_eq!(
+            settings_menu_item_at(
+                PhysicalSize::new(380, 340),
+                2.0,
+                PhysicalPosition::new(20.0, 290.0)
+            ),
+            Some(SettingsMenuItem::About)
+        );
+        assert_eq!(SettingsMenuItem::About.label(), "About Vivida");
+        let panel = panel_rect(PhysicalSize::new(1000, 800), 2.0, (320.0, 150.0));
+        let link = about_link_rect(panel, 2.0);
+        assert!(panel.contains(f64::from(link.x), f64::from(link.y)));
+        assert!(panel.contains(f64::from(link.right() - 1), f64::from(link.bottom() - 1)));
+        assert!(!link.contains(f64::from(panel.x), f64::from(panel.y)));
     }
 
     #[test]

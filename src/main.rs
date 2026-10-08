@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use chrome::{
     ChromeHitMap, ChromeLayout, ChromeRenderState, ChromeRenderer, ContextMenuRenderState,
     RenameEditorRenderState, RenameEditorRenderer, SettingsMenuItem, SettingsMenuRenderer,
-    ShortcutsRenderState, ShortcutsRenderer, SidebarMode, compute_chrome_layout,
+    ShortcutsRenderState, ShortcutsRenderer, SidebarMode, about_link_rect, compute_chrome_layout,
     rename_editor_logical_size, settings_menu_item_at, settings_menu_logical_size,
     shortcuts_close_rect, shortcuts_content_height, shortcuts_header_height,
     shortcuts_logical_size, shortcuts_row_height,
@@ -605,6 +605,7 @@ struct Shell {
     shortcuts_id: Option<WindowId>,
     shortcuts_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
     shortcuts_open: bool,
+    about_open: bool,
     shortcuts_scroll: f64,
     shortcuts_cursor: Option<PhysicalPosition<f64>>,
     shortcuts_hover_close: bool,
@@ -813,6 +814,7 @@ impl Shell {
             shortcuts_id: None,
             shortcuts_embedded_size: None,
             shortcuts_open: false,
+            about_open: false,
             shortcuts_scroll: 0.0,
             shortcuts_cursor: None,
             shortcuts_hover_close: false,
@@ -2866,6 +2868,7 @@ impl Shell {
                 ShortcutsRenderState {
                     scroll: self.shortcuts_scroll,
                     hovered_close: self.shortcuts_hover_close,
+                    about: self.about_open,
                 },
             )
         {
@@ -2988,6 +2991,7 @@ impl Shell {
                     ShortcutsRenderState {
                         scroll: self.shortcuts_scroll,
                         hovered_close: self.shortcuts_hover_close,
+                        about: self.about_open,
                     },
                 ),
                 context_menu,
@@ -3085,6 +3089,48 @@ impl Shell {
         Ok(())
     }
 
+    fn open_info_panel(&mut self, about: bool) {
+        self.set_shortcuts_open(false);
+        self.about_open = about;
+        let (width, height) = if about {
+            (320.0, 150.0)
+        } else {
+            shortcuts_logical_size()
+        };
+        let scale = self
+            .shortcuts_window
+            .as_ref()
+            .or(self.chrome_window.as_ref())
+            .map_or(1.0, |window| window.scale_factor());
+        let size = LogicalSize::new(width, height).to_physical(scale);
+        if let Some(window) = &self.shortcuts_window {
+            window.set_title(if about {
+                "About Vivida"
+            } else {
+                "Vivida shortcuts"
+            });
+            let _ = window.request_inner_size(size);
+        } else {
+            self.shortcuts_embedded_size = Some(size);
+        }
+        if let Some(renderer) = &mut self.shortcuts_renderer {
+            renderer.resize(size, scale, &self.config);
+        }
+        self.set_shortcuts_open(true);
+    }
+
+    fn click_about_link(&self, cursor: PhysicalPosition<f64>) -> bool {
+        if self.about_open
+            && self.shortcuts_panel().is_some_and(|(panel, scale)| {
+                about_link_rect(panel, scale).contains(cursor.x, cursor.y)
+            })
+        {
+            platform::open_url("https://vivido.dev");
+            return true;
+        }
+        false
+    }
+
     fn set_shortcuts_open(&mut self, open: bool) {
         if self.shortcuts_open == open {
             if open {
@@ -3140,6 +3186,7 @@ impl Shell {
         let state = ShortcutsRenderState {
             scroll: self.shortcuts_scroll,
             hovered_close: self.shortcuts_hover_close,
+            about: self.about_open,
         };
         let (Some(window), Some(renderer)) = (&self.shortcuts_window, &mut self.shortcuts_renderer)
         else {
@@ -3259,6 +3306,9 @@ impl Shell {
     }
 
     fn scroll_shortcuts(&mut self, delta: f64) {
+        if self.about_open {
+            return;
+        }
         let (content, viewport) = self.shortcuts_viewport();
         let scroll = clamp_scroll(self.shortcuts_scroll + delta, content, viewport);
         if (scroll - self.shortcuts_scroll).abs() < f64::EPSILON {
@@ -3741,9 +3791,11 @@ impl Shell {
     fn activate_settings_item(&mut self, event_loop: &ActiveEventLoop, item: SettingsMenuItem) {
         match item {
             SettingsMenuItem::Settings => self.open_config_in_editor(event_loop),
-            SettingsMenuItem::Shortcuts => self.set_shortcuts_open(true),
+            SettingsMenuItem::Shortcuts => self.open_info_panel(false),
             SettingsMenuItem::CheckForUpdates => request_update_check(&self.event_sink),
             SettingsMenuItem::Documentation => platform::open_url(DOCUMENTATION_URL),
+            #[cfg(any(windows, target_os = "linux"))]
+            SettingsMenuItem::About => self.open_info_panel(true),
         }
     }
 
@@ -4057,6 +4109,9 @@ impl Shell {
         if self.shortcuts_open && self.shortcuts_window.is_none() {
             if self.shortcuts_hover_close {
                 self.set_shortcuts_open(false);
+                return true;
+            }
+            if self.click_about_link(cursor) {
                 return true;
             }
             if self.chrome_hits.shortcuts.contains(cursor.x, cursor.y) {
@@ -5235,7 +5290,13 @@ impl ApplicationHandler<Event> for Shell {
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } if self.shortcuts_hover_close => self.set_shortcuts_open(false),
+                } => {
+                    if self.shortcuts_hover_close {
+                        self.set_shortcuts_open(false);
+                    } else if let Some(cursor) = self.shortcuts_cursor {
+                        self.click_about_link(cursor);
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed =>
                 {
@@ -6149,7 +6210,15 @@ mod tests {
             SettingsMenuItem::from_index(3),
             Some(SettingsMenuItem::Documentation)
         );
-        assert_eq!(SettingsMenuItem::from_index(4), None);
+        #[cfg(any(windows, target_os = "linux"))]
+        assert_eq!(
+            SettingsMenuItem::from_index(4),
+            Some(SettingsMenuItem::About)
+        );
+        assert_eq!(
+            SettingsMenuItem::from_index(SettingsMenuItem::ALL.len()),
+            None
+        );
     }
 
     #[test]
