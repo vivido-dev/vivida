@@ -18,9 +18,11 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
 use crate::layout::PhysicalRect;
+use crate::locale::Locale;
 use crate::model::{TabId, Workspace, WorkspaceId};
 use crate::platform::{pane_bottom_resize_gutter, pane_side_resize_gutter};
 use crate::shortcuts;
+use crate::strings::Label;
 
 pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 132.0;
 pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
@@ -84,14 +86,14 @@ impl SettingsMenuItem {
         Self::About,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> Label {
         match self {
-            Self::Settings => "Settings",
-            Self::Shortcuts => "Shortcuts",
-            Self::CheckForUpdates => "Check for Updates…",
-            Self::Documentation => "Documentation",
+            Self::Settings => Label::Settings,
+            Self::Shortcuts => Label::Shortcuts,
+            Self::CheckForUpdates => Label::CheckForUpdates,
+            Self::Documentation => Label::Documentation,
             #[cfg(any(windows, target_os = "linux"))]
-            Self::About => "About Vivida",
+            Self::About => Label::AboutVivida,
         }
     }
 
@@ -252,6 +254,7 @@ pub struct ChromeRenderState<'a> {
     pub context_menu: Option<ContextMenuRenderState<'a>>,
     pub rename_editor: Option<RenameEditorRenderState<'a>>,
     pub embedded_frames: &'a [EmbeddedFramePlacement<'a>],
+    pub locale: Locale,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -367,6 +370,7 @@ impl SettingsMenuRenderer {
         &mut self,
         size: PhysicalSize<u32>,
         hovered: Option<SettingsMenuItem>,
+        locale: Locale,
     ) -> Result<bool, vivido::display::renderer::Error> {
         let scale = self.scale_factor;
         let row_height = (SETTINGS_MENU_ROW_LOGICAL * scale).round() as u32;
@@ -409,7 +413,7 @@ impl SettingsMenuRenderer {
             }
             self.text.paint_text(
                 &mut scene,
-                item.label(),
+                item.label().t(locale),
                 (12.0 * scale as f32, top + 9.0 * scale as f32),
                 TEXT,
                 false,
@@ -445,6 +449,7 @@ pub fn settings_menu_item_at(
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShortcutsRenderState {
+    pub locale: Locale,
     pub about: bool,
     pub scroll: f64,
     pub hovered_close: bool,
@@ -595,9 +600,9 @@ fn paint_shortcuts_panel(
     text.paint_text(
         scene,
         if state.about {
-            "Vivida"
+            Label::ProductName.t(state.locale)
         } else {
-            "Keyboard Shortcuts"
+            Label::ShortcutsHeader.t(state.locale)
         },
         (
             panel.x as f32 + padding,
@@ -632,7 +637,11 @@ fn paint_shortcuts_panel(
     if state.about {
         text.paint_text(
             scene,
-            concat!("Version ", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "{} {}",
+                Label::Version.t(state.locale),
+                env!("CARGO_PKG_VERSION")
+            ),
             (
                 panel.x as f32 + padding,
                 panel.y as f32 + 60.0 * scale as f32,
@@ -676,7 +685,7 @@ fn paint_shortcuts_panel(
     for section in shortcuts::sections() {
         text.paint_text(
             scene,
-            section.title,
+            section.title.t(state.locale),
             (panel.x as f32 + padding, y + 12.0 * scale as f32),
             MUTED,
             true,
@@ -687,7 +696,7 @@ fn paint_shortcuts_panel(
             if y + row_height >= list.y as f32 && y <= list.bottom() as f32 {
                 text.paint_text(
                     scene,
-                    row.description,
+                    row.description.t(state.locale),
                     (panel.x as f32 + padding, y + 5.0 * scale as f32),
                     TEXT,
                     false,
@@ -923,6 +932,7 @@ impl ChromeRenderer {
                 state.active_workspace,
                 state.hovered_workspace,
                 layout.tab_bar.height,
+                state.locale,
                 &mut hit_map,
             );
         }
@@ -944,13 +954,19 @@ impl ChromeRenderer {
             paint_rects(&mut scene, [rect(divider, ACCENT)]);
         }
         if state.settings_menu_open {
-            self.paint_settings_menu(&mut scene, size, state.settings_menu_hover, &mut hit_map);
+            self.paint_settings_menu(
+                &mut scene,
+                size,
+                state.settings_menu_hover,
+                state.locale,
+                &mut hit_map,
+            );
         }
         if let Some(shortcuts) = state.shortcuts {
             self.paint_shortcuts(&mut scene, size, shortcuts, &mut hit_map);
         }
         if let Some(menu) = state.context_menu {
-            self.paint_context_menu(&mut scene, size, menu, &mut hit_map);
+            self.paint_context_menu(&mut scene, size, menu, state.locale, &mut hit_map);
         }
         if let Some(editor) = state.rename_editor {
             self.paint_rename_editor(&mut scene, size, editor, &mut hit_map);
@@ -1225,6 +1241,7 @@ impl ChromeRenderer {
         active_workspace: Option<WorkspaceId>,
         hovered_workspace: Option<WorkspaceId>,
         sidebar_top: u32,
+        locale: Locale,
         hit_map: &mut ChromeHitMap,
     ) {
         let scale = self.scale_factor;
@@ -1238,7 +1255,7 @@ impl ChromeRenderer {
         if mode == SidebarMode::Expanded {
             self.text.paint_text(
                 scene,
-                "Spaces",
+                Label::Spaces.t(locale),
                 (padding as f32, header.y as f32 + (10.0 * scale) as f32),
                 MUTED,
                 true,
@@ -1334,7 +1351,7 @@ impl ChromeRenderer {
             height: footer_height,
         };
         let (label, label_x) = if mode == SidebarMode::Expanded {
-            ("+ New Space", padding as f32)
+            (Label::NewSpace.t(locale), padding as f32)
         } else {
             let plus_width = self.text.measure_text("+", true);
             ("+", ((area.width as f32 - plus_width) / 2.0).max(0.0))
@@ -1375,6 +1392,7 @@ impl ChromeRenderer {
         scene: &mut Scene,
         size: PhysicalSize<u32>,
         hovered: Option<SettingsMenuItem>,
+        locale: Locale,
         hit_map: &mut ChromeHitMap,
     ) {
         let scale = self.scale_factor;
@@ -1415,7 +1433,7 @@ impl ChromeRenderer {
             hit_map.settings_items.push(row);
             self.text.paint_text(
                 scene,
-                item.label(),
+                item.label().t(locale),
                 (
                     row.x as f32 + 12.0 * scale as f32,
                     row.y as f32 + 9.0 * scale as f32,
@@ -1431,6 +1449,7 @@ impl ChromeRenderer {
         scene: &mut Scene,
         size: PhysicalSize<u32>,
         state: ContextMenuRenderState<'_>,
+        locale: Locale,
         hit_map: &mut ChromeHitMap,
     ) {
         let scale = self.scale_factor;
@@ -1456,11 +1475,15 @@ impl ChromeRenderer {
         let labels = if let Some(entries) = state.launch_entries {
             entries.iter().map(|entry| entry.label.as_str()).collect()
         } else if state.recovery_actions {
-            vec!["Reset Terminal", "Restart Terminal", "Cancel"]
+            vec![
+                Label::ResetTerminal.t(locale),
+                Label::RestartTerminal.t(locale),
+                Label::Cancel.t(locale),
+            ]
         } else if state.reset_title {
-            vec!["Rename", "Reset"]
+            vec![Label::Rename.t(locale), Label::Reset.t(locale)]
         } else {
-            vec!["Rename"]
+            vec![Label::Rename.t(locale)]
         };
         for (index, label) in labels.iter().enumerate() {
             let mut row = PhysicalRect {
@@ -2548,7 +2571,10 @@ mod tests {
             ),
             Some(SettingsMenuItem::About)
         );
-        assert_eq!(SettingsMenuItem::About.label(), "About Vivida");
+        assert_eq!(
+            SettingsMenuItem::About.label().t(Locale::En),
+            "About Vivida"
+        );
         let panel = panel_rect(PhysicalSize::new(1000, 800), 2.0, (320.0, 150.0));
         let link = about_link_rect(panel, 2.0);
         assert!(panel.contains(f64::from(link.x), f64::from(link.y)));

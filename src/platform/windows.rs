@@ -4,6 +4,7 @@ use std::error::Error;
 
 use vivido::Event;
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Globalization::{GetUserDefaultUILanguage, LCIDToLocaleName};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos};
 use winit::event_loop::EventLoopBuilder;
@@ -102,6 +103,36 @@ pub fn position_popup(
 
 pub fn set_popup_visible(window: &Window, visible: bool) {
     window.set_visible(visible);
+}
+
+/// `LOCALE_NAME_MAX_LENGTH` from WinNls.h; windows-sys does not export the constant.
+const LOCALE_NAME_MAX_LENGTH: usize = 85;
+
+/// The user's preferred UI language as a locale name, e.g. `zh-TW`.
+///
+/// A LANGID from `GetUserDefaultUILanguage` is a valid sort-neutral LCID, so
+/// `LCIDToLocaleName` turns it into the BCP-47 name without an intermediate table.
+pub fn preferred_language_tag() -> Option<String> {
+    let language = GetUserDefaultUILanguage();
+    let mut name = [0u16; LOCALE_NAME_MAX_LENGTH];
+    // SAFETY: `name` is a writable buffer of the documented locale-name length, and the LANGID
+    // comes straight from the system. Zero flags request the neutral name.
+    let written = unsafe {
+        LCIDToLocaleName(
+            u32::from(language),
+            name.as_mut_ptr(),
+            LOCALE_NAME_MAX_LENGTH as i32,
+            0,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    let end = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    Some(String::from_utf16_lossy(&name[..end]))
 }
 
 fn hwnd(raw: RawWindowHandle) -> Option<HWND> {

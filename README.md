@@ -79,6 +79,13 @@ Vivida is released under the Apache-2.0 license. See [LICENSE](LICENSE)
 
 ## Notes
 
+### Interface language
+
+Vivida's UI follows your system language — English, Traditional Chinese (zh-Hant), Simplified
+Chinese (zh-Hans), and Japanese are built in. To override it, set `VIVIDA_LOCALE` to a language
+tag and start Vivida from a terminal or launcher that passes it through, e.g.
+`VIVIDA_LOCALE=zh-Hant vivida`. Unrecognized values fall back to the system language.
+
 > [!WARNING]
 > **On Windows, do not install WezTerm alongside Vivida.** Older builds of Vivida's embedded
 > Vivido terminal can load WezTerm's bundled `conpty.dll` from `PATH`. We reproduced dropped

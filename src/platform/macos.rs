@@ -6,7 +6,7 @@ use std::sync::{Arc, Once};
 use objc2::runtime::{Bool, Sel};
 use objc2::{ClassType, MainThreadMarker, ffi, sel};
 use objc2_app_kit::{NSApplication, NSView, NSWindowButton, NSWindowOrderingMode};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSLocale, NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use vivido::cli::TerminalOptions;
 use vivido::{Event, LoopHandle, ParentWindowHandle, Processor, WindowOptions};
@@ -36,6 +36,16 @@ pub fn configure_event_loop(builder: &mut EventLoopBuilder<Event>) {
 pub fn application_is_active() -> bool {
     let mtm = MainThreadMarker::new().expect("pane hosting runs on the main thread");
     NSApplication::sharedApplication(mtm).isActive()
+}
+
+/// The user's preferred UI language tag, e.g. `zh-Hant-TW`.
+///
+/// `preferredLanguages` is the list the user orders in System Settings, so unlike
+/// `currentLocale` it reflects the interface language rather than regional formats.
+pub fn preferred_language_tag() -> Option<String> {
+    NSLocale::preferredLanguages()
+        .firstObject()
+        .map(|tag| tag.to_string())
 }
 
 pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes {

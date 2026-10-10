@@ -7,11 +7,13 @@
 
 mod chrome;
 mod layout;
+mod locale;
 mod model;
 mod platform;
 mod session;
 mod shortcuts;
 mod split_resize;
+mod strings;
 
 use split_resize::{DragEvent, SplitDrag, divider_at, divider_cursor, drag_event};
 
@@ -31,6 +33,7 @@ use chrome::{
 };
 use clap::{Args, Parser, Subcommand};
 use layout::{Axis, PhysicalRect, compute_rects, resize_pane};
+use locale::Locale;
 use model::{
     PaneId, PaneKey, TabId, Workspace, WorkspaceId, focus_owned_pane, names_equal, normalize_name,
     remove_owned_pane, unique_name, workspace_label,
@@ -40,6 +43,7 @@ use platform::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
     position_popup, set_popup_visible,
 };
+use strings::Label;
 use vivido::cli::{
     IpcSignalName, ListOptions, MessageOptions, SocketMessage, TerminalOptions, WindowOptions,
 };
@@ -591,6 +595,7 @@ struct Shell {
     processor: Processor,
     event_sink: EventSink,
     _automation_registry: RegistryGuard,
+    locale: Locale,
     chrome_window: Option<Arc<Window>>,
     chrome_renderer: Option<ChromeRenderer>,
     chrome_id: Option<WindowId>,
@@ -800,6 +805,7 @@ impl Shell {
             processor,
             event_sink,
             _automation_registry: automation_registry,
+            locale: Locale::detect(),
             chrome_window: None,
             chrome_renderer: None,
             chrome_id: None,
@@ -2855,7 +2861,7 @@ impl Shell {
                 &mut self.settings_menu_renderer,
                 self.settings_menu_embedded_size,
             )
-            && let Err(error) = renderer.render(size, self.settings_menu_hover)
+            && let Err(error) = renderer.render(size, self.settings_menu_hover, self.locale)
         {
             eprintln!("failed to render embedded settings menu: {error}");
         }
@@ -2866,6 +2872,7 @@ impl Shell {
             && let Err(error) = renderer.render(
                 size,
                 ShortcutsRenderState {
+                    locale: self.locale,
                     scroll: self.shortcuts_scroll,
                     hovered_close: self.shortcuts_hover_close,
                     about: self.about_open,
@@ -2962,8 +2969,8 @@ impl Shell {
             .filter(|_| self.rename_editor_window.is_none())
             .map(|(editor, display_value)| RenameEditorRenderState {
                 label: match editor.target {
-                    NameTarget::Workspace(_) => "Rename Space",
-                    NameTarget::Tab { .. } => "Rename Tab",
+                    NameTarget::Workspace(_) => Label::RenameSpace.t(self.locale),
+                    NameTarget::Tab { .. } => Label::RenameTab.t(self.locale),
                 },
                 display_value,
                 error: editor.error.as_deref(),
@@ -2989,6 +2996,7 @@ impl Shell {
                 update_available: self.update_available,
                 shortcuts: (self.shortcuts_open && self.shortcuts_window.is_none()).then_some(
                     ShortcutsRenderState {
+                        locale: self.locale,
                         scroll: self.shortcuts_scroll,
                         hovered_close: self.shortcuts_hover_close,
                         about: self.about_open,
@@ -2997,6 +3005,7 @@ impl Shell {
                 context_menu,
                 rename_editor,
                 embedded_frames: &embedded_frames,
+                locale: self.locale,
             },
         ) {
             Ok((layout, hit_map, presented)) => {
@@ -3105,9 +3114,9 @@ impl Shell {
         let size = LogicalSize::new(width, height).to_physical(scale);
         if let Some(window) = &self.shortcuts_window {
             window.set_title(if about {
-                "About Vivida"
+                Label::AboutVivida.t(self.locale)
             } else {
-                "Vivida shortcuts"
+                Label::ShortcutsWindowTitle.t(self.locale)
             });
             let _ = window.request_inner_size(size);
         } else {
@@ -3184,6 +3193,7 @@ impl Shell {
             return;
         }
         let state = ShortcutsRenderState {
+            locale: self.locale,
             scroll: self.shortcuts_scroll,
             hovered_close: self.shortcuts_hover_close,
             about: self.about_open,
@@ -3737,8 +3747,8 @@ impl Shell {
         let display_value = editor.display_value();
         let state = RenameEditorRenderState {
             label: match editor.target {
-                NameTarget::Workspace(_) => "Rename Space",
-                NameTarget::Tab { .. } => "Rename Tab",
+                NameTarget::Workspace(_) => Label::RenameSpace.t(self.locale),
+                NameTarget::Tab { .. } => Label::RenameTab.t(self.locale),
             },
             display_value: &display_value,
             error: editor.error.as_deref(),
@@ -3836,7 +3846,7 @@ impl Shell {
         else {
             return;
         };
-        match renderer.render(window.inner_size(), hovered) {
+        match renderer.render(window.inner_size(), hovered, self.locale) {
             Ok(true) => (),
             Ok(false) => window.request_redraw(),
             Err(error) => eprintln!("failed to render settings menu: {error}"),

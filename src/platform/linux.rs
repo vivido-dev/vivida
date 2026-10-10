@@ -40,3 +40,13 @@ pub fn position_popup(
 pub fn set_popup_visible(window: &Window, visible: bool) {
     window.set_visible(visible);
 }
+
+/// The first set locale environment variable, e.g. `zh_TW.UTF-8`.
+///
+/// `LC_ALL` overrides `LC_MESSAGES`, which overrides `LANG`; semantic filtering of `C`,
+/// `POSIX`, and unparseable values happens in [`crate::locale::from_tag`].
+pub fn preferred_language_tag() -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+}

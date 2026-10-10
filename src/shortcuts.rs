@@ -7,101 +7,103 @@
 //!
 //! [`handle_shell_shortcut`]: crate::Shell::handle_shell_shortcut
 
+use crate::strings::Label;
+
 /// One titled block of rows in the shortcuts window.
 pub struct Section {
-    pub title: &'static str,
+    pub title: Label,
     pub rows: &'static [Row],
 }
 
 /// A shortcut and what it does. `keys` is already formatted for this platform.
 pub struct Row {
     pub keys: &'static str,
-    pub description: &'static str,
+    pub description: Label,
 }
 
-const fn row(keys: &'static str, description: &'static str) -> Row {
+const fn row(keys: &'static str, description: Label) -> Row {
     Row { keys, description }
 }
 
 #[cfg(target_os = "macos")]
 const VIVIDA: &[Row] = &[
-    row("⌘T", "New tab"),
-    row("⌘D", "Split the pane left and right"),
-    row("⌘⇧D", "Split the pane top and bottom"),
-    row("⌘W", "Close the focused pane"),
-    row("⌘⇧N", "New space"),
-    row("⌘⇧W", "Close the space"),
-    row("⌘⇧B", "Expand, shrink, or hide the sidebar"),
-    row("⌘⇧]", "Next tab"),
-    row("⌘⇧[", "Previous tab"),
-    row("⌘1 – ⌘9", "Switch to space 1 through 9"),
-    row("⌃⇧F12", "Recover a stuck terminal"),
+    row("⌘T", Label::NewTab),
+    row("⌘D", Label::SplitHorizontal),
+    row("⌘⇧D", Label::SplitVertical),
+    row("⌘W", Label::CloseFocusedPane),
+    row("⌘⇧N", Label::NewSpaceShortcut),
+    row("⌘⇧W", Label::CloseSpace),
+    row("⌘⇧B", Label::CycleSidebar),
+    row("⌘⇧]", Label::NextTab),
+    row("⌘⇧[", Label::PreviousTab),
+    row("⌘1 – ⌘9", Label::SwitchToSpace),
+    row("⌃⇧F12", Label::RecoverTerminal),
 ];
 
 #[cfg(not(target_os = "macos"))]
 const VIVIDA: &[Row] = &[
-    row("Ctrl T", "New tab"),
-    row("Ctrl D", "Split the pane left and right"),
-    row("Ctrl Shift D", "Split the pane top and bottom"),
-    row("Ctrl W", "Close the focused pane"),
-    row("Ctrl Shift N", "New space"),
-    row("Ctrl Shift W", "Close the space"),
-    row("Ctrl Shift B", "Expand, shrink, or hide the sidebar"),
-    row("Ctrl Shift ]", "Next tab"),
-    row("Ctrl Shift [", "Previous tab"),
-    row("Ctrl 1 – Ctrl 9", "Switch to space 1 through 9"),
-    row("Ctrl Shift F12", "Recover a stuck terminal"),
+    row("Ctrl T", Label::NewTab),
+    row("Ctrl D", Label::SplitHorizontal),
+    row("Ctrl Shift D", Label::SplitVertical),
+    row("Ctrl W", Label::CloseFocusedPane),
+    row("Ctrl Shift N", Label::NewSpaceShortcut),
+    row("Ctrl Shift W", Label::CloseSpace),
+    row("Ctrl Shift B", Label::CycleSidebar),
+    row("Ctrl Shift ]", Label::NextTab),
+    row("Ctrl Shift [", Label::PreviousTab),
+    row("Ctrl 1 – Ctrl 9", Label::SwitchToSpace),
+    row("Ctrl Shift F12", Label::RecoverTerminal),
 ];
 
 #[cfg(target_os = "macos")]
 const TERMINAL: &[Row] = &[
-    row("⌘C", "Copy the selection"),
-    row("⌘V", "Paste"),
-    row("⌘⇧P", "Command palette"),
-    row("⌘F", "Search forward"),
-    row("⌘B", "Search backward"),
-    row("⌘K", "Clear the scrollback"),
-    row("⌘0", "Reset the font size"),
-    row("⌘+ / ⌘−", "Increase or decrease the font size"),
-    row("⌃⌘F", "Toggle fullscreen"),
-    row("⌃⇧O", "Open a link shown on screen"),
-    row("⇧PageUp / ⇧PageDown", "Scroll one page"),
-    row("⇧Home / ⇧End", "Scroll to the top or bottom"),
+    row("⌘C", Label::CopySelection),
+    row("⌘V", Label::Paste),
+    row("⌘⇧P", Label::CommandPalette),
+    row("⌘F", Label::SearchForward),
+    row("⌘B", Label::SearchBackward),
+    row("⌘K", Label::ClearScrollback),
+    row("⌘0", Label::ResetFontSize),
+    row("⌘+ / ⌘−", Label::ChangeFontSize),
+    row("⌃⌘F", Label::ToggleFullscreen),
+    row("⌃⇧O", Label::OpenLinkOnScreen),
+    row("⇧PageUp / ⇧PageDown", Label::ScrollOnePage),
+    row("⇧Home / ⇧End", Label::ScrollToEnd),
 ];
 
 #[cfg(not(target_os = "macos"))]
 const TERMINAL: &[Row] = &[
-    row("Ctrl Shift C", "Copy the selection"),
-    row("Ctrl Shift V", "Paste"),
-    row("Shift Insert", "Paste the primary selection"),
-    row("Ctrl Shift P", "Command palette"),
-    row("Ctrl Shift F", "Search forward"),
-    row("Ctrl 0", "Reset the font size"),
-    row("Ctrl + / Ctrl −", "Increase or decrease the font size"),
-    row("Ctrl Shift O", "Open a link shown on screen"),
-    row("Shift PageUp / Shift PageDown", "Scroll one page"),
-    row("Shift Home / Shift End", "Scroll to the top or bottom"),
+    row("Ctrl Shift C", Label::CopySelection),
+    row("Ctrl Shift V", Label::Paste),
+    row("Shift Insert", Label::PastePrimarySelection),
+    row("Ctrl Shift P", Label::CommandPalette),
+    row("Ctrl Shift F", Label::SearchForward),
+    row("Ctrl 0", Label::ResetFontSize),
+    row("Ctrl + / Ctrl −", Label::ChangeFontSize),
+    row("Ctrl Shift O", Label::OpenLinkOnScreen),
+    row("Shift PageUp / Shift PageDown", Label::ScrollOnePage),
+    row("Shift Home / Shift End", Label::ScrollToEnd),
 ];
 
 const SEARCH: &[Row] = &[
-    row("Enter", "Confirm the match"),
-    row("Escape", "Cancel the search"),
-    row("F3 / Shift F3", "Next or previous match"),
-    row("Ctrl U", "Clear the query"),
-    row("Ctrl P / Ctrl N", "Previous or next search in history"),
+    row("Enter", Label::ConfirmMatch),
+    row("Escape", Label::CancelSearch),
+    row("F3 / Shift F3", Label::NextOrPreviousMatch),
+    row("Ctrl U", Label::ClearQuery),
+    row("Ctrl P / Ctrl N", Label::SearchHistory),
 ];
 
 const SECTIONS: &[Section] = &[
     Section {
-        title: "Vivida",
+        title: Label::ProductName,
         rows: VIVIDA,
     },
     Section {
-        title: "Terminal",
+        title: Label::SectionTerminal,
         rows: TERMINAL,
     },
     Section {
-        title: "While searching",
+        title: Label::SectionSearch,
         rows: SEARCH,
     },
 ];
@@ -113,25 +115,32 @@ pub fn sections() -> &'static [Section] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::locale::Locale;
 
     #[test]
-    fn every_section_lists_described_shortcuts() {
+    fn every_section_lists_described_shortcuts_in_every_locale() {
         assert!(!sections().is_empty());
-        for section in sections() {
-            assert!(!section.title.is_empty());
-            assert!(!section.rows.is_empty(), "{} has no rows", section.title);
-            for row in section.rows {
+        for locale in Locale::ALL {
+            for section in sections() {
+                assert!(!section.title.t(*locale).is_empty());
                 assert!(
-                    !row.keys.is_empty(),
-                    "{} has an unlabelled row",
-                    section.title
+                    !section.rows.is_empty(),
+                    "{} has no rows",
+                    section.title.t(*locale)
                 );
-                assert!(
-                    !row.description.is_empty(),
-                    "{} has an undescribed row {}",
-                    section.title,
-                    row.keys
-                );
+                for row in section.rows {
+                    assert!(
+                        !row.keys.is_empty(),
+                        "{} has an unlabelled row",
+                        section.title.t(*locale)
+                    );
+                    assert!(
+                        !row.description.t(*locale).is_empty(),
+                        "{} has an undescribed row {}",
+                        section.title.t(*locale),
+                        row.keys
+                    );
+                }
             }
         }
     }
