@@ -113,7 +113,8 @@ const LOCALE_NAME_MAX_LENGTH: usize = 85;
 /// A LANGID from `GetUserDefaultUILanguage` is a valid sort-neutral LCID, so
 /// `LCIDToLocaleName` turns it into the BCP-47 name without an intermediate table.
 pub fn preferred_language_tag() -> Option<String> {
-    let language = GetUserDefaultUILanguage();
+    // SAFETY: this parameterless query has no caller preconditions.
+    let language = unsafe { GetUserDefaultUILanguage() };
     let mut name = [0u16; LOCALE_NAME_MAX_LENGTH];
     // SAFETY: `name` is a writable buffer of the documented locale-name length, and the LANGID
     // comes straight from the system. Zero flags request the neutral name.
