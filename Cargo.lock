@@ -4039,6 +4039,7 @@ dependencies = [
  "home",
  "image",
  "libc",
+ "libloading",
  "log",
  "mac-usernotifications",
  "memchr",
