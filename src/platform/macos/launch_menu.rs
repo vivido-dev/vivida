@@ -1,4 +1,4 @@
-//! Native launch menus stay above the terminal child windows.
+//! Native popup menus stay above the terminal child windows.
 
 use std::cell::Cell;
 use std::error::Error;
@@ -43,19 +43,31 @@ pub fn show_launch_menu(
     entries: &[LaunchEntry],
     anchor: PhysicalPosition<i32>,
 ) -> Result<Option<usize>, Box<dyn Error>> {
-    let mtm = MainThreadMarker::new().ok_or("launch menu requires the main thread")?;
+    let labels = entries
+        .iter()
+        .map(|entry| entry.label.as_str())
+        .collect::<Vec<_>>();
+    show_context_menu(chrome, &labels, anchor)
+}
+
+pub fn show_context_menu(
+    chrome: &Window,
+    labels: &[&str],
+    anchor: PhysicalPosition<i32>,
+) -> Result<Option<usize>, Box<dyn Error>> {
+    let mtm = MainThreadMarker::new().ok_or("popup menu requires the main thread")?;
     let owner =
         super::ns_window(chrome.window_handle()?.as_raw()).ok_or("chrome has no macOS window")?;
     let view = owner.contentView().ok_or("chrome has no content view")?;
     let target = LaunchMenuTarget::new(mtm);
     let menu = NSMenu::initWithTitle(mtm.alloc(), ns_string!(""));
     menu.setAutoenablesItems(false);
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, label) in labels.iter().enumerate() {
         // SAFETY: the selector is implemented above with AppKit's single-menu-item signature.
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc(),
-                &NSString::from_str(&entry.label),
+                &NSString::from_str(label),
                 Some(sel!(selectLaunchEntry:)),
                 ns_string!(""),
             )

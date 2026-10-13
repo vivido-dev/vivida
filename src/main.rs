@@ -3396,12 +3396,54 @@ impl Shell {
         self.close_recovery_menu();
         self.set_settings_menu_open(false);
         self.name_editor = None;
-        // Native terminal children sit above the chrome content surface. Keep both tab actions
-        // wholly inside the tab strip so their clicks always reach the chrome, including
-        // when the target tab is inactive.
-        let anchor = name_context_anchor(target, anchor);
-        self.name_context_menu = Some(NameContextMenu { target, anchor });
-        self.request_chrome_redraw();
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            // The compact sidebar is narrower than a menu. Native tracking keeps the actions
+            // above terminal children even when the menu extends into the pane area.
+            let labels = name_context_labels(target, self.locale);
+            let result = self
+                .chrome_window
+                .as_ref()
+                .map(|chrome| platform::show_context_menu(chrome, &labels, anchor.cast()));
+            match result {
+                Some(Ok(Some(index))) => self.activate_name_action(target, index),
+                Some(Err(error)) => eprintln!("failed to show name menu: {error}"),
+                _ => self.focus_active_pane(),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            // Keep the two tab actions side by side inside the tab strip.
+            let anchor = name_context_anchor(target, anchor);
+            self.name_context_menu = Some(NameContextMenu { target, anchor });
+            self.request_chrome_redraw();
+        }
+    }
+
+    fn activate_name_action(&mut self, target: NameTarget, index: usize) {
+        self.name_context_menu = None;
+        match (target, index) {
+            (target, 0) => self.start_name_editor(target),
+            (
+                NameTarget::Tab {
+                    workspace_id,
+                    tab_id,
+                },
+                1,
+            ) => {
+                if let Err(error) = self.host_reset_tab_title(TabTarget {
+                    workspace_id: Some(workspace_id.0),
+                    workspace_name: None,
+                    tab_id: Some(tab_id.0),
+                    tab_name: None,
+                    from_window_id: None,
+                }) {
+                    eprintln!("failed to reset tab title: {}", error.message);
+                }
+                self.request_chrome_redraw();
+            }
+            _ => self.request_chrome_redraw(),
+        }
     }
 
     fn open_recovery_menu(&mut self, pane: WindowId) {
@@ -4166,31 +4208,11 @@ impl Shell {
                 .context_items
                 .iter()
                 .position(|rect| rect.contains(cursor.x, cursor.y));
-            match (menu.target, item) {
-                (target, Some(0)) => self.start_name_editor(target),
-                (
-                    NameTarget::Tab {
-                        workspace_id,
-                        tab_id,
-                    },
-                    Some(1),
-                ) => {
-                    self.name_context_menu = None;
-                    if let Err(error) = self.host_reset_tab_title(TabTarget {
-                        workspace_id: Some(workspace_id.0),
-                        workspace_name: None,
-                        tab_id: Some(tab_id.0),
-                        tab_name: None,
-                        from_window_id: None,
-                    }) {
-                        eprintln!("failed to reset tab title: {}", error.message);
-                    }
-                    self.request_chrome_redraw();
-                }
-                _ => {
-                    self.name_context_menu = None;
-                    self.request_chrome_redraw();
-                }
+            if let Some(index) = item {
+                self.activate_name_action(menu.target, index);
+            } else {
+                self.name_context_menu = None;
+                self.request_chrome_redraw();
             }
             return true;
         }
@@ -4981,6 +5003,16 @@ fn automatic_tab_label_follows_directory_changes_after_reset() {
     assert_eq!(workspace.tabs[0].title, "third");
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+fn name_context_labels(target: NameTarget, locale: Locale) -> Vec<&'static str> {
+    let mut labels = vec![Label::Rename.t(locale)];
+    if matches!(target, NameTarget::Tab { .. }) {
+        labels.push(Label::Reset.t(locale));
+    }
+    labels
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn name_context_anchor(
     target: NameTarget,
     requested: PhysicalPosition<f64>,
@@ -6591,6 +6623,24 @@ mod tests {
         assert_eq!(
             name_context_anchor(NameTarget::Workspace(WorkspaceId(1)), requested),
             requested
+        );
+    }
+
+    #[test]
+    fn native_name_menu_preserves_rename_and_tab_reset_order() {
+        assert_eq!(
+            name_context_labels(NameTarget::Workspace(WorkspaceId(1)), Locale::En),
+            vec![Label::Rename.t(Locale::En)],
+        );
+        assert_eq!(
+            name_context_labels(
+                NameTarget::Tab {
+                    workspace_id: WorkspaceId(1),
+                    tab_id: TabId(2)
+                },
+                Locale::En,
+            ),
+            vec![Label::Rename.t(Locale::En), Label::Reset.t(Locale::En)],
         );
     }
 

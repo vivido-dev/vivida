@@ -149,6 +149,19 @@ pub fn show_launch_menu(
     entries: &[vivido::shell::LaunchEntry],
     anchor: winit::dpi::PhysicalPosition<i32>,
 ) -> Result<Option<usize>, Box<dyn Error>> {
+    let labels = entries
+        .iter()
+        .map(|entry| entry.label.as_str())
+        .collect::<Vec<_>>();
+    show_context_menu(chrome, &labels, anchor)
+}
+
+/// Show a native context menu above terminal child windows.
+pub fn show_context_menu(
+    chrome: &Window,
+    labels: &[&str],
+    anchor: winit::dpi::PhysicalPosition<i32>,
+) -> Result<Option<usize>, Box<dyn Error>> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -166,12 +179,11 @@ pub fn show_launch_menu(
             return Err(std::io::Error::last_os_error().into());
         }
         let result = (|| {
-            for (index, entry) in entries.iter().enumerate() {
+            for (index, label) in labels.iter().enumerate() {
                 let id = u32::try_from(index)?
                     .checked_add(1)
-                    .ok_or("too many launch entries")?;
-                let label = entry
-                    .label
+                    .ok_or("too many menu items")?;
+                let label = label
                     .replace('&', "&&")
                     .encode_utf16()
                     .chain(Some(0))

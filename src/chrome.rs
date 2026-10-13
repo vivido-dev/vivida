@@ -1304,11 +1304,7 @@ impl ChromeRenderer {
                 );
             }
             let label_x = padding.saturating_add(status_slot);
-            let label = if mode == SidebarMode::Expanded {
-                workspace.label.clone()
-            } else {
-                (index + 1).to_string()
-            };
+            let label = sidebar_label(mode, index + 1, &workspace.label);
             self.text.paint_text(
                 scene,
                 &label,
@@ -1803,6 +1799,14 @@ fn tab_border_rects(
         .chain(first.then_some(RenderRect::new(x, y, thickness, height, BORDER, 1.0)))
 }
 
+fn sidebar_label(mode: SidebarMode, number: usize, name: &str) -> String {
+    if mode == SidebarMode::Expanded {
+        format!("{number} {name}")
+    } else {
+        number.to_string()
+    }
+}
+
 fn sidebar_toggle_rect(tab_bar: PhysicalRect, leading_inset: u32, scale: f64) -> PhysicalRect {
     let padding = ((4.0 * scale).round() as u32).min(tab_bar.height / 2);
     PhysicalRect {
@@ -2171,6 +2175,15 @@ mod tests {
                 .width,
             0
         );
+    }
+
+    #[test]
+    fn sidebar_labels_prefix_names_with_the_current_position() {
+        assert_eq!(sidebar_label(SidebarMode::Expanded, 1, "Dev"), "1 Dev");
+        assert_eq!(sidebar_label(SidebarMode::Expanded, 2, "界"), "2 界");
+        assert_eq!(sidebar_label(SidebarMode::Compact, 2, "界"), "2");
+        // Position belongs to the presentation; the stored name is used unchanged by renaming.
+        assert_eq!(sidebar_label(SidebarMode::Expanded, 10, "Dev"), "10 Dev");
     }
 
     #[test]

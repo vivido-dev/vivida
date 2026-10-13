@@ -23,7 +23,7 @@ use crate::layout::PhysicalRect;
 mod pane_geometry;
 
 mod launch_menu;
-pub use launch_menu::show_launch_menu;
+pub use launch_menu::{show_context_menu, show_launch_menu};
 mod sidebar_symbol;
 pub use sidebar_symbol::sidebar_symbol;
 
