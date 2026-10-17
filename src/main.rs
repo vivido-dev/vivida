@@ -10,6 +10,7 @@ mod layout;
 mod locale;
 mod model;
 mod platform;
+mod redraw;
 mod session;
 mod shortcuts;
 mod split_resize;
@@ -599,15 +600,18 @@ struct Shell {
     chrome_window: Option<Arc<Window>>,
     chrome_renderer: Option<ChromeRenderer>,
     chrome_id: Option<WindowId>,
+    chrome_redraw: redraw::Redraw,
     settings_menu_window: Option<Arc<Window>>,
     settings_menu_renderer: Option<SettingsMenuRenderer>,
     settings_menu_id: Option<WindowId>,
+    settings_menu_redraw: redraw::Redraw,
     settings_menu_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
     settings_menu_hover: Option<SettingsMenuItem>,
     last_gear_click: Option<Instant>,
     shortcuts_window: Option<Arc<Window>>,
     shortcuts_renderer: Option<ShortcutsRenderer>,
     shortcuts_id: Option<WindowId>,
+    shortcuts_redraw: redraw::Redraw,
     shortcuts_embedded_size: Option<winit::dpi::PhysicalSize<u32>>,
     shortcuts_open: bool,
     about_open: bool,
@@ -617,6 +621,7 @@ struct Shell {
     rename_editor_window: Option<Arc<Window>>,
     rename_editor_renderer: Option<RenameEditorRenderer>,
     rename_editor_id: Option<WindowId>,
+    rename_editor_redraw: redraw::Redraw,
     chrome_layout: ChromeLayout,
     chrome_hits: ChromeHitMap,
     split_drag: Option<SplitDrag<(WorkspaceId, TabId)>>,
@@ -809,15 +814,18 @@ impl Shell {
             chrome_window: None,
             chrome_renderer: None,
             chrome_id: None,
+            chrome_redraw: redraw::Redraw::default(),
             settings_menu_window: None,
             settings_menu_renderer: None,
             settings_menu_id: None,
+            settings_menu_redraw: redraw::Redraw::default(),
             settings_menu_embedded_size: None,
             settings_menu_hover: None,
             last_gear_click: None,
             shortcuts_window: None,
             shortcuts_renderer: None,
             shortcuts_id: None,
+            shortcuts_redraw: redraw::Redraw::default(),
             shortcuts_embedded_size: None,
             shortcuts_open: false,
             about_open: false,
@@ -827,6 +835,7 @@ impl Shell {
             rename_editor_window: None,
             rename_editor_renderer: None,
             rename_editor_id: None,
+            rename_editor_redraw: redraw::Redraw::default(),
             chrome_layout: ChromeLayout::default(),
             chrome_hits: ChromeHitMap::default(),
             split_drag: None,
@@ -3014,9 +3023,7 @@ impl Shell {
                     && self.settings_menu_window.is_none()
                     && self.chrome_hits.gear != hit_map.gear;
                 self.chrome_hits = hit_map;
-                if !presented {
-                    self.request_chrome_redraw();
-                }
+                self.chrome_redraw.complete(presented, Instant::now());
                 if menu_moved {
                     self.request_chrome_redraw();
                 }
@@ -3028,7 +3035,7 @@ impl Shell {
 
     fn request_chrome_redraw(&self) {
         if let Some(chrome) = &self.chrome_window {
-            chrome.request_redraw();
+            self.chrome_redraw.request(chrome);
         }
     }
 
@@ -3203,8 +3210,7 @@ impl Shell {
             return;
         };
         match renderer.render(window.inner_size(), state) {
-            Ok(true) => (),
-            Ok(false) => window.request_redraw(),
+            Ok(presented) => self.shortcuts_redraw.complete(presented, Instant::now()),
             Err(error) => eprintln!("failed to render shortcuts: {error}"),
         }
     }
@@ -3796,8 +3802,9 @@ impl Shell {
             error: editor.error.as_deref(),
         };
         match renderer.render(window.inner_size(), state) {
-            Ok(true) => (),
-            Ok(false) => window.request_redraw(),
+            Ok(presented) => self
+                .rename_editor_redraw
+                .complete(presented, Instant::now()),
             Err(error) => eprintln!("failed to render rename editor: {error}"),
         }
     }
@@ -3889,8 +3896,9 @@ impl Shell {
             return;
         };
         match renderer.render(window.inner_size(), hovered, self.locale) {
-            Ok(true) => (),
-            Ok(false) => window.request_redraw(),
+            Ok(presented) => self
+                .settings_menu_redraw
+                .complete(presented, Instant::now()),
             Err(error) => eprintln!("failed to render settings menu: {error}"),
         }
     }
@@ -5264,6 +5272,30 @@ impl ApplicationHandler<Event> for Shell {
             }
             return;
         }
+        let redraw = if Some(window_id) == self.chrome_id {
+            self.chrome_window
+                .as_deref()
+                .map(|window| (window, &mut self.chrome_redraw))
+        } else if Some(window_id) == self.settings_menu_id {
+            self.settings_menu_window
+                .as_deref()
+                .map(|window| (window, &mut self.settings_menu_redraw))
+        } else if Some(window_id) == self.shortcuts_id {
+            self.shortcuts_window
+                .as_deref()
+                .map(|window| (window, &mut self.shortcuts_redraw))
+        } else if Some(window_id) == self.rename_editor_id {
+            self.rename_editor_window
+                .as_deref()
+                .map(|window| (window, &mut self.rename_editor_redraw))
+        } else {
+            None
+        };
+        if let Some((window, redraw)) = redraw
+            && !redraw.handle_event(window, &event)
+        {
+            return;
+        }
         if self.handle_split_event(window_id, &event) {
             return;
         }
@@ -5486,6 +5518,30 @@ impl ApplicationHandler<Event> for Shell {
         self.reap_closed_panes(ShellLoop::Winit(event_loop));
         self.refresh_tab_titles();
         self.refresh_progress();
+        redraw::pump(
+            event_loop,
+            [
+                (self.chrome_window.as_deref(), &mut self.chrome_redraw),
+                (
+                    self.settings_menu_window
+                        .as_deref()
+                        .filter(|_| self.settings_menu_open),
+                    &mut self.settings_menu_redraw,
+                ),
+                (
+                    self.shortcuts_window
+                        .as_deref()
+                        .filter(|_| self.shortcuts_open),
+                    &mut self.shortcuts_redraw,
+                ),
+                (
+                    self.rename_editor_window
+                        .as_deref()
+                        .filter(|_| self.name_editor.is_some()),
+                    &mut self.rename_editor_redraw,
+                ),
+            ],
+        );
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
