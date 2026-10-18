@@ -1,12 +1,15 @@
+use std::cell::RefCell;
 use std::error::Error;
 use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Once};
 
 use block2::RcBlock;
+use objc2::rc::Retained;
 use objc2::runtime::{Bool, Sel};
 use objc2::{ClassType, MainThreadMarker, ffi, sel};
-use objc2_app_kit::{NSApplication, NSView, NSWindowButton, NSWindowOrderingMode};
+use objc2_app_kit::{NSApplication, NSView, NSWindow, NSWindowButton, NSWindowOrderingMode};
+use objc2_core_foundation::CFRunLoop;
 use objc2_foundation::{NSLocale, NSPoint, NSRect, NSRunLoop, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use vivido::cli::TerminalOptions;
@@ -147,6 +150,7 @@ fn keep_content_clicks(window: &objc2_app_kit::NSWindow) {
 }
 
 pub fn focus_chrome_input(window: &Window) {
+    cancel_pane_focus();
     window.focus_window();
 }
 
@@ -203,6 +207,7 @@ pub fn position_popup(
         child.orderFrontRegardless();
     }
     if focus == PopupFocus::Keyboard {
+        cancel_pane_focus();
         popup.focus_window();
     }
 }
@@ -232,6 +237,20 @@ pub fn set_popup_visible(window: &Window, visible: bool) {
         }
         popup.orderOut(None);
     }
+}
+
+thread_local! {
+    /// The pane window waiting for the deferred keyboard handoff in [`NativePaneHost::focus`].
+    ///
+    /// Requests made before the handoff runs collapse onto the latest one, and handing the
+    /// keyboard to the chrome or a keyboard popup cancels it, so a pane request queued earlier in
+    /// the same turn cannot pull the keyboard back from them afterwards.
+    static PENDING_FOCUS: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+}
+
+/// Drop a pending pane handoff because the chrome or one of its popups now takes the keyboard.
+fn cancel_pane_focus() {
+    PENDING_FOCUS.take();
 }
 
 #[derive(Clone)]
@@ -339,10 +358,17 @@ impl PaneHost for NativePaneHost {
         // Focus requests usually arrive from inside `windowDidBecomeKey` for the chrome, while
         // the click that made the chrome key is still being dispatched. AppKit silently ignores
         // a key-window change attempted at that point, stranding the keyboard on the chrome
-        // where Vivida drops key events. Defer the handoff to the next turn of the main run
-        // loop, after the current AppKit event has finished dispatching.
+        // where Vivida drops key events. Defer the handoff until the current AppKit event has
+        // finished dispatching.
+        if PENDING_FOCUS.replace(Some(pane)).is_some() {
+            // The handoff already queued will hand the keyboard to this pane instead.
+            return;
+        }
         let mtm = MainThreadMarker::new().expect("pane hosting runs on the main thread");
         let block: RcBlock<dyn Fn()> = RcBlock::new(move || {
+            let Some(pane) = PENDING_FOCUS.take() else {
+                return;
+            };
             if pane.isKeyWindow() {
                 return;
             }
@@ -361,10 +387,16 @@ impl PaneHost for NativePaneHost {
                 pane.makeKeyAndOrderFront(None);
             }
         });
+        // `performBlock:` runs the block in the default mode only, so it waits out modal alerts,
+        // menu tracking, and live resizes rather than reshuffling key windows inside them.
         // SAFETY: the block is scheduled from the main thread onto the main run loop and never
-        // crosses threads, so the non-Send retained window it holds is confined to the main
-        // thread.
+        // crosses threads, so the main-thread state it touches stays on the main thread.
         unsafe { NSRunLoop::mainRunLoop().performBlock(&block) };
+        // Enqueuing does not wake the loop. A request made while winit prepares to wait (host
+        // requests and pane reaping run there) would otherwise sleep until an unrelated event.
+        if let Some(run_loop) = CFRunLoop::main() {
+            run_loop.wake_up();
+        }
     }
 
     fn is_attached(&self, processor: &Processor, pane: WindowId) -> bool {
