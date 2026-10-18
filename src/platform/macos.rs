@@ -3,10 +3,11 @@ use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Once};
 
+use block2::RcBlock;
 use objc2::runtime::{Bool, Sel};
 use objc2::{ClassType, MainThreadMarker, ffi, sel};
 use objc2_app_kit::{NSApplication, NSView, NSWindowButton, NSWindowOrderingMode};
-use objc2_foundation::{NSLocale, NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSLocale, NSPoint, NSRect, NSRunLoop, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use vivido::cli::TerminalOptions;
 use vivido::{Event, LoopHandle, ParentWindowHandle, Processor, WindowOptions};
@@ -332,9 +333,38 @@ impl PaneHost for NativePaneHost {
     }
 
     fn focus(&self, processor: &mut Processor, pane: WindowId) {
-        if let Some(pane) = processor.window_mut(pane) {
-            pane.display.window.focus_window();
-        }
+        let Some((_, pane)) = self.native_windows(processor, pane) else {
+            return;
+        };
+        // Focus requests usually arrive from inside `windowDidBecomeKey` for the chrome, while
+        // the click that made the chrome key is still being dispatched. AppKit silently ignores
+        // a key-window change attempted at that point, stranding the keyboard on the chrome
+        // where Vivida drops key events. Defer the handoff to the next turn of the main run
+        // loop, after the current AppKit event has finished dispatching.
+        let mtm = MainThreadMarker::new().expect("pane hosting runs on the main thread");
+        let block: RcBlock<dyn Fn()> = RcBlock::new(move || {
+            if pane.isKeyWindow() {
+                return;
+            }
+            // A hidden pane (a background tab) must not be mapped just to take the keyboard,
+            // matching the guards on the winit focus call this replaces.
+            if pane.isVisible() && !pane.isMiniaturized() {
+                let app = NSApplication::sharedApplication(mtm);
+                // The replacement `activate` only lands on macOS 14 and cooperates with the
+                // foreground app, while raised activation is what background automation relies
+                // on.
+                #[expect(
+                    deprecated,
+                    reason = "raises a background instance for pane automation"
+                )]
+                app.activateIgnoringOtherApps(true);
+                pane.makeKeyAndOrderFront(None);
+            }
+        });
+        // SAFETY: the block is scheduled from the main thread onto the main run loop and never
+        // crosses threads, so the non-Send retained window it holds is confined to the main
+        // thread.
+        unsafe { NSRunLoop::mainRunLoop().performBlock(&block) };
     }
 
     fn is_attached(&self, processor: &Processor, pane: WindowId) -> bool {
