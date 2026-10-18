@@ -4328,6 +4328,11 @@ impl Shell {
     }
 
     fn begin_chrome_resize(&self) -> bool {
+        // macOS leaves edge presses to the native frame's live resize; the shell only mirrors
+        // its cursor.
+        if cfg!(target_os = "macos") {
+            return false;
+        }
         let (Some(chrome), Some(cursor)) = (&self.chrome_window, self.cursor_position) else {
             return false;
         };
@@ -4367,7 +4372,7 @@ impl Shell {
             .split_cursor(position)
             .or_else(|| chrome_resize_direction(chrome, position).map(resize_cursor))
             .unwrap_or(CursorIcon::Default);
-        chrome.set_cursor(icon);
+        platform::set_chrome_cursor(chrome, icon);
     }
 
     fn update_hovered_workspace(&mut self, position: PhysicalPosition<f64>) {
@@ -4548,6 +4553,7 @@ impl Shell {
                 if let Some(window_id) = self.embedded_hovered_pane.take() {
                     self.route_embedded_event(window_id, WindowEvent::CursorLeft { device_id });
                 }
+                platform::release_chrome_cursor();
                 self.cursor_position = None;
                 self.hovered_workspace = None;
                 self.request_chrome_redraw();
@@ -5183,11 +5189,21 @@ fn settings_menu_click(
     }
 }
 
+/// The resize-band direction under the pointer, if any.
+///
+/// On macOS the shell draws only the band's cursor (see `set_chrome_cursor`); presses there
+/// stay with the native frame's live resize. A zoomed window still shows its resize band on
+/// macOS, while the other platforms resize through `begin_chrome_resize` and skip it while
+/// maximized.
 fn chrome_resize_direction(
     window: &Window,
     position: PhysicalPosition<f64>,
 ) -> Option<ResizeDirection> {
-    if cfg!(target_os = "macos") || window.is_maximized() || window.fullscreen().is_some() {
+    if window.fullscreen().is_some() {
+        return None;
+    }
+    #[cfg(not(target_os = "macos"))]
+    if window.is_maximized() {
         return None;
     }
     resize_direction_at(window.inner_size(), window.scale_factor(), position)
@@ -5440,6 +5456,11 @@ impl ApplicationHandler<Event> for Shell {
         }
         if let WindowEvent::ModifiersChanged(modifiers) = &event {
             self.modifiers = modifiers.state();
+        }
+        // Entering a pane ends a resize shape the chrome set, except that a divider drag keeps
+        // its arrow while the pointer crosses panes.
+        if matches!(event, WindowEvent::CursorEntered { .. }) && !self.split_pointer_down {
+            platform::release_chrome_cursor();
         }
         if matches!(
             &event,

@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOSIZE, Se
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Icon, Window, WindowAttributes};
+use winit::window::{CursorIcon, Icon, Window, WindowAttributes};
 
 use super::PopupFocus;
 
@@ -49,6 +49,15 @@ pub fn focus_chrome_input(window: &Window) {
         SetFocus(window);
     }
 }
+
+/// Windows asks the window under the pointer for its cursor (`WM_SETCURSOR`) whatever holds the
+/// keyboard, so winit's `set_cursor` already applies.
+pub fn set_chrome_cursor(window: &Window, icon: CursorIcon) {
+    window.set_cursor(icon);
+}
+
+/// Nothing to restore: winit applies the chrome's cursor only while the pointer is over it.
+pub fn release_chrome_cursor() {}
 
 pub fn popup_window_attributes(
     chrome: &Window,

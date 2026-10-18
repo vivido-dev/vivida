@@ -5,7 +5,7 @@ use std::error::Error;
 use vivido::Event;
 use winit::dpi::PhysicalPosition;
 use winit::event_loop::EventLoopBuilder;
-use winit::window::{Window, WindowAttributes};
+use winit::window::{CursorIcon, Window, WindowAttributes};
 
 use super::PopupFocus;
 
@@ -21,6 +21,14 @@ pub fn finalize_chrome_window(_window: &Window) {}
 pub fn focus_chrome_input(window: &Window) {
     window.focus_window();
 }
+
+/// The chrome composites every pane itself, so winit's `set_cursor` on the chrome is authoritative.
+pub fn set_chrome_cursor(window: &Window, icon: CursorIcon) {
+    window.set_cursor(icon);
+}
+
+/// Nothing to restore: winit applies the chrome's cursor only while the pointer is over it.
+pub fn release_chrome_cursor() {}
 /// Wayland has no positioned child surfaces the shell can drive, so every popup falls back to an
 /// overlay drawn inside the chrome.
 pub fn popup_window_attributes(

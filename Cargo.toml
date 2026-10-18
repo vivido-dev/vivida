@@ -37,6 +37,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSApplication",
   "NSButton",
   "NSControl",
+  "NSCursor",
+  "NSEvent",
   "NSFontDescriptor",
   "NSGraphics",
   "NSGraphicsContext",
@@ -75,6 +77,10 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "macos_cursor"
+harness = false
 
 [[test]]
 name = "macos_pane_geometry"

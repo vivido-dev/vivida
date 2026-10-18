@@ -26,6 +26,8 @@ use crate::layout::PhysicalRect;
 
 mod pane_geometry;
 
+mod cursor;
+pub use cursor::{release_chrome_cursor, set_chrome_cursor};
 mod launch_menu;
 pub use launch_menu::{show_context_menu, show_launch_menu};
 mod sidebar_symbol;

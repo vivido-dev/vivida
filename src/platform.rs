@@ -140,7 +140,8 @@ pub use macos::sidebar_symbol;
 #[cfg(target_os = "macos")]
 pub use macos::{
     NativePaneHost, application_is_active, configure_event_loop, finalize_chrome_window,
-    focus_chrome_input, popup_window_attributes, position_popup, set_popup_visible,
+    focus_chrome_input, popup_window_attributes, position_popup, release_chrome_cursor,
+    set_chrome_cursor, set_popup_visible,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{show_context_menu, show_launch_menu};
@@ -154,7 +155,7 @@ pub use windows::preferred_language_tag;
 #[cfg(target_os = "windows")]
 pub use windows::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
-    position_popup, set_popup_visible,
+    position_popup, release_chrome_cursor, set_chrome_cursor, set_popup_visible,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{show_context_menu, show_launch_menu};
@@ -167,7 +168,7 @@ pub use linux::preferred_language_tag;
 #[cfg(target_os = "linux")]
 pub use linux::{
     configure_event_loop, finalize_chrome_window, focus_chrome_input, popup_window_attributes,
-    position_popup, set_popup_visible,
+    position_popup, release_chrome_cursor, set_chrome_cursor, set_popup_visible,
 };
 
 #[cfg(all(test, target_os = "linux"))]
