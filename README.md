@@ -43,6 +43,12 @@ spot the error in the log, open the right pane, and fix it — while you watch o
 You get a workspace that feels great to drive. Your agents get eyes and hands. Vivida is where
 both of you get more done.
 
+## Resizing the sidebar
+
+Drag the expanded sidebar's right edge to change its width, up to 400 logical pixels. Vivida
+remembers the width and keeps room for the terminal. The compact and hidden sidebar cannot be
+resized.
+
 ## Resizing split panes
 
 Drag the gap between panes to resize the two neighboring sections. The panes resize live; other

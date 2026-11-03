@@ -25,6 +25,8 @@ use crate::shortcuts;
 use crate::strings::Label;
 
 pub const EXPANDED_SIDEBAR_LOGICAL: f64 = 132.0;
+// Allow long space names without letting the sidebar dominate a wide window.
+pub const MAX_SIDEBAR_LOGICAL: f64 = 400.0;
 pub const COMPACT_SIDEBAR_LOGICAL: f64 = 44.0;
 pub const TAB_BAR_LOGICAL: f64 = 35.0;
 pub const MIN_PANE_WIDTH_LOGICAL: f64 = 160.0;
@@ -131,12 +133,24 @@ impl SidebarMode {
         }
     }
 
-    fn logical_width(self) -> f64 {
+    fn logical_width(self, expanded_width: f64) -> f64 {
         match self {
-            Self::Expanded => EXPANDED_SIDEBAR_LOGICAL,
+            Self::Expanded => bounded_sidebar_width(expanded_width),
             Self::Compact => COMPACT_SIDEBAR_LOGICAL,
             Self::Hidden => 0.0,
         }
+    }
+}
+
+pub fn default_sidebar_width() -> f64 {
+    EXPANDED_SIDEBAR_LOGICAL
+}
+
+pub fn bounded_sidebar_width(width: f64) -> f64 {
+    if width.is_finite() {
+        width.clamp(EXPANDED_SIDEBAR_LOGICAL, MAX_SIDEBAR_LOGICAL)
+    } else {
+        default_sidebar_width()
     }
 }
 
@@ -184,9 +198,11 @@ pub fn compute_chrome_layout(
     size: PhysicalSize<u32>,
     scale_factor: f64,
     sidebar_mode: SidebarMode,
+    expanded_width: f64,
 ) -> ChromeLayout {
     let min_content_width = (MIN_PANE_WIDTH_LOGICAL * scale_factor).round() as u32;
-    let requested_sidebar = (sidebar_mode.logical_width() * scale_factor).round() as u32;
+    let requested_sidebar =
+        (sidebar_mode.logical_width(expanded_width) * scale_factor).round() as u32;
     let sidebar_width = requested_sidebar.min(size.width.saturating_sub(min_content_width));
     let bottom_resize_gutter = pane_bottom_resize_gutter(scale_factor).min(size.height);
     let available_height = size.height.saturating_sub(bottom_resize_gutter);
@@ -241,6 +257,7 @@ pub struct ChromeRenderState<'a> {
     pub cursor: Option<PhysicalPosition<f64>>,
     pub split_highlight: Option<PhysicalRect>,
     pub sidebar_mode: SidebarMode,
+    pub sidebar_width: f64,
     pub workspaces: &'a [Workspace],
     pub active_workspace: Option<WorkspaceId>,
     pub hovered_workspace: Option<WorkspaceId>,
@@ -805,7 +822,7 @@ impl ChromeRenderer {
             } else {
                 (CORNER_RADIUS_LOGICAL * scale) as f32
             });
-        let layout = compute_chrome_layout(size, scale, state.sidebar_mode);
+        let layout = compute_chrome_layout(size, scale, state.sidebar_mode, state.sidebar_width);
         let mut scene = Scene::new();
         let mut hit_map = ChromeHitMap::default();
 
@@ -2158,19 +2175,19 @@ mod tests {
     fn sidebar_modes_allocate_expected_widths() {
         let size = PhysicalSize::new(1000, 600);
         assert_eq!(
-            compute_chrome_layout(size, 1.0, SidebarMode::Expanded)
+            compute_chrome_layout(size, 1.0, SidebarMode::Expanded, default_sidebar_width())
                 .sidebar
                 .width,
             132
         );
         assert_eq!(
-            compute_chrome_layout(size, 1.0, SidebarMode::Compact)
+            compute_chrome_layout(size, 1.0, SidebarMode::Compact, default_sidebar_width())
                 .sidebar
                 .width,
             44
         );
         assert_eq!(
-            compute_chrome_layout(size, 1.0, SidebarMode::Hidden)
+            compute_chrome_layout(size, 1.0, SidebarMode::Hidden, default_sidebar_width())
                 .sidebar
                 .width,
             0
@@ -2188,7 +2205,12 @@ mod tests {
 
     #[test]
     fn expanded_sidebar_never_starves_the_minimum_pane_width() {
-        let layout = compute_chrome_layout(PhysicalSize::new(280, 200), 1.0, SidebarMode::Expanded);
+        let layout = compute_chrome_layout(
+            PhysicalSize::new(280, 200),
+            1.0,
+            SidebarMode::Expanded,
+            default_sidebar_width(),
+        );
         assert_eq!(layout.sidebar.width, 120);
         assert_eq!(
             layout.content.width,
@@ -2211,7 +2233,8 @@ mod tests {
     #[test]
     fn windows_content_leaves_the_bottom_resize_gutter_uncovered() {
         let size = PhysicalSize::new(1000, 600);
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Expanded, default_sidebar_width());
 
         assert_eq!(layout.content.bottom(), 590);
         assert_eq!(
@@ -2232,8 +2255,12 @@ mod tests {
             ]
         );
 
-        let short_layout =
-            compute_chrome_layout(PhysicalSize::new(1000, 100), 1.0, SidebarMode::Expanded);
+        let short_layout = compute_chrome_layout(
+            PhysicalSize::new(1000, 100),
+            1.0,
+            SidebarMode::Expanded,
+            default_sidebar_width(),
+        );
         assert_eq!(short_layout.content.height, 80);
         assert_eq!(short_layout.content.bottom(), 90);
     }
@@ -2242,7 +2269,8 @@ mod tests {
     #[test]
     fn macos_content_leaves_the_native_resize_border_reachable() {
         let size = PhysicalSize::new(1000, 600);
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Expanded, default_sidebar_width());
 
         assert_eq!(layout.content.right(), 994);
         assert_eq!(layout.content.bottom(), 594);
@@ -2265,7 +2293,7 @@ mod tests {
         );
 
         // A hidden sidebar exposes the leading edge, so the content moves off it too.
-        let hidden = compute_chrome_layout(size, 1.0, SidebarMode::Hidden);
+        let hidden = compute_chrome_layout(size, 1.0, SidebarMode::Hidden, default_sidebar_width());
         assert_eq!(hidden.content.x, 6);
         assert_eq!(
             resize_gutter_rects(size, hidden),
@@ -2305,7 +2333,8 @@ mod tests {
         let size = PhysicalSize::new(1000, 600);
 
         // Compact: the strip from the sidebar's edge to the reservation is sidebar-colored.
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Compact, default_sidebar_width());
         let band =
             traffic_light_band_rect(layout, leading_control_inset(1.0, false)).expect("band");
         assert_eq!(band.x, 44);
@@ -2315,12 +2344,14 @@ mod tests {
 
         // Expanded hides nothing (the reservation is inside the sidebar) and hidden keeps the
         // tab band a single background color.
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Expanded, default_sidebar_width());
         assert!(traffic_light_band_rect(layout, leading_control_inset(1.0, false)).is_none());
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Hidden);
+        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Hidden, default_sidebar_width());
         assert!(traffic_light_band_rect(layout, leading_control_inset(1.0, false)).is_none());
         // Fullscreen has no traffic-light reservation either.
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Compact, default_sidebar_width());
         assert!(traffic_light_band_rect(layout, leading_control_inset(1.0, true)).is_none());
     }
 
@@ -2331,18 +2362,21 @@ mod tests {
 
         // The compact sidebar is narrower than the traffic-light reservation, so its border
         // must not enter the band the buttons occupy.
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Compact, default_sidebar_width());
         let border = sidebar_border_rect(layout, size, 1.0, false);
         assert_eq!(border.x, 43.0);
         assert_eq!(border.y, 35.0);
         assert_eq!(border.height, 565.0);
 
         // Expanded and fullscreen keep the full-height border.
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Expanded);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Expanded, default_sidebar_width());
         let border = sidebar_border_rect(layout, size, 1.0, false);
         assert_eq!(border.y, 0.0);
         assert_eq!(border.height, 600.0);
-        let layout = compute_chrome_layout(size, 1.0, SidebarMode::Compact);
+        let layout =
+            compute_chrome_layout(size, 1.0, SidebarMode::Compact, default_sidebar_width());
         let border = sidebar_border_rect(layout, size, 1.0, true);
         assert_eq!(border.y, 0.0);
         assert_eq!(border.height, 600.0);
@@ -2376,7 +2410,8 @@ mod tests {
     fn sidebar_heading_stays_below_top_controls_and_inside_the_sidebar() {
         for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
             let size = PhysicalSize::new((1000.0 * scale) as u32, (600.0 * scale) as u32);
-            let layout = compute_chrome_layout(size, scale, SidebarMode::Expanded);
+            let layout =
+                compute_chrome_layout(size, scale, SidebarMode::Expanded, default_sidebar_width());
             let header = sidebar_header_rect(
                 layout.sidebar,
                 layout.tab_bar.height,
@@ -2393,9 +2428,13 @@ mod tests {
     #[test]
     fn sidebar_toggle_padding_clears_the_tab_bar_bottom_border() {
         for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
-            let bar =
-                compute_chrome_layout(PhysicalSize::new(1000, 600), scale, SidebarMode::Expanded)
-                    .tab_bar;
+            let bar = compute_chrome_layout(
+                PhysicalSize::new(1000, 600),
+                scale,
+                SidebarMode::Expanded,
+                default_sidebar_width(),
+            )
+            .tab_bar;
             let toggle = sidebar_toggle_rect(bar, leading_control_inset(scale, false), scale);
             assert!(toggle.y > bar.y);
             assert!(toggle.bottom() < bar.bottom() - scale.ceil() as i32);

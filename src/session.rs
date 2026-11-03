@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chrome::SidebarMode;
+use crate::chrome::{SidebarMode, default_sidebar_width};
 use crate::layout::Node;
 use crate::model::{PaneId, TabId, Workspace, WorkspaceId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub sidebar_mode: SidebarMode,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f64,
     pub active_workspace: Option<WorkspaceId>,
     pub workspaces: Vec<WorkspaceSnapshot>,
 }
@@ -101,6 +103,7 @@ pub fn save(path: &Path, session: &Session) -> io::Result<()> {
 impl Session {
     pub fn capture<F>(
         sidebar_mode: SidebarMode,
+        sidebar_width: f64,
         active_workspace: Option<WorkspaceId>,
         workspaces: &[Workspace],
         mut cwd: F,
@@ -140,6 +143,7 @@ impl Session {
             .collect();
         Self {
             sidebar_mode,
+            sidebar_width,
             active_workspace,
             workspaces,
         }
@@ -154,6 +158,7 @@ mod tests {
     fn session_round_trips_owner_scoped_layouts() {
         let session = Session {
             sidebar_mode: SidebarMode::Compact,
+            sidebar_width: 280.0,
             active_workspace: Some(WorkspaceId(2)),
             workspaces: vec![WorkspaceSnapshot {
                 id: WorkspaceId(2),
@@ -173,6 +178,7 @@ mod tests {
         let encoded = serde_json::to_vec(&session).unwrap();
         let decoded: Session = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.sidebar_mode, SidebarMode::Compact);
+        assert_eq!(decoded.sidebar_width, 280.0);
         assert_eq!(decoded.active_workspace, Some(WorkspaceId(2)));
         assert_eq!(decoded.workspaces[0].tabs[0].root, Node::Leaf(PaneId(1)));
         assert!(decoded.workspaces[0].tabs[0].custom_title);
@@ -192,6 +198,7 @@ mod tests {
             }]
         }"#;
         let decoded: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.sidebar_width, default_sidebar_width());
         assert!(!decoded.workspaces[0].tabs[0].custom_title);
     }
 }

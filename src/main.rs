@@ -13,9 +13,11 @@ mod platform;
 mod redraw;
 mod session;
 mod shortcuts;
+mod sidebar_resize;
 mod split_resize;
 mod strings;
 
+use sidebar_resize::SidebarDrag;
 use split_resize::{DragEvent, SplitDrag, divider_at, divider_cursor, drag_event};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -630,6 +632,9 @@ struct Shell {
     cursor_position: Option<PhysicalPosition<f64>>,
     modifiers: ModifiersState,
     sidebar_mode: SidebarMode,
+    sidebar_width: f64,
+    sidebar_drag: Option<SidebarDrag>,
+    sidebar_pointer_down: bool,
     hovered_workspace: Option<WorkspaceId>,
     settings_menu_open: bool,
     update_available: bool,
@@ -844,6 +849,9 @@ impl Shell {
             cursor_position: None,
             modifiers: ModifiersState::empty(),
             sidebar_mode: SidebarMode::default(),
+            sidebar_width: chrome::default_sidebar_width(),
+            sidebar_drag: None,
+            sidebar_pointer_down: false,
             hovered_workspace: None,
             settings_menu_open: false,
             update_available: false,
@@ -955,6 +963,7 @@ impl Shell {
             return false;
         };
         self.sidebar_mode = saved.sidebar_mode;
+        self.sidebar_width = chrome::bounded_sidebar_width(saved.sidebar_width);
         for saved_workspace in saved.workspaces {
             let mut tabs = Vec::new();
             for saved_tab in saved_workspace.tabs {
@@ -1017,6 +1026,7 @@ impl Shell {
         };
         let saved = session::Session::capture(
             self.sidebar_mode,
+            self.sidebar_width,
             self.active_workspace,
             &self.workspaces,
             |window_id| {
@@ -2221,6 +2231,7 @@ impl Shell {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        self.sidebar_drag = None;
         self.end_split_drag();
         if self.sidebar_mode == mode {
             return;
@@ -2317,6 +2328,132 @@ impl Shell {
             return;
         };
         NativePaneHost::new(chrome).reveal(&mut self.processor, window_id, visible);
+    }
+
+    fn sidebar_cursor(&self, position: PhysicalPosition<f64>) -> Option<CursorIcon> {
+        if self.sidebar_drag.is_some() {
+            return Some(CursorIcon::EwResize);
+        }
+        if self.sidebar_mode != SidebarMode::Expanded
+            || self.settings_menu_open
+            || self.shortcuts_open
+            || self.name_editor.is_some()
+            || self.name_context_menu.is_some()
+            || self.launch_menu.is_some()
+            || self.recovery_menu.is_some()
+        {
+            return None;
+        }
+        let chrome = self.chrome_window.as_ref()?;
+        if chrome_resize_direction(chrome, position).is_some() {
+            return None;
+        }
+        sidebar_resize::resize_handle(self.chrome_layout, self.sidebar_mode, chrome.scale_factor())
+            .contains(position.x, position.y)
+            .then_some(CursorIcon::EwResize)
+    }
+
+    /// Capture sidebar drags before chrome controls or terminal panes receive the gesture.
+    fn handle_sidebar_event(&mut self, window_id: WindowId, event: &WindowEvent) -> bool {
+        let chrome_event = Some(window_id) == self.chrome_id;
+        #[cfg(target_os = "macos")]
+        let focus_handoff = chrome_event
+            && self.sidebar_pointer_down
+            && matches!(event, WindowEvent::Focused(false))
+            && platform::application_is_active();
+        #[cfg(not(target_os = "macos"))]
+        let focus_handoff = false;
+        match drag_event(
+            event,
+            chrome_event,
+            self.sidebar_pointer_down,
+            focus_handoff,
+        ) {
+            DragEvent::Start => {
+                self.sidebar_pointer_down = false;
+                self.sidebar_drag = None;
+                if !chrome_event {
+                    return false;
+                }
+                let Some(position) = self.cursor_position else {
+                    return false;
+                };
+                if self.sidebar_cursor(position).is_none() {
+                    return false;
+                }
+                self.end_split_drag();
+                self.split_pointer_down = false;
+                let Some(chrome) = &self.chrome_window else {
+                    return false;
+                };
+                self.sidebar_drag = Some(SidebarDrag::begin(
+                    self.sidebar_width,
+                    self.chrome_layout,
+                    chrome.scale_factor(),
+                    position.x,
+                ));
+                self.sidebar_pointer_down = true;
+                chrome.focus_window();
+                self.update_chrome_cursor(position);
+                true
+            }
+            DragEvent::Move(position) => {
+                let point = if chrome_event {
+                    Some(position)
+                } else {
+                    self.pane_rects.get(&window_id).map(|rect| {
+                        PhysicalPosition::new(
+                            position.x + f64::from(rect.x),
+                            position.y + f64::from(rect.y),
+                        )
+                    })
+                };
+                if let Some(point) = point {
+                    self.cursor_position = Some(point);
+                    if let (Some(drag), Some(chrome)) = (self.sidebar_drag, &self.chrome_window) {
+                        let width = drag.width(point, chrome.inner_size());
+                        if self.sidebar_width != width {
+                            self.sidebar_width = width;
+                            self.sync_pane_geometry();
+                            self.request_chrome_redraw();
+                        }
+                    }
+                    self.update_chrome_cursor(point);
+                }
+                true
+            }
+            DragEvent::Release => {
+                self.sidebar_drag = None;
+                self.sidebar_pointer_down = false;
+                self.hovered_workspace = None;
+                self.request_chrome_redraw();
+                if let Some(position) = self.cursor_position {
+                    self.update_chrome_cursor(position);
+                }
+                if self
+                    .chrome_window
+                    .as_ref()
+                    .is_some_and(|window| window.has_focus())
+                {
+                    self.focus_active_pane();
+                }
+                true
+            }
+            DragEvent::Restore => {
+                if let Some(drag) = self.sidebar_drag.take() {
+                    self.sidebar_width = drag.original_width;
+                    self.sync_pane_geometry();
+                    self.request_chrome_redraw();
+                }
+                true
+            }
+            DragEvent::End => {
+                self.sidebar_drag = None;
+                false
+            }
+            DragEvent::Swallow => true,
+            DragEvent::Pass => false,
+        }
     }
 
     fn end_split_drag(&mut self) {
@@ -2542,7 +2679,8 @@ impl Shell {
         };
         let size = chrome.inner_size();
         let scale = chrome.scale_factor();
-        self.chrome_layout = compute_chrome_layout(size, scale, self.sidebar_mode);
+        self.chrome_layout =
+            compute_chrome_layout(size, scale, self.sidebar_mode, self.sidebar_width);
         if self.split_drag.as_ref().is_some_and(|drag| {
             self.split_context().is_none_or(|(owner, root)| {
                 !drag.valid(&owner, root, self.chrome_layout.content, scale)
@@ -2778,10 +2916,11 @@ impl Shell {
         // cursor icon. Applying the focused pane's cursor unconditionally on every redraw would
         // stomp the resize-border arrow the instant a terminal blink or other redraw fires while
         // the pointer sits in the chrome's own resize gutter or tab strip.
-        let pointer_owns_cursor = self.embedded_pointer_capture == Some(window_id)
-            || self
-                .cursor_position
-                .is_some_and(|position| rect.contains(position.x, position.y));
+        let pointer_owns_cursor = !self.sidebar_pointer_down
+            && (self.embedded_pointer_capture == Some(window_id)
+                || self
+                    .cursor_position
+                    .is_some_and(|position| rect.contains(position.x, position.y)));
         if pointer_owns_cursor {
             chrome.set_cursor(state.cursor);
             chrome.set_cursor_visible(state.cursor_visible);
@@ -2994,6 +3133,7 @@ impl Shell {
                 cursor: self.cursor_position,
                 split_highlight,
                 sidebar_mode: self.sidebar_mode,
+                sidebar_width: self.sidebar_width,
                 workspaces: &self.workspaces,
                 active_workspace: self.active_workspace,
                 hovered_workspace: self.hovered_workspace,
@@ -4369,7 +4509,8 @@ impl Shell {
             return;
         };
         let icon = self
-            .split_cursor(position)
+            .sidebar_cursor(position)
+            .or_else(|| self.split_cursor(position))
             .or_else(|| chrome_resize_direction(chrome, position).map(resize_cursor))
             .unwrap_or(CursorIcon::Default);
         platform::set_chrome_cursor(chrome, icon);
@@ -5312,7 +5453,9 @@ impl ApplicationHandler<Event> for Shell {
         {
             return;
         }
-        if self.handle_split_event(window_id, &event) {
+        if self.handle_sidebar_event(window_id, &event)
+            || self.handle_split_event(window_id, &event)
+        {
             return;
         }
         if Some(window_id) == self.rename_editor_id {
@@ -5459,7 +5602,10 @@ impl ApplicationHandler<Event> for Shell {
         }
         // Entering a pane ends a resize shape the chrome set, except that a divider drag keeps
         // its arrow while the pointer crosses panes.
-        if matches!(event, WindowEvent::CursorEntered { .. }) && !self.split_pointer_down {
+        if matches!(event, WindowEvent::CursorEntered { .. })
+            && !self.split_pointer_down
+            && !self.sidebar_pointer_down
+        {
             platform::release_chrome_cursor();
         }
         if matches!(
@@ -6223,7 +6369,12 @@ mod tests {
                 SidebarMode::Compact,
                 SidebarMode::Hidden,
             ] {
-                let layout = chrome::compute_chrome_layout(size, scale, sidebar);
+                let layout = chrome::compute_chrome_layout(
+                    size,
+                    scale,
+                    sidebar,
+                    chrome::default_sidebar_width(),
+                );
                 for (x, direction) in [
                     (5.0 * scale, ResizeDirection::West),
                     (f64::from(size.width) - 5.0 * scale, ResizeDirection::East),
