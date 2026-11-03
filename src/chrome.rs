@@ -581,11 +581,17 @@ pub fn shortcuts_close_rect(panel: PhysicalRect, scale_factor: f64) -> PhysicalR
     }
 }
 
+/// Size of the About panel, including both product versions.
+pub fn about_logical_size() -> (f64, f64) {
+    // Leave one row for each product version above the website link.
+    (320.0, 178.0)
+}
+
 /// Website link hit area in the About panel.
 pub fn about_link_rect(panel: PhysicalRect, scale: f64) -> PhysicalRect {
     PhysicalRect {
         x: panel.x + (SHORTCUTS_PADDING_LOGICAL * scale).round() as i32,
-        y: panel.y + (94.0 * scale).round() as i32,
+        y: panel.y + (122.0 * scale).round() as i32,
         width: (190.0 * scale).round() as u32,
         height: (28.0 * scale).round() as u32,
     }
@@ -655,13 +661,27 @@ fn paint_shortcuts_panel(
         text.paint_text(
             scene,
             &format!(
-                "{} {}",
+                "Vivida {} {}",
                 Label::Version.t(state.locale),
-                env!("CARGO_PKG_VERSION")
+                crate::version::VIVIDA
             ),
             (
                 panel.x as f32 + padding,
                 panel.y as f32 + 60.0 * scale as f32,
+            ),
+            TEXT,
+            false,
+        );
+        text.paint_text(
+            scene,
+            &format!(
+                "Vivido {} {}",
+                Label::Version.t(state.locale),
+                crate::version::vivido()
+            ),
+            (
+                panel.x as f32 + padding,
+                panel.y as f32 + 88.0 * scale as f32,
             ),
             TEXT,
             false,
@@ -1386,7 +1406,7 @@ impl ChromeRenderer {
         hit_map: &mut ChromeHitMap,
     ) {
         hit_map.shortcuts = if state.about {
-            panel_rect(size, self.scale_factor, (320.0, 150.0))
+            panel_rect(size, self.scale_factor, about_logical_size())
         } else {
             shortcuts_rect(size, self.scale_factor)
         };
@@ -2627,7 +2647,7 @@ mod tests {
             SettingsMenuItem::About.label().t(Locale::En),
             "About Vivida"
         );
-        let panel = panel_rect(PhysicalSize::new(1000, 800), 2.0, (320.0, 150.0));
+        let panel = panel_rect(PhysicalSize::new(1000, 800), 2.0, about_logical_size());
         let link = about_link_rect(panel, 2.0);
         assert!(panel.contains(f64::from(link.x), f64::from(link.y)));
         assert!(panel.contains(f64::from(link.right() - 1), f64::from(link.bottom() - 1)));

@@ -24,7 +24,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use super::{PaneHost, PopupFocus};
 use crate::layout::PhysicalRect;
 
+mod about;
 mod pane_geometry;
+pub use about::configure_about_menu;
 
 mod cursor;
 pub use cursor::{release_chrome_cursor, set_chrome_cursor};

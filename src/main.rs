@@ -16,6 +16,7 @@ mod shortcuts;
 mod sidebar_resize;
 mod split_resize;
 mod strings;
+mod version;
 
 use sidebar_resize::SidebarDrag;
 use split_resize::{DragEvent, SplitDrag, divider_at, divider_cursor, drag_event};
@@ -3249,7 +3250,7 @@ impl Shell {
         self.set_shortcuts_open(false);
         self.about_open = about;
         let (width, height) = if about {
-            (320.0, 150.0)
+            chrome::about_logical_size()
         } else {
             shortcuts_logical_size()
         };
@@ -5410,6 +5411,10 @@ impl ApplicationHandler<Event> for Shell {
         }
         self.processor
             .handle_winit_event(event_loop, WinitEvent::NewEvents(cause));
+        #[cfg(target_os = "macos")]
+        if cause == StartCause::Init {
+            platform::configure_about_menu();
+        }
     }
 
     fn window_event(

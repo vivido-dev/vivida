@@ -132,6 +132,8 @@ pub use vivido::shell::{NativePaneHost, PaneHost};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
+pub use macos::configure_about_menu;
+#[cfg(target_os = "macos")]
 pub use macos::configure_chrome_window;
 #[cfg(target_os = "macos")]
 pub use macos::preferred_language_tag;
