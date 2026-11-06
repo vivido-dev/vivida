@@ -1,5 +1,8 @@
-//! Wayland chrome-window integration; terminal pane hosting lives in `vivido::shell`.
+//! Linux chrome-window integration; terminal pane hosting lives in `vivido::shell`.
 
+// Rust guideline compliant 2026-10-07
+
+use std::env;
 use std::error::Error;
 
 use vivido::Event;
@@ -10,8 +13,17 @@ use winit::window::{CursorIcon, Window, WindowAttributes};
 use super::PopupFocus;
 
 pub fn configure_event_loop(builder: &mut EventLoopBuilder<Event>) {
-    use winit::platform::wayland::EventLoopBuilderExtWayland;
-    builder.with_wayland();
+    use winit::platform::x11::EventLoopBuilderExtX11;
+
+    // Winit trusts WAYLAND_DISPLAY even when it names an unreachable compositor. Probe before
+    // building: a failed build consumes winit's one event-loop creation attempt.
+    // Leave an inherited WAYLAND_SOCKET to winit; probing would consume that file descriptor.
+    if env::var("DISPLAY").is_ok_and(|display| !display.is_empty())
+        && env::var_os("WAYLAND_SOCKET").is_none()
+        && wayland_client::Connection::connect_to_env().is_err()
+    {
+        builder.with_x11();
+    }
 }
 pub fn configure_chrome_window(attributes: WindowAttributes) -> WindowAttributes {
     attributes.with_decorations(false)
